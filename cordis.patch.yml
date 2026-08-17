@@ -1,0 +1,12 @@
+- insert:
+    - id: dsh-codex-workflow
+      name: 'dsh-codex-workflow'
+      config:
+        codexCommand: codex
+        plannerModel: ''
+        reviewerModel: ''
+        plannerEffort: high
+        reviewerEffort: high
+        maxReviewCycles: 3
+        turnTimeoutMs: 600000
+        idleProcessMs: 900000

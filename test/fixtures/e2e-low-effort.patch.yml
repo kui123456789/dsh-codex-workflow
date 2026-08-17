@@ -1,0 +1,8 @@
+- id: desktop-runtime
+  config:
+    open: false
+- id: dsh-codex-workflow
+  config:
+    plannerEffort: low
+    reviewerEffort: low
+    turnTimeoutMs: 180000
