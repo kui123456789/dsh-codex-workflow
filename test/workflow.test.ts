@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { ToolRunContext } from "@deepseek-ai/dsh-tools";
+import { closeCoordinationStoresForDirectory } from "../src/coordination.js";
+import { newRequestId } from "../src/bridge-protocol.js";
+import { CodexInvalidThreadError, CodexNoVerdictError } from "../src/codex-callback.js";
 import { WorkflowStore } from "../src/store.js";
 import type { ReviewResult, TurnWaitResult, WorkflowConfig, WorkflowRecord } from "../src/types.js";
-import { WorkflowManager, type CodexGateway } from "../src/workflow.js";
+import { WorkflowManager, type CodexCallback, type CodexGateway } from "../src/workflow.js";
 
 interface ReviewStartCall {
   threadId: string;
@@ -132,13 +135,46 @@ const config: WorkflowConfig = {
   maxReviewCycles: 3,
   maxNoChangeReviewRounds: 1,
   reviewDiffMaxBytes: 65536,
+  bridgePollMs: 1000,
+  bridgeMaxPayloadBytes: 1048576,
+  callbackTimeoutMs: 10_000,
+  callbackMaxAttempts: 3,
+  callbackRetryBaseMs: 200,
   turnTimeoutMs: 10_000,
   idleProcessMs: 0,
   storageDir: "",
 };
 
-function manager(directory: string, gateway = new FakeGateway(), overrides: Partial<WorkflowConfig> = {}) {
-  return new WorkflowManager(new WorkflowStore(directory), gateway, { ...config, ...overrides, storageDir: directory });
+function manager(directory: string, gateway = new FakeGateway(), overrides: Partial<WorkflowConfig> = {}, callback?: CodexCallback, bridgeQueue?: { enqueue(command: import("../src/bridge-protocol.js").SubmitVerdictCommand): Promise<string> }) {
+  return new WorkflowManager(new WorkflowStore(directory), gateway, { ...config, ...overrides, storageDir: directory }, callback, bridgeQueue);
+}
+
+/** Deterministic callback double: queue results; record every resume request. */
+class FakeCallback implements CodexCallback {
+  results: Array<{ kind: "verdict"; verdict: ReviewResult } | { kind: "retryable_busy" } | Error> = [];
+  requests: Array<{ workflowId: string; submissionId: string; codexThreadId: string; cwd: string; prompt: string }> = [];
+  cancelledWorkflows: string[] = [];
+  cancelledSubmissions: string[] = [];
+  stopped = false;
+
+  async send(request: { workflowId: string; submissionId: string; codexThreadId: string; cwd: string; prompt: string }): Promise<{ kind: "verdict"; verdict: ReviewResult } | { kind: "retryable_busy" }> {
+    this.requests.push(request);
+    const next = this.results.shift();
+    if (next instanceof Error) throw next;
+    return next ?? { kind: "verdict", verdict: { verdict: "pass", findings: [], testGaps: [], summary: "pass" } };
+  }
+
+  cancel(workflowId: string): void {
+    this.cancelledWorkflows.push(workflowId);
+  }
+
+  cancelSubmission(workflowId: string, submissionId: string): void {
+    this.cancelledSubmissions.push(`${workflowId}:${submissionId}`);
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+  }
 }
 
 test("runs plan, repair, and detached review in the original DSH session", async () => {
@@ -166,7 +202,7 @@ test("runs plan, repair, and detached review in the original DSH session", async
     assert.deepEqual(gateway.reviewStarts[1], { threadId: "reviewer-thread", detached: false });
     assert.ok(deferred.length >= 3);
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -183,13 +219,13 @@ test("blocks after the configured third failed review", async () => {
     const managerInstance = manager(directory, gateway);
     const exec = fakeExec("session-limit", directory, []);
     const planned = await managerInstance.start({ task: "Build it" }, exec);
-    await managerInstance.review(planned.id, { implementationSummary: "one" }, exec);
-    await managerInstance.review(planned.id, { implementationSummary: "two" }, exec);
+    await managerInstance.review(planned.id, { implementationSummary: "one", changedFiles: ["changed.txt"] }, exec);
+    await managerInstance.review(planned.id, { implementationSummary: "two", changedFiles: ["changed.txt"] }, exec);
     const final = await managerInstance.review(planned.id, { implementationSummary: "three" }, exec);
     assert.equal(final.phase, "blocked");
     assert.equal(final.reviewCycles, 3);
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -206,7 +242,7 @@ test("blocking findings enter the automatic repair loop", async () => {
     const reviewed = await instance.review(planned.id, { implementationSummary: "Impl" }, exec);
     assert.equal(reviewed.phase, "fixing");
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -223,7 +259,7 @@ test("test gaps alone count as blocking", async () => {
     const reviewed = await instance.review(planned.id, { implementationSummary: "Impl" }, exec);
     assert.equal(reviewed.phase, "fixing");
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -249,7 +285,7 @@ test("non-blocking findings stop at the review decision gate", async () => {
       /belongs to another DSH session/,
     );
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -270,7 +306,7 @@ test("accept at the decision gate ships the workflow with findings recorded", as
     assert.equal(decided.reviewDecision?.note, "nitpick only");
     assert.ok(decided.latestReview?.findings[0]?.blocking === false);
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -292,7 +328,7 @@ test("fix at the decision gate enters the repair loop and can pass later", async
     const repaired = await instance.review(planned.id, { implementationSummary: "Fixed nits" }, exec);
     assert.equal(repaired.phase, "passed");
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -318,7 +354,7 @@ test("blocks a blocking re-review when the workspace did not change", async () =
     assert.equal(second.noChangeReviewRounds, 1);
     assert.match(second.error ?? "", /no verifiable change/);
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -346,7 +382,7 @@ test("an actual workspace change resets the no-change counter", async () => {
     assert.equal(third.noChangeReviewRounds, 1);
     assert.match(third.error ?? "", /no verifiable change/);
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -380,7 +416,7 @@ test("pass and non-blocking reviews are never blocked by identical fingerprints"
     const gated = await gateInstance.review(gatePlanned.id, { implementationSummary: "two", changedFiles: ["a.txt"] }, gateExec);
     assert.equal(gated.phase, "waiting_review_decision");
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -396,14 +432,14 @@ test("insufficient evidence disables no-change detection", async () => {
     const exec = fakeExec("session-insufficient", directory, []);
     const planned = await instance.start({ task: "Build it" }, exec);
     // No changedFiles in a non-git workspace: nothing verifiable, no false block.
-    const first = await instance.review(planned.id, { implementationSummary: "one" }, exec);
+    const first = await instance.review(planned.id, { implementationSummary: "one", changedFiles: ["changed.txt"] }, exec);
     assert.equal(first.phase, "fixing");
     assert.ok(first.latestReviewEvidence?.insufficient);
-    const second = await instance.review(planned.id, { implementationSummary: "two" }, exec);
+    const second = await instance.review(planned.id, { implementationSummary: "two", changedFiles: ["changed.txt"] }, exec);
     assert.equal(second.phase, "fixing");
     assert.equal(second.noChangeReviewRounds, 0);
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -434,7 +470,7 @@ test("review-only skips the planner, uses a detached reviewer, and reuses it on 
     assert.deepEqual(gateway.reviewThreads, ["reviewer-thread", "reviewer-thread"]);
     assert.deepEqual(gateway.reviewStarts[1], { threadId: "reviewer-thread", detached: false });
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -463,7 +499,7 @@ test("review-only enforces single active workflow per session and supports cance
     const fresh = await instance.start({ task: "Second" }, exec);
     assert.equal(fresh.phase, "executing");
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -485,7 +521,7 @@ test("review-only fails cleanly when the source thread cannot start", async () =
     assert.equal(records[0]?.phase, "failed");
     assert.equal(records[0]?.mode, "review_only");
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -517,7 +553,7 @@ test("unobservable rounds break the fingerprint chain and are never blocked", as
     assert.equal(third.phase, "fixing");
     assert.equal(third.noChangeReviewRounds, 0);
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -533,18 +569,18 @@ test("a pass verdict carrying actionable content is demoted to changes_requested
     const instance = manager(directory, gateway);
     const exec = fakeExec("session-passcontent", directory, []);
     const planned = await instance.start({ task: "Build it" }, exec);
-    const blocking = await instance.review(planned.id, { implementationSummary: "one" }, exec);
+    const blocking = await instance.review(planned.id, { implementationSummary: "one", changedFiles: ["changed.txt"] }, exec);
     assert.equal(blocking.phase, "fixing");
-    const testGaps = await instance.review(planned.id, { implementationSummary: "two" }, exec);
+    const testGaps = await instance.review(planned.id, { implementationSummary: "two", changedFiles: ["changed.txt"] }, exec);
     assert.equal(testGaps.phase, "fixing");
     const nits = await instance.review(planned.id, { implementationSummary: "three" }, exec);
     assert.equal(nits.phase, "waiting_review_decision");
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
-test("an empty changes_requested verdict fails the review", async () => {
+test("an empty changes_requested verdict is an invalid review: retryable, no cycle consumed", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-emptyverdict-"));
   try {
     const gateway = new FakeGateway();
@@ -555,13 +591,18 @@ test("an empty changes_requested verdict fails the review", async () => {
     const exec = fakeExec("session-emptyverdict", directory, []);
     const planned = await instance.start({ task: "Build it" }, exec);
     await assert.rejects(
-      instance.review(planned.id, { implementationSummary: "one" }, exec),
+      instance.review(planned.id, { implementationSummary: "one", changedFiles: ["changed.txt"] }, exec),
       /changes_requested without findings or test gaps/,
     );
     const records = await new WorkflowStore(directory).list();
-    assert.equal(records[0]?.phase, "failed");
+    // An invalid protocol result is infrastructure-ish: the workflow returns to
+    // its retryable phase and consumes no review cycle (a later valid review
+    // still works).
+    assert.equal(records[0]?.phase, "executing");
+    assert.equal(records[0]?.reviewCycles, 0);
+    assert.ok(records[0]?.error);
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -591,7 +632,7 @@ test("review-only honours reviewer model and effort overrides across repair roun
     assert.deepEqual(gateway.turnCalls.map((call) => call.model), ["override-model", "override-model"]);
     assert.deepEqual(gateway.turnCalls.map((call) => call.effort), ["low", "low"]);
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -613,7 +654,7 @@ test("review-only without changedFiles is rejected in a non-git workspace", asyn
     const next = await instance.reviewOnly({ implementationSummary: "Changed with files", changedFiles: ["a.txt"] }, exec);
     assert.equal(next.phase, "fixing");
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -632,7 +673,7 @@ test("cancel interrupts a still-running review and is not overwritten when it se
     const instance = manager(directory, gateway);
     const exec = fakeExec("session-activereview", directory, []);
     const planned = await instance.start({ task: "Build it" }, exec);
-    const pendingReview = instance.review(planned.id, { implementationSummary: "one" }, exec);
+    const pendingReview = instance.review(planned.id, { implementationSummary: "one", changedFiles: ["changed.txt"] }, exec);
     // The reviewer ids must be persisted while the review is still running.
     const store = new WorkflowStore(directory);
     await waitFor(async () => (await store.load(planned.id))?.reviewerThreadId === "reviewer-thread");
@@ -649,7 +690,7 @@ test("cancel interrupts a still-running review and is not overwritten when it se
     assert.equal(settled.phase, "cancelled");
     assert.equal((await store.load(planned.id))?.phase, "cancelled");
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -666,7 +707,7 @@ test("review-only persists its source thread id for recovery", async () => {
     assert.equal(started.sourceThreadId, "source-thread");
     assert.equal(started.reviewerThreadId, "reviewer-thread");
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -690,7 +731,7 @@ test("review-only source thread failure still records a usable failed record", a
     assert.equal(records[0]?.phase, "failed");
     assert.equal(records[0]?.sourceThreadId, undefined);
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -716,7 +757,7 @@ class FlakyStore extends WorkflowStore {
 
   override async update<T>(
     id: string,
-    fn: (record: WorkflowRecord) => T | Promise<T>,
+    fn: (record: WorkflowRecord) => T,
     opts: { ignoreCancelled?: boolean } = {},
   ) {
     this.updateCount += 1;
@@ -742,16 +783,21 @@ test("a failing turn registration fails the workflow and interrupts the new turn
     // start() used one update; the third review update is the raw-review turn
     // registration (entering, evidence, registerActiveTurn).
     store.failAtUpdate = store.updateCount + 3;
-    await assert.rejects(instance.review(planned.id, { implementationSummary: "one" }, exec), /store write failed/);
+    await assert.rejects(instance.review(planned.id, { implementationSummary: "one", changedFiles: ["changed.txt"] }, exec), /store write failed/);
     const records = await store.list();
-    assert.equal(records[0]?.phase, "failed");
+    // An infrastructure failure returns the workflow to its RETRYABLE phase and
+    // records the error — it must not become failed, so a later review can run.
+    assert.equal(records[0]?.phase, "executing");
+    assert.ok(records[0]?.error);
     // The just-started reviewer turn was interrupted, mirroring the app-server.
     assert.ok(gateway.interrupts.some(
       (entry) => entry.threadId === "reviewer-thread" && entry.turnId === "review-turn-1",
     ));
-    assert.equal(await store.activeForSession("session-regfail"), undefined);
+    // The workflow stays ACTIVE (retryable) after an infrastructure failure.
+    const active = await store.activeForSession("session-regfail");
+    assert.equal(active?.id, planned.id, "the workflow remains active so a later review can retry");
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -768,7 +814,7 @@ test("cancel before the reviewer ids are persisted: onStarted never resurrects a
     const exec = fakeExec("session-beforeonstarted", directory, []);
     const planned = await instance.start({ task: "Build it" }, exec);
     const store = new WorkflowStore(directory);
-    const pendingReview = instance.review(planned.id, { implementationSummary: "one" }, exec);
+    const pendingReview = instance.review(planned.id, { implementationSummary: "one", changedFiles: ["changed.txt"] }, exec);
     await waitFor(async () => (await store.load(planned.id))?.phase === "reviewing" && gateway.reviewStarts.length === 1);
     // The reviewer ids are not persisted yet: cancel wins first.
     const before = await store.load(planned.id);
@@ -785,7 +831,7 @@ test("cancel before the reviewer ids are persisted: onStarted never resurrects a
       (entry) => entry.threadId === "reviewer-thread" && entry.turnId === "review-turn-1",
     ));
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -802,7 +848,7 @@ test("cancel during the normalize turn interrupts the normalize turn, not the fi
     const turnGate = deferredGate();
     gateway.turnGate = turnGate;
     const store = new WorkflowStore(directory);
-    const pendingReview = instance.review(planned.id, { implementationSummary: "one" }, exec);
+    const pendingReview = instance.review(planned.id, { implementationSummary: "one", changedFiles: ["changed.txt"] }, exec);
     await waitFor(async () => (await store.load(planned.id))?.reviewerTurnId === "normalize-turn-1");
     const during = await store.load(planned.id);
     assert.equal(during?.reviewerTurnId, "normalize-turn-1");
@@ -815,7 +861,7 @@ test("cancel during the normalize turn interrupts the normalize turn, not the fi
     assert.equal(settled.phase, "cancelled");
     assert.equal((await store.load(planned.id))?.phase, "cancelled");
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -834,7 +880,7 @@ test("cancel between the final check and the outcome commit: no overwrite, no ou
     const planned = await instance.start({ task: "Build it" }, exec);
     const turnGate = deferredGate();
     gateway.turnGate = turnGate;
-    const pendingReview = instance.review(planned.id, { implementationSummary: "one" }, execWithDeferred);
+    const pendingReview = instance.review(planned.id, { implementationSummary: "one", changedFiles: ["changed.txt"] }, execWithDeferred);
     await waitFor(async () => (await store.load(planned.id))?.reviewerTurnId === "normalize-turn-1");
     const loadGate = deferredGate();
     store.holdNextLoad = true;
@@ -851,7 +897,7 @@ test("cancel between the final check and the outcome commit: no overwrite, no ou
     // No outcome message may be injected after the cancellation.
     assert.ok(!deferred.some((message) => JSON.stringify(message).includes("Codex Reviewer passed")));
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -876,7 +922,7 @@ test("cancel while the planner turn is running interrupts the planner turn and e
     assert.equal(settled.phase, "cancelled");
     assert.equal((await store.load(record.id))?.phase, "cancelled");
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -896,7 +942,7 @@ test("interrupt failures never un-cancel a workflow or leave it active", async (
     const fresh = await instance.start({ task: "Second" }, exec);
     assert.equal(fresh.phase, "executing");
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
   }
 });
 
@@ -918,7 +964,7 @@ test("onStarted interrupt failure after cancellation still leaves the record can
     const store = new WorkflowStore(directory);
     const exec = fakeExec("session-onstartedfail", directory, []);
     const planned = await instance.start({ task: "Build it" }, exec);
-    const pendingReview = instance.review(planned.id, { implementationSummary: "one" }, exec);
+    const pendingReview = instance.review(planned.id, { implementationSummary: "one", changedFiles: ["changed.txt"] }, exec);
     await waitFor(async () => gateway.reviewStarts.length === 1);
     const cancelled = await instance.cancel(planned.id, exec);
     assert.equal(cancelled.phase, "cancelled");
@@ -931,7 +977,506 @@ test("onStarted interrupt failure after cancellation still leaves the record can
       (entry) => entry.threadId === "reviewer-thread" && entry.turnId === "review-turn-1",
     ));
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await rmClosed(directory);
+  }
+});
+
+test("submit rejects non-bridge workflows and terminal phases", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-submit-"));
+  try {
+    const callback = new FakeCallback();
+    const instance = manager(directory, new FakeGateway(), {}, callback);
+    const exec = fakeExec("session-submit", directory, []);
+    const planned = await instance.start({ task: "Build it" }, exec);
+    await assert.rejects(
+      instance.submit(planned.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec),
+      /not a Codex-bridge workflow/,
+    );
+    assert.equal(callback.requests.length, 0);
+
+    const bridge = await instance.startExternalPlan({
+      version: 1,
+      kind: "dispatch_plan",
+      requestId: newRequestId(),
+      createdAt: new Date().toISOString(),
+      codexThreadId: newRequestId(),
+      target: { cwd: directory, dshSessionId: "session-bridge-owner" },
+      task: "Bridge task",
+      planMarkdown: "<proposed_plan>\nDo it\n</proposed_plan>",
+      assumptions: [],
+    }, fakeExec("session-bridge-owner", directory, []).agent!);
+    assert.equal(bridge.phase, "executing");
+    await assert.rejects(
+      instance.submit(bridge.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, fakeExec("other-session", directory, [])),
+      /belongs to another DSH session/,
+    );
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+async function bridgeWorkflow(instance: WorkflowManager, sessionId: string, directory: string, codexThreadId: string) {
+  const exec = fakeExec(sessionId, directory, []);
+  // Non-git tests need an observable changed file in the workspace.
+  await changedFile(directory);
+  return instance.startExternalPlan({
+    version: 1,
+    kind: "dispatch_plan",
+    requestId: newRequestId(),
+    createdAt: new Date().toISOString(),
+    codexThreadId,
+    target: { cwd: directory, dshSessionId: sessionId },
+    task: "Bridge task",
+    planMarkdown: "<proposed_plan>\nDo it\n</proposed_plan>",
+    assumptions: [],
+  }, exec.agent!);
+}
+
+/** Ensure the workspace has an observable changed file for non-git submits. */
+async function changedFile(directory: string): Promise<void> {
+  await writeFile(join(directory, "changed.txt"), "v1", "utf8");
+}
+
+function fakeBridgeQueue(): { enqueue: (command: import("../src/bridge-protocol.js").SubmitVerdictCommand) => Promise<string>; commands: import("../src/bridge-protocol.js").SubmitVerdictCommand[] } {
+  const commands: import("../src/bridge-protocol.js").SubmitVerdictCommand[] = [];
+  return {
+    commands,
+    enqueue: async (command) => {
+      commands.push(command);
+      return command.requestId;
+    },
+  };
+}
+
+test("submit persists a submission, resumes the exact thread and enqueues the structured verdict", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-submit-ok-"));
+  try {
+    const callback = new FakeCallback();
+    const queue = fakeBridgeQueue();
+    const instance = manager(directory, new FakeGateway(), {}, callback, queue);
+    const exec = fakeExec("session-submit-ok", directory, []);
+    const codexThreadId = newRequestId();
+    const bridge = await bridgeWorkflow(instance, "session-submit-ok", directory, codexThreadId);
+    const submitted = await instance.submit(bridge.id, {
+      implementationSummary: "Implemented",
+      changedFiles: ["changed.txt"],
+      testResults: "all pass",
+    }, exec);
+    assert.equal(submitted.phase, "executing");
+    assert.ok(submitted.submissionId);
+    assert.equal(submitted.submissionState, "received");
+    assert.equal(submitted.reviewCycles, 0, "a cycle is only counted once the verdict is APPLIED, not on submit");
+    assert.equal(submitted.pendingReviewRequest?.implementationSummary, "Implemented");
+    assert.ok(submitted.latestReviewEvidence);
+    assert.equal(callback.requests.length, 1);
+    assert.equal(callback.requests[0]!.codexThreadId, codexThreadId);
+    assert.equal(callback.requests[0]!.submissionId, submitted.submissionId);
+    // The prompt no longer tells the reviewer to run the bridge CLI.
+    assert.ok(!/dsh-codex-workflow respond/.test(callback.requests[0]!.prompt));
+    assert.match(callback.requests[0]!.prompt, /SUBMISSION:/);
+    // The structured verdict was enqueued by the plugin, not the child.
+    assert.equal(queue.commands.length, 1);
+    assert.equal(queue.commands[0]!.submissionId, submitted.submissionId);
+    assert.equal(queue.commands[0]!.codexThreadId, codexThreadId);
+    assert.equal(queue.commands[0]!.verdict.verdict, "pass");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("submit rejects a second active submission", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-submit-once-"));
+  try {
+    const callback = new FakeCallback();
+    const instance = manager(directory, new FakeGateway(), {}, callback, fakeBridgeQueue());
+    const exec = fakeExec("session-submit-once", directory, []);
+    const bridge = await bridgeWorkflow(instance, "session-submit-once", directory, newRequestId());
+    await instance.submit(bridge.id, { implementationSummary: "one", changedFiles: ["changed.txt"] }, exec);
+    await assert.rejects(
+      instance.submit(bridge.id, { implementationSummary: "two", changedFiles: ["changed.txt"] }, exec),
+      /already has an active submission/,
+    );
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("submit retries busy callbacks with backoff and fails after the attempt cap", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-submit-busy-"));
+  try {
+    const callback = new FakeCallback();
+    callback.results = [
+      { kind: "retryable_busy" },
+      { kind: "retryable_busy" },
+      { kind: "retryable_busy" },
+    ];
+    const instance = manager(
+      directory,
+      new FakeGateway(),
+      { callbackMaxAttempts: 3, callbackRetryBaseMs: 1 },
+      callback,
+    );
+    const exec = fakeExec("session-submit-busy", directory, []);
+    const bridge = await bridgeWorkflow(instance, "session-submit-busy", directory, newRequestId());
+    const submitted = await instance.submit(bridge.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
+    assert.equal(submitted.submissionState, "failed");
+    assert.equal(submitted.submissionAttempts, 3);
+    assert.match(submitted.submissionError ?? "", /busy after 3 attempts/);
+    assert.equal(callback.requests.length, 3);
+    assert.equal(submitted.phase, "executing", "the DSH workflow stays intact");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("submit treats invalid thread ids and missing verdicts as terminal failures", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-submit-invalid-"));
+  try {
+    const callback = new FakeCallback();
+    callback.results = [new CodexInvalidThreadError("codex thread x does not exist")];
+    const instance = manager(directory, new FakeGateway(), {}, callback);
+    const exec = fakeExec("session-submit-invalid", directory, []);
+    const bridge = await bridgeWorkflow(instance, "session-submit-invalid", directory, newRequestId());
+    const submitted = await instance.submit(bridge.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
+    assert.equal(submitted.submissionState, "failed");
+    assert.match(submitted.submissionError ?? "", /does not exist/);
+
+    const callback2 = new FakeCallback();
+    callback2.results = [new CodexNoVerdictError("no final agent message found in the review output")];
+    const instance2 = manager(directory, new FakeGateway(), {}, callback2);
+    const bridge2 = await bridgeWorkflow(instance2, "session-submit-noverdict", directory, newRequestId());
+    const exec2 = fakeExec("session-submit-noverdict", directory, []);
+    const submitted2 = await instance2.submit(bridge2.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec2);
+    assert.equal(submitted2.submissionState, "failed");
+    assert.match(submitted2.submissionError ?? "", /no final agent message/);
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("applyExternalVerdict reuses the outcome policy: pass, fixing, gate and no-change", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-verdict-"));
+  try {
+    const file = join(directory, "a.txt");
+    await writeFile(file, "v1", "utf8");
+    const instance = manager(directory, new FakeGateway(), { maxNoChangeReviewRounds: 1, maxReviewCycles: 2 }, new FakeCallback());
+    const codexThreadId = newRequestId();
+    const makeBridge = async (sessionId: string) => {
+      const exec = fakeExec(sessionId, directory, []);
+      const record = await bridgeWorkflow(instance, sessionId, directory, codexThreadId);
+      const submitted = await instance.submit(record.id, { implementationSummary: "done", changedFiles: ["a.txt"] }, exec);
+      return { record, submissionId: submitted.submissionId! };
+    };
+    const blockingVerdict = (summary: string, submissionId: string, workflowId: string) => ({
+      version: 1 as const,
+      kind: "submit_verdict" as const,
+      requestId: newRequestId(),
+      createdAt: new Date().toISOString(),
+      workflowId,
+      codexThreadId,
+      submissionId,
+      verdict: {
+        verdict: "changes_requested" as const,
+        findings: [{ severity: "high" as const, blocking: true, title: "Fix", body: summary }],
+        testGaps: [] as string[],
+        summary,
+      },
+    });
+
+    const passing = await makeBridge("session-v-pass");
+    const passVerdict = { ...blockingVerdict("x", passing.submissionId, passing.record.id), verdict: { verdict: "pass" as const, findings: [], testGaps: [], summary: "ok" } };
+    assert.equal((await instance.applyExternalVerdict(passVerdict)).phase, "passed");
+
+    const fixing = await makeBridge("session-v-fix");
+    assert.equal((await instance.applyExternalVerdict(blockingVerdict("fix me", fixing.submissionId, fixing.record.id))).phase, "fixing");
+
+    const gated = await makeBridge("session-v-gate");
+    const gateVerdict = { ...blockingVerdict("nit", gated.submissionId, gated.record.id), verdict: {
+      verdict: "changes_requested" as const,
+      findings: [{ severity: "medium" as const, blocking: false, title: "Nit", body: "n" }],
+      testGaps: [],
+      summary: "nits",
+    } };
+    assert.equal((await instance.applyExternalVerdict(gateVerdict)).phase, "waiting_review_decision");
+
+    const noChange = await makeBridge("session-v-nochange");
+    assert.equal((await instance.applyExternalVerdict(blockingVerdict("round one", noChange.submissionId, noChange.record.id))).phase, "fixing");
+    // Cycle 2: DSH submits again (new submission), workspace unchanged.
+    const exec2 = fakeExec("session-v-nochange", directory, []);
+    const resubmitted = await instance.submit(noChange.record.id, { implementationSummary: "same state", changedFiles: ["a.txt"] }, exec2);
+    assert.notEqual(resubmitted.submissionId, noChange.submissionId);
+    const blocked = await instance.applyExternalVerdict(blockingVerdict("round two", resubmitted.submissionId!, noChange.record.id));
+    assert.equal(blocked.phase, "blocked");
+    assert.match(blocked.error ?? "", /no verifiable change/);
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("applyExternalVerdict rejects unknown workflows, thread mismatch, stale and missing submissions", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-verdict-reject-"));
+  try {
+    const instance = manager(directory, new FakeGateway(), {}, new FakeCallback());
+    const exec = fakeExec("session-verdict-reject", directory, []);
+    const codexThreadId = newRequestId();
+    const record = await bridgeWorkflow(instance, "session-verdict-reject", directory, codexThreadId);
+    const submitted = await instance.submit(record.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
+    const submissionId = submitted.submissionId!;
+    const base = {
+      version: 1 as const,
+      kind: "submit_verdict" as const,
+      requestId: newRequestId(),
+      createdAt: new Date().toISOString(),
+      workflowId: record.id,
+      codexThreadId,
+      submissionId,
+      verdict: { verdict: "pass" as const, findings: [], testGaps: [], summary: "ok" },
+    };
+    await assert.rejects(instance.applyExternalVerdict({ ...base, codexThreadId: newRequestId() }), /thread mismatch/);
+    await assert.rejects(instance.applyExternalVerdict({ ...base, workflowId: "wf-ghost" }), /unknown workflow/);
+    await assert.rejects(
+      instance.applyExternalVerdict({ ...base, submissionId: newRequestId() }),
+      /stale submission/,
+    );
+    await assert.rejects(
+      instance.applyExternalVerdict({ ...base, submissionId: undefined }),
+      /missing its submission id/,
+    );
+
+    // Never submitted: rejected before any submission.
+    const fresh = await bridgeWorkflow(instance, "session-verdict-fresh", directory, codexThreadId);
+    await assert.rejects(instance.applyExternalVerdict({ ...base, workflowId: fresh.id, submissionId: undefined, codexThreadId }), /before any submission/);
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("the same submission verdict replays idempotently even after the phase moved on", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-verdict-replay-"));
+  try {
+    const instance = manager(directory, new FakeGateway(), {}, new FakeCallback());
+    const exec = fakeExec("session-v-replay", directory, []);
+    const codexThreadId = newRequestId();
+    const record = await bridgeWorkflow(instance, "session-v-replay", directory, codexThreadId);
+    const submitted = await instance.submit(record.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
+    const command = {
+      version: 1 as const,
+      kind: "submit_verdict" as const,
+      requestId: newRequestId(),
+      createdAt: new Date().toISOString(),
+      workflowId: record.id,
+      codexThreadId,
+      submissionId: submitted.submissionId!,
+      verdict: { verdict: "pass" as const, findings: [], testGaps: [], summary: "ok" },
+    };
+    const applied = await instance.applyExternalVerdict(command);
+    assert.equal(applied.phase, "passed");
+    // Replay of the SAME request id: idempotent, not an error.
+    const replayed = await instance.applyExternalVerdict(command);
+    assert.equal(replayed.phase, "passed");
+    // The same submission with a DIFFERENT request id is refused: only the
+    // expected identity may ever apply.
+    await assert.rejects(
+      instance.applyExternalVerdict({ ...command, requestId: newRequestId() }),
+      /already applied as request/,
+    );
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("a late verdict on a cancelled workflow is idempotent and never resurrects it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-verdict-cancel-"));
+  try {
+    const instance = manager(directory, new FakeGateway(), {}, new FakeCallback());
+    const exec = fakeExec("session-verdict-cancel", directory, []);
+    const codexThreadId = newRequestId();
+    const record = await bridgeWorkflow(instance, "session-verdict-cancel", directory, codexThreadId);
+    const submitted = await instance.submit(record.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
+    await instance.cancel(record.id, exec);
+    const result = await instance.applyExternalVerdict({
+      version: 1,
+      kind: "submit_verdict",
+      requestId: newRequestId(),
+      createdAt: new Date().toISOString(),
+      workflowId: record.id,
+      codexThreadId,
+      submissionId: submitted.submissionId!,
+      verdict: { verdict: "pass", findings: [], testGaps: [], summary: "ok" },
+    });
+    assert.equal(result.phase, "cancelled");
+    assert.equal((await new WorkflowStore(directory).load(record.id))?.phase, "cancelled");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("recoverCallbacks resumes persisted submissions exactly once with bounded attempts", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-recover-"));
+  try {
+    const callback = new FakeCallback();
+    callback.results = [{ kind: "verdict", verdict: { verdict: "pass", findings: [], testGaps: [], summary: "ok" } }];
+    const instance = manager(directory, new FakeGateway(), {}, callback, fakeBridgeQueue());
+    const exec = fakeExec("session-recover", directory, []);
+    const bridge = await bridgeWorkflow(instance, "session-recover", directory, newRequestId());
+
+    // Simulate a crash right after persist: queued submission, no callback ran.
+    const submitted = await instance.submit(bridge.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
+    assert.equal(callback.requests.length, 1); // the live submit already ran
+
+    // Reset to the pre-spawn state: submission queued, attempts 0.
+    await new WorkflowStore(directory).update(bridge.id, (r) => {
+      r.submissionState = "queued";
+      r.submissionAttempts = 0;
+    });
+    callback.requests.length = 0;
+    callback.results.push({ kind: "verdict", verdict: { verdict: "pass", findings: [], testGaps: [], summary: "ok" } });
+
+    // Two concurrent restarters: exactly one spawn.
+    const [first, second] = await Promise.all([instance.recoverCallbacks(), instance.recoverCallbacks()]);
+    assert.equal(first + second, 1);
+    await waitFor(async () => callback.requests.length === 1);
+    assert.equal(callback.requests[0]!.submissionId, submitted.submissionId);
+    // Wait for the fire-and-forget recovery chain to finish its writes.
+    await waitFor(async () => (await new WorkflowStore(directory).load(bridge.id))?.submissionState === "received");
+
+    // Exhausted attempts are failed, not re-spawned.
+    await new WorkflowStore(directory).update(bridge.id, (r) => {
+      r.submissionState = "queued";
+      r.submissionAttempts = 5;
+    });
+    callback.results.length = 0;
+    const recovered = await instance.recoverCallbacks();
+    assert.equal(recovered, 0);
+    assert.equal(callback.requests.length, 1);
+    assert.equal((await new WorkflowStore(directory).load(bridge.id))?.submissionState, "failed");
+    // Let the fire-and-forget recovery chain settle before removing the dir.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  } finally {
+    await rmRetry(directory);
+  }
+});
+
+/** Finding 3: infrastructure failures never consume a review cycle; the first
+ * APPLIED verdict is still cycle 1 for both the bridge submit path and the
+ * DSH review path. */
+test("callback infrastructure failures do not consume a review cycle; first applied verdict is cycle 1", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-cycles-"));
+  try {
+    // Bridge submit path: three busy failures, then a real pass applies.
+    const callback = new FakeCallback();
+    callback.results.push({ kind: "retryable_busy" });
+    callback.results.push({ kind: "retryable_busy" });
+    callback.results.push({ kind: "retryable_busy" });
+    const queue = fakeBridgeQueue();
+    const instance = manager(directory, new FakeGateway(), { callbackMaxAttempts: 3, callbackRetryBaseMs: 30 }, callback, queue);
+    const exec = fakeExec("session-cycles", directory, []);
+    const bridge = await bridgeWorkflow(instance, "session-cycles", directory, newRequestId());
+    const failed = await instance.submit(bridge.id, { implementationSummary: "try 1", changedFiles: ["changed.txt"] }, exec);
+    assert.equal(failed.submissionState, "failed", "busy exhaustion fails the submission, not the workflow");
+    assert.equal(failed.reviewCycles, 0, "infrastructure failures consume no cycle");
+    assert.equal(failed.phase, "executing", "the workflow stays retryable");
+    // The first APPLIED verdict is cycle 1.
+    const submitted = await instance.submit(bridge.id, { implementationSummary: "try 2", changedFiles: ["changed.txt"] }, exec);
+    assert.equal(submitted.reviewCycles, 0, "still zero until the verdict is applied");
+    const applied = await instance.applyExternalVerdict(queue.commands[0]!);
+    assert.equal(applied.reviewCycles, 1, "first applied verdict is cycle 1");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("a legacy DSH review consumes exactly one cycle per applied review", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-cycles-review-"));
+  try {
+    const gateway = new FakeGateway();
+    gateway.reviewResults = [{ verdict: "changes_requested", findings: [blockingFinding], testGaps: [], summary: "no" }];
+    const instance = manager(directory, gateway, {}, new FakeCallback());
+    const exec = fakeExec("session-cycles-review", directory, []);
+    const planned = await instance.start({ task: "Fix it" }, exec);
+    assert.equal(planned.phase, "executing");
+    assert.equal(planned.reviewCycles, 0, "starting a workflow consumes no cycle");
+    const reviewed = await instance.review(planned.id, { implementationSummary: "work", changedFiles: ["changed.txt"] }, exec);
+    assert.equal(reviewed.phase, "fixing");
+    assert.equal(reviewed.reviewCycles, 1, "one applied review = one cycle");
+    // Another round: cycle 2.
+    gateway.reviewResults = [{ verdict: "changes_requested", findings: [blockingFinding], testGaps: [], summary: "no" }];
+    const second = await instance.review(planned.id, { implementationSummary: "more", changedFiles: ["changed.txt"] }, exec);
+    assert.equal(second.reviewCycles, 2);
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+async function rmClosed(path: string): Promise<void> {
+  closeCoordinationStoresForDirectory(join(path, "legacy"));
+  closeCoordinationStoresForDirectory(path);
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    try {
+      await rm(path, { recursive: true, force: true });
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  await rm(path, { recursive: true, force: true });
+}
+
+async function rmRetry(path: string): Promise<void> {
+  await rmClosed(path);
+}
+
+test("cancel kills the active callback child and terminates the submission", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-cancel-child-"));
+  try {
+    const callback = new FakeCallback();
+    const instance = manager(directory, new FakeGateway(), {}, callback);
+    const exec = fakeExec("session-cancel-child", directory, []);
+    const bridge = await bridgeWorkflow(instance, "session-cancel-child", directory, newRequestId());
+    await instance.submit(bridge.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
+    await instance.cancel(bridge.id, exec);
+    assert.deepEqual(callback.cancelledWorkflows, [bridge.id]);
+    const record = await new WorkflowStore(directory).load(bridge.id);
+    assert.equal(record?.phase, "cancelled");
+    assert.equal(record?.submissionState, "failed");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("onTurnStopping steers bridge workflows to submit and legacy workflows to review", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-turnstop-"));
+  try {
+    const instance = manager(directory, new FakeGateway());
+    const exec = fakeExec("session-turnstop", directory, []);
+    const bridge = await bridgeWorkflow(instance, "session-turnstop", directory, newRequestId());
+    const steers: string[] = [];
+    const agent = {
+      id: "session-turnstop",
+      session: { header: { cwd: directory } },
+      steer: (message: { content: Array<{ text?: string }> }) => {
+        steers.push(message.content[0]?.text ?? "");
+      },
+    } as never as import("@deepseek-ai/dsh-agent").Agent;
+    await instance.onTurnStopping(agent, 1);
+    assert.equal(steers.length, 1);
+    assert.match(steers[0]!, /codex_workflow_submit/);
+    assert.ok(!/codex_workflow_review/.test(steers[0]!));
+
+    const legacy = await instance.start({ task: "Legacy" }, fakeExec("session-turnstop-legacy", directory, []));
+    assert.equal(legacy.phase, "executing");
+    const legacyAgent = {
+      id: "session-turnstop-legacy",
+      session: { header: { cwd: directory } },
+      steer: (message: { content: Array<{ text?: string }> }) => {
+        steers.push(message.content[0]?.text ?? "");
+      },
+    } as never as import("@deepseek-ai/dsh-agent").Agent;
+    await instance.onTurnStopping(legacyAgent, 2);
+    assert.equal(steers.length, 2);
+    assert.match(steers[1]!, /codex_workflow_review/);
+  } finally {
+    await rmClosed(directory);
   }
 });
 
@@ -944,6 +1489,866 @@ async function waitFor(predicate: () => Promise<boolean> | boolean, timeoutMs = 
   throw new Error("timed out waiting for condition");
 }
 
+/** A crash between verdict staging (verdict_ready) and enqueue must be
+ * recovered by re-enqueueing the EXACT staged command (same requestId,
+ * createdAt, commandHash) — never a new identity — and must never respawn
+ * the callback. The staged identity survives `received` and is only cleared
+ * once the verdict is APPLIED. */
+test("verdict_ready recovery re-enqueues the exact staged command and keeps its identity until applied", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-verdictready-"));
+  try {
+    const callback = new FakeCallback();
+    const queue = fakeBridgeQueue();
+    const instance = manager(directory, new FakeGateway(), {}, callback, queue);
+    const exec = fakeExec("session-vr", directory, []);
+    const codexThreadId = newRequestId();
+    const bridge = await bridgeWorkflow(instance, "session-vr", directory, codexThreadId);
+    const submitted = await instance.submit(bridge.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
+    assert.equal(submitted.submissionState, "received");
+    // Simulate the crash after phase A (staged) before phase B/C: the staged
+    // command is the one the queue must see, verbatim.
+    const stagedRequestId = newRequestId();
+    const stagedCommand: import("../src/bridge-protocol.js").SubmitVerdictCommand = {
+      version: 1,
+      kind: "submit_verdict",
+      requestId: stagedRequestId,
+      createdAt: "2026-08-18T00:00:00.000Z",
+      workflowId: bridge.id,
+      codexThreadId,
+      submissionId: submitted.submissionId!,
+      verdict: { verdict: "pass", findings: [], testGaps: [], summary: "ok" },
+    };
+    await new WorkflowStore(directory).update(bridge.id, (r) => {
+      r.submissionState = "verdict_ready";
+      r.stagedVerdict = { command: stagedCommand, createdAt: stagedCommand.createdAt };
+    });
+    queue.commands.length = 0;
+    callback.requests.length = 0;
+
+    const recovered = await instance.recoverCallbacks();
+    assert.equal(recovered, 0, "verdict_ready recovery is not a callback spawn");
+    await waitFor(async () => (await new WorkflowStore(directory).load(bridge.id))?.submissionState === "received");
+    assert.equal(callback.requests.length, 0, "verdict_ready recovery never respawns the callback");
+    assert.equal(queue.commands.length, 1);
+    // The re-enqueued command is byte-for-byte the staged one: same requestId,
+    // createdAt, verdict payload — hence the same commandHash.
+    assert.deepEqual(queue.commands[0], stagedCommand, "recovery re-enqueues the EXACT staged command");
+    assert.equal(queue.commands[0]!.createdAt, stagedCommand.createdAt);
+    // The staged identity is KEPT through received: a conflicting manual
+    // verdict cannot jump ahead of the expected one.
+    const receivedRecord = await new WorkflowStore(directory).load(bridge.id);
+    assert.equal(receivedRecord?.stagedVerdict?.command.requestId, stagedRequestId, "identity kept until applied");
+    // Repeated recovery cannot mint a second, different identity.
+    const again = await instance.recoverCallbacks();
+    assert.equal(again, 0);
+    assert.equal(queue.commands.length, 1);
+    // Applying the expected identity clears the staged verdict.
+    await instance.applyExternalVerdict(stagedCommand);
+    const applied = await new WorkflowStore(directory).load(bridge.id);
+    assert.equal(applied?.phase, "passed");
+    assert.equal(applied?.stagedVerdict, undefined, "staged identity cleared after apply");
+  } finally {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await rmRetry(directory);
+  }
+});
+
+test("first apply only from received: verdict_ready is not applicable and conflicting request ids are rejected", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-verdictready-reject-"));
+  try {
+    const instance = manager(directory, new FakeGateway(), {}, new FakeCallback(), fakeBridgeQueue());
+    const exec = fakeExec("session-vrr", directory, []);
+    const codexThreadId = newRequestId();
+    const bridge = await bridgeWorkflow(instance, "session-vrr", directory, codexThreadId);
+    const submitted = await instance.submit(bridge.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
+    const stagedRequestId = newRequestId();
+    const stagedCommand: import("../src/bridge-protocol.js").SubmitVerdictCommand = {
+      version: 1,
+      kind: "submit_verdict",
+      requestId: stagedRequestId,
+      createdAt: "2026-08-18T00:00:00.000Z",
+      workflowId: bridge.id,
+      codexThreadId,
+      submissionId: submitted.submissionId!,
+      verdict: { verdict: "pass", findings: [], testGaps: [], summary: "ok" },
+    };
+    await new WorkflowStore(directory).update(bridge.id, (r) => {
+      r.submissionState = "verdict_ready";
+      r.stagedVerdict = { command: stagedCommand, createdAt: stagedCommand.createdAt };
+    });
+    const base = {
+      version: 1 as const,
+      kind: "submit_verdict" as const,
+      requestId: newRequestId(),
+      createdAt: new Date().toISOString(),
+      workflowId: bridge.id,
+      codexThreadId,
+      submissionId: submitted.submissionId!,
+      verdict: { verdict: "pass" as const, findings: [], testGaps: [], summary: "ok" },
+    };
+    // A different request id answering the same staged submission is refused.
+    await assert.rejects(instance.applyExternalVerdict(base), /already staged/);
+    // verdict_ready is NOT applicable even for the expected identity: the
+    // first apply must wait for the enqueue commit (received).
+    await assert.rejects(
+      instance.applyExternalVerdict({ ...base, requestId: stagedRequestId }),
+      /not yet applicable/,
+    );
+    const midState = await new WorkflowStore(directory).load(bridge.id);
+    assert.equal(midState?.submissionState, "verdict_ready");
+    assert.equal(midState?.stagedVerdict?.command.requestId, stagedRequestId);
+
+    // Phase C commits received (identity kept). Now the expected identity
+    // applies — and a conflicting request id arriving FIRST still cannot
+    // steal the apply.
+    await new WorkflowStore(directory).update(bridge.id, (r) => {
+      if (r.stagedVerdict?.command.requestId !== stagedRequestId) return;
+      r.submissionState = "received";
+      r.callbackState = "idle";
+    });
+    await assert.rejects(
+      instance.applyExternalVerdict({ ...base, requestId: newRequestId() }),
+      /already staged/,
+      "a conflicting request id cannot jump ahead of the expected one",
+    );
+    assert.equal((await instance.applyExternalVerdict({ ...base, requestId: stagedRequestId })).phase, "passed");
+    const applied = await new WorkflowStore(directory).load(bridge.id);
+    assert.equal(applied?.submissionState, "applied");
+    assert.equal(applied?.stagedVerdict, undefined);
+    // Replay of the SAME request id is idempotent; a DIFFERENT request id for
+    // the same submission is refused after apply too.
+    assert.equal((await instance.applyExternalVerdict({ ...base, requestId: stagedRequestId })).phase, "passed");
+    await assert.rejects(
+      instance.applyExternalVerdict({ ...base, requestId: newRequestId() }),
+      /already applied as request/,
+    );
+  } finally {
+    await rmRetry(directory);
+  }
+});
+
+/** P1-3: the verdict is bound to the evidence fingerprint captured at submit
+ * time. If the workspace changed since, an old "pass" must NEVER apply — not
+ * even via the block/gate policy — and a fresh submit repairs the flow. */
+test("a pass verdict is refused when the workspace changed since the review (git)", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-verdict-changed-git-"));
+  try {
+    // The reviewed workspace is a nested repo; the workflow store lives OUTSIDE
+    // it, so the plugin's own record files never pollute the git fingerprint.
+    const repo = join(directory, "repo");
+    await mkdir(repo, { recursive: true });
+    await initGitRepo(repo);
+    const queue = fakeBridgeQueue();
+    const instance = manager(directory, new FakeGateway(), {}, new FakeCallback(), queue);
+    const exec = fakeExec("session-vcg", repo, []);
+    const codexThreadId = newRequestId();
+    const bridge = await bridgeWorkflow(instance, "session-vcg", repo, codexThreadId);
+    const submitted = await instance.submit(bridge.id, { implementationSummary: "v1", changedFiles: ["changed.txt"] }, exec);
+    assert.ok(submitted.latestReviewEvidence?.fingerprint);
+    // The automatic callback staged the exact verdict command; apply uses THAT
+    // original command (same requestId/createdAt/hash), never a new one.
+    const stagedCommand = queue.commands[0]!;
+
+    // Workspace changes AFTER the review, before the verdict arrives.
+    await writeFile(join(repo, "a.txt"), "v2-changed", "utf8");
+    const refused = await instance.applyExternalVerdict(stagedCommand);
+    assert.notEqual(refused.phase, "passed", "changed workspace must never apply a stale pass");
+    assert.equal(refused.phase, "executing");
+    assert.match(refused.error ?? "", /workspace changed since the review/);
+    assert.equal(refused.latestReview, undefined, "the stale verdict and findings are void");
+
+    // A fresh submit over the new state binds new evidence and passes.
+    const resubmitted = await instance.submit(bridge.id, { implementationSummary: "v2", changedFiles: ["changed.txt"] }, exec);
+    assert.notEqual(resubmitted.submissionId, submitted.submissionId);
+    const passed = await instance.applyExternalVerdict(queue.commands[1]!);
+    assert.equal(passed.phase, "passed");
+  } finally {
+    await rmRetry(directory);
+  }
+});
+
+test("a pass verdict is refused when the workspace changed since the review (non-git)", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-verdict-changed-files-"));
+  try {
+    const file = join(directory, "a.txt");
+    await writeFile(file, "v1", "utf8");
+    const queue = fakeBridgeQueue();
+    const instance = manager(directory, new FakeGateway(), {}, new FakeCallback(), queue);
+    const exec = fakeExec("session-vcf", directory, []);
+    const codexThreadId = newRequestId();
+    const bridge = await bridgeWorkflow(instance, "session-vcf", directory, codexThreadId);
+    const submitted = await instance.submit(bridge.id, { implementationSummary: "v1", changedFiles: ["a.txt"] }, exec);
+    assert.ok(submitted.latestReviewEvidence?.fingerprint);
+    const stagedCommand = queue.commands[0]!;
+
+    await writeFile(file, "v2-changed", "utf8");
+    const refused = await instance.applyExternalVerdict(stagedCommand);
+    assert.notEqual(refused.phase, "passed");
+    assert.match(refused.error ?? "", /workspace changed since the review/);
+
+    const resubmitted = await instance.submit(bridge.id, { implementationSummary: "v2", changedFiles: ["a.txt"] }, exec);
+    const passed = await instance.applyExternalVerdict(queue.commands[1]!);
+    assert.equal(passed.phase, "passed");
+  } finally {
+    await rmRetry(directory);
+  }
+});
+
+/** P1-4: the decision-gate fix prompt must point bridge workflows at
+ * codex_workflow_submit, never codex_workflow_review. */
+test("decide(fix) steers bridge workflows to submit and legacy workflows to review", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-decide-origin-"));
+  try {
+    // Bridge workflow: the automatic callback produces a NON-BLOCKING
+    // changes_requested verdict which reaches waiting_review_decision.
+    const queue = fakeBridgeQueue();
+    const callback = new FakeCallback();
+    callback.results = [{
+      kind: "verdict" as const,
+      verdict: { verdict: "changes_requested", findings: [nonBlockingFinding], testGaps: [], summary: "nits" },
+    }];
+    const instance = manager(directory, new FakeGateway(), {}, callback, queue);
+    const bridgeExec = fakeExec("session-decide-bridge", directory, []);
+    const codexThreadId = newRequestId();
+    const bridge = await bridgeWorkflow(instance, "session-decide-bridge", directory, codexThreadId);
+    const submitted = await instance.submit(bridge.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, bridgeExec);
+    const stagedCommand = queue.commands[0]!;
+    assert.equal(stagedCommand.verdict.verdict, "changes_requested");
+    const bridgeDeferred: unknown[] = [];
+    const applied = await instance.applyExternalVerdict(stagedCommand);
+    assert.equal(applied.phase, "waiting_review_decision");
+    const decided = await instance.decide(bridge.id, { decision: "fix" }, fakeExec("session-decide-bridge", directory, bridgeDeferred));
+    assert.equal(decided.phase, "fixing");
+    const bridgeText = JSON.stringify(bridgeDeferred.map((m) => (m as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? ""));
+    assert.match(bridgeText, /codex_workflow_submit/);
+    assert.ok(!/codex_workflow_review/.test(bridgeText), "bridge fix prompt must not name the review tool");
+
+    // Legacy workflow: review tool is still the right next step.
+    const legacyGateway = new FakeGateway();
+    legacyGateway.reviewResults = [{ verdict: "changes_requested", findings: [nonBlockingFinding], testGaps: [], summary: "nits" }];
+    const legacy = manager(join(directory, "legacy"), legacyGateway, {}, new FakeCallback(), fakeBridgeQueue());
+    const planned = await legacy.start({ task: "Legacy" }, fakeExec("session-decide-legacy", directory, []));
+    await legacy.review(planned.id, { implementationSummary: "Impl" }, fakeExec("session-decide-legacy", directory, []));
+    const legacyDeferred: unknown[] = [];
+    await legacy.decide(planned.id, { decision: "fix" }, fakeExec("session-decide-legacy", directory, legacyDeferred));
+    const legacyText = JSON.stringify(legacyDeferred.map((m) => (m as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? ""));
+    assert.match(legacyText, /codex_workflow_review/);
+  } finally {
+    await rmRetry(directory);
+  }
+});
+
+/** P1-6: the submission lease is the cross-process claim gate — two manager
+ * instances over one store can never double-spawn a callback for the same
+ * submission, a live lease is never taken, and an expired lease is. */
+test("two managers over one store spawn exactly one callback via the submission lease", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-lease-"));
+  try {
+    const setup = manager(directory, new FakeGateway(), {}, new FakeCallback(), fakeBridgeQueue());
+    const exec = fakeExec("session-lease", directory, []);
+    const bridge = await bridgeWorkflow(setup, "session-lease", directory, newRequestId());
+    const submitted = await setup.submit(bridge.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
+
+    // Simulate a crash right after persist: queued submission, attempts 0.
+    await new WorkflowStore(directory).update(bridge.id, (r) => {
+      r.submissionState = "queued";
+      r.submissionAttempts = 0;
+    });
+    const callbackA = new FakeCallback();
+    const callbackB = new FakeCallback();
+    const managerA = manager(directory, new FakeGateway(), {}, callbackA, fakeBridgeQueue());
+    const managerB = manager(directory, new FakeGateway(), {}, callbackB, fakeBridgeQueue());
+    const [a, b] = await Promise.all([managerA.recoverCallbacks(), managerB.recoverCallbacks()]);
+    assert.equal(a + b, 1, "exactly one manager wins the claim");
+    await waitFor(async () => callbackA.requests.length + callbackB.requests.length === 1);
+    assert.equal(callbackA.requests.length + callbackB.requests.length, 1, "exactly one child spawned");
+    assert.ok(callbackA.requests[0]?.submissionId === submitted.submissionId
+      || callbackB.requests[0]?.submissionId === submitted.submissionId);
+    await waitFor(async () => (await new WorkflowStore(directory).load(bridge.id))?.submissionState === "received");
+  } finally {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await rmRetry(directory);
+  }
+});
+
+test("a live submission lease blocks recovery; an expired lease is taken over", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-lease-expiry-"));
+  try {
+    const instance = manager(directory, new FakeGateway(), {}, new FakeCallback(), fakeBridgeQueue());
+    const exec = fakeExec("session-lease-exp", directory, []);
+    const bridge = await bridgeWorkflow(instance, "session-lease-exp", directory, newRequestId());
+    const submitted = await instance.submit(bridge.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
+    await new WorkflowStore(directory).update(bridge.id, (r) => {
+      r.submissionState = "queued";
+      r.submissionAttempts = 0;
+    });
+    const coordination = new WorkflowStore(directory).coordinationHandle;
+    const resource = `submission:${bridge.id}:${submitted.submissionId}`;
+
+    // Live lease (another process): recovery must skip it entirely.
+    const grant = coordination.acquireLease(resource, 60_000, "other-process");
+    assert.ok(grant, "other process holds the lease");
+    const blocked = new FakeCallback();
+    const blocker = manager(directory, new FakeGateway(), {}, blocked, fakeBridgeQueue());
+    assert.equal(await blocker.recoverCallbacks(), 0);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(blocked.requests.length, 0, "a live lease must not be stolen");
+
+    // The owner releases (or crashes — lease then expires): recovery takes over.
+    assert.equal(coordination.releaseLease(resource, grant!.epoch, grant!.owner), true);
+    const taker = new FakeCallback();
+    const takerMgr = manager(directory, new FakeGateway(), {}, taker, fakeBridgeQueue());
+    assert.equal(await takerMgr.recoverCallbacks(), 1);
+    await waitFor(async () => taker.requests.length === 1);
+    await waitFor(async () => (await new WorkflowStore(directory).load(bridge.id))?.submissionState === "received");
+  } finally {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await rmRetry(directory);
+  }
+});
+
+/** P2: attempts are counted once per REAL spawn — a recovery claim must not
+ * consume an extra attempt on top of the actual callback run. */
+test("recovery counts exactly one attempt per real callback spawn", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-attempts-"));
+  try {
+    const callback = new FakeCallback();
+    callback.results = [{ kind: "verdict", verdict: { verdict: "pass", findings: [], testGaps: [], summary: "ok" } }];
+    const instance = manager(directory, new FakeGateway(), {}, callback, fakeBridgeQueue());
+    const exec = fakeExec("session-attempts", directory, []);
+    const bridge = await bridgeWorkflow(instance, "session-attempts", directory, newRequestId());
+    const submitted = await instance.submit(bridge.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
+    assert.equal(submitted.submissionAttempts, 1, "one live spawn = one attempt");
+    assert.equal(callback.requests.length, 1);
+
+    // Crash after the first real send: persisted attempts stay at 1.
+    await new WorkflowStore(directory).update(bridge.id, (r) => {
+      r.submissionState = "queued";
+    });
+    callback.results.push({ kind: "verdict", verdict: { verdict: "pass", findings: [], testGaps: [], summary: "ok" } });
+    callback.requests.length = 0;
+    assert.equal(await instance.recoverCallbacks(), 1);
+    await waitFor(async () => callback.requests.length === 1);
+    await waitFor(async () => (await new WorkflowStore(directory).load(bridge.id))?.submissionState === "received");
+    const finalRecord = await new WorkflowStore(directory).load(bridge.id);
+    assert.equal(finalRecord?.submissionAttempts, 2, "recovery spawn = exactly one more attempt");
+    assert.equal(callback.requests.length, 1);
+  } finally {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await rmRetry(directory);
+  }
+});
+
+/** P0-B (round 3): workflow creation is atomic per session/request — two
+ * overlapping creators for the same request yield exactly one workflow and
+ * the same idempotent record; the same session cannot get two active
+ * workflows. */
+test("concurrent dispatch of the same request yields exactly one workflow", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-create-atomic-"));
+  try {
+    const agent = fakeExec("session-create", directory, []).agent!;
+    const shared = new WorkflowStore(directory);
+    const managerA = new WorkflowManager(shared, new FakeGateway(), { ...config, storageDir: directory });
+    const managerB = new WorkflowManager(new WorkflowStore(directory), new FakeGateway(), { ...config, storageDir: directory });
+    const command = {
+      version: 1 as const,
+      kind: "dispatch_plan" as const,
+      requestId: newRequestId(),
+      createdAt: new Date().toISOString(),
+      codexThreadId: newRequestId(),
+      target: { cwd: directory, dshSessionId: "session-create" },
+      task: "Concurrent dispatch",
+      planMarkdown: "<proposed_plan>\nDo it\n</proposed_plan>",
+      assumptions: [],
+    };
+    const [a, b] = await Promise.all([
+      managerA.startExternalPlan(command, agent),
+      managerB.startExternalPlan(command, agent),
+    ]);
+    assert.equal(a.id, b.id, "both creators return the SAME workflow");
+    const active = await shared.activeForSession("session-create");
+    assert.equal(active?.id, a.id);
+    const all = await shared.list();
+    assert.equal(all.filter((r) => r.dshSessionId === "session-create" && r.bridgeRequestId === command.requestId).length, 1);
+  } finally {
+    await rmRetry(directory);
+  }
+});
+
+test("concurrent dispatch of different requests on one session leaves exactly one active workflow", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-create-session-"));
+  try {
+    const agent = fakeExec("session-create-2", directory, []).agent!;
+    const shared = new WorkflowStore(directory);
+    const managerA = new WorkflowManager(shared, new FakeGateway(), { ...config, storageDir: directory });
+    const managerB = new WorkflowManager(new WorkflowStore(directory), new FakeGateway(), { ...config, storageDir: directory });
+    const makeCommand = () => ({
+      version: 1 as const,
+      kind: "dispatch_plan" as const,
+      requestId: newRequestId(),
+      createdAt: new Date().toISOString(),
+      codexThreadId: newRequestId(),
+      target: { cwd: directory, dshSessionId: "session-create-2" },
+      task: "Race",
+      planMarkdown: "<proposed_plan>\nDo it\n</proposed_plan>",
+      assumptions: [],
+    });
+    const [a, b] = await Promise.allSettled([
+      managerA.startExternalPlan(makeCommand(), agent),
+      managerB.startExternalPlan(makeCommand(), agent),
+    ]);
+    const fulfilled = [a, b].filter((r): r is PromiseFulfilledResult<import("../src/types.js").WorkflowRecord> => r.status === "fulfilled");
+    const rejected = [a, b].filter((r): r is PromiseRejectedResult => r.status === "rejected");
+    assert.equal(fulfilled.length, 1, "exactly one creator creates");
+    assert.ok(rejected.length === 1, "the other is rejected (already active or creating)");
+    assert.match(String(rejected[0]!.reason), /active Codex workflow|already creating/);
+    const active = await shared.activeForSession("session-create-2");
+    assert.equal(active?.id, fulfilled[0]!.value.id);
+    assert.equal((await shared.list()).filter((r) => r.dshSessionId === "session-create-2").length, 1);
+  } finally {
+    await rmRetry(directory);
+  }
+});
+
+/** A-lost-lease fencing: after B takes over A's submission lease, A's late
+ * callback result must never write state or enqueue a verdict. */
+test("a callback owner that lost its lease cannot write or enqueue a verdict", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-leaselost-"));
+  try {
+    // A SHARED queue is injected into both owners, so the queue's content is
+    // the single observable truth: only the new owner's staged command may
+    // ever appear.
+    const sharedQueue = fakeBridgeQueue();
+    const callbackA = new DeferredCallback();
+    callbackA.deferredVerdict = { verdict: "pass", findings: [], testGaps: [], summary: "A-verdict" };
+    const instanceA = manager(directory, new FakeGateway(), { leaseTtlMs: 300 }, callbackA, sharedQueue);
+    const exec = fakeExec("session-leaselost", directory, []);
+    const bridge = await bridgeWorkflow(instanceA, "session-leaselost", directory, newRequestId());
+
+    const pendingSubmit = instanceA.submit(bridge.id, { implementationSummary: "A", changedFiles: ["changed.txt"] }, exec);
+    // Wait until A's callback child is in flight (its deferred send pending).
+    await waitFor(async () => callbackA.sentRequests.length === 1);
+
+    // B (another process/manager) takes over A's now-abandoned submission lease.
+    const callbackB = new FakeCallback();
+    callbackB.results.push({ kind: "verdict", verdict: { verdict: "pass", findings: [], testGaps: [], summary: "B-verdict" } });
+    const instanceB = manager(directory, new FakeGateway(), { leaseTtlMs: 300 }, callbackB, sharedQueue);
+    const coordination = new WorkflowStore(directory).coordinationHandle;
+    const record = await new WorkflowStore(directory).load(bridge.id);
+    const resource = `submission:${bridge.id}:${record!.submissionId}`;
+    // Simulate A's lease being gone (expired/taken): clear the lease row.
+    if (record!.submissionLeaseToken && record!.submissionLeaseEpoch !== undefined) {
+      coordination.releaseLease(resource, record!.submissionLeaseEpoch, record!.submissionLeaseToken);
+    }
+    assert.equal(await instanceB.recoverCallbacks(), 1);
+    // B completes the pipeline (verdict staged + enqueued + received).
+    await waitFor(async () => (await new WorkflowStore(directory).load(bridge.id))?.submissionState === "received");
+
+    // A's heartbeat detects the loss (renew changes 0 rows) and kills its child.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.ok(callbackA.cancelledSubmissions.includes(`${bridge.id}:${record!.submissionId}`),
+      "A kills its own callback child after losing the lease");
+
+    // A's late callback result arrives: it must NOT write or enqueue anything.
+    callbackA.releaseDeferred();
+    await pendingSubmit;
+    const after = await new WorkflowStore(directory).load(bridge.id);
+    assert.equal(after?.submissionState, "received", "A did not regress the state");
+    assert.equal(after?.appliedVerdictRequestId, undefined, "A did not apply");
+    // Shared-persistent-queue semantics: exactly the NEW owner's command exists.
+    assert.equal(sharedQueue.commands.length, 1, "only B's verdict ever entered the shared queue");
+    for (const command of sharedQueue.commands) {
+      assert.equal(command.verdict.summary, "B-verdict", "only the NEW owner enqueues");
+      assert.equal(command.submissionId, record!.submissionId);
+      assert.equal(command.requestId, after?.stagedVerdict?.command.requestId);
+    }
+    assert.equal(after?.stagedVerdict?.command.verdict.summary, "B-verdict");
+  } finally {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await rmRetry(directory);
+  }
+});
+
+/** [#1 review] The reviewer gets the FULL bounded diff (no silent 8KB clip)
+ * when it fits, and is explicitly allowed read-only inspection commands. */
+test("callback embeds the full bounded diff and allows read-only inspection", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-bigdiff-"));
+  try {
+    const repo = join(directory, "repo");
+    await mkdir(repo, { recursive: true });
+    await initGitRepo(repo);
+    // A diff comfortably between 8KB (the old silent clip) and 64KB (embed bound).
+    const big = Array.from({ length: 1200 }, (_, i) =>
+      `line-${String(i).padStart(5, "0")} a reasonably long line of change content`,
+    ).join("\n");
+    assert.ok(big.length > 8000, "the diff must exceed the former 8KB clip");
+    assert.ok(big.length < 65536);
+    await writeFile(join(repo, "a.txt"), big, "utf8");
+
+    const callback = new FakeCallback();
+    const instance = manager(directory, new FakeGateway(), {}, callback, fakeBridgeQueue());
+    const exec = fakeExec("session-bigdiff", repo, []);
+    const bridge = await bridgeWorkflow(instance, "session-bigdiff", repo, newRequestId());
+    const submitted = await instance.submit(bridge.id, { implementationSummary: "big change", changedFiles: ["changed.txt"] }, exec);
+    assert.equal(submitted.submissionState, "received");
+    const prompt = callback.requests[0]!.prompt;
+    // The full diff is embedded — a line far beyond byte 8000 is present.
+    assert.ok(prompt.includes("line-01199"), "the full bounded diff is embedded, not clipped at 8KB");
+    assert.match(prompt, /\[full observed diff, \d+ bytes\]/);
+    // Read-only inspection is allowed; the hard "Do not run any command" ban is gone.
+    assert.match(prompt, /read-only inspection commands/);
+    assert.match(prompt, /MUST NOT write or modify any file/);
+    assert.ok(!/Do not run any command/.test(prompt), "the reviewer may run read-only inspection commands");
+  } finally {
+    await rmRetry(directory);
+  }
+});
+
+/** [#1 review] When evidence collection had to truncate the diff, the reviewer
+ * is explicitly told and still allowed read-only inspection of the workspace. */
+test("callback tells the reviewer the diff was truncated and still allows read-only inspection", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-hugediff-"));
+  try {
+    const repo = join(directory, "repo");
+    await mkdir(repo, { recursive: true });
+    await initGitRepo(repo);
+    const huge = Array.from({ length: 5000 }, (_, i) => `r${i}-${"y".repeat(24)}`).join("\n");
+    assert.ok(Buffer.byteLength(huge, "utf8") > 65536, "well beyond the embed bound");
+    await writeFile(join(repo, "a.txt"), huge, "utf8");
+
+    const callback = new FakeCallback();
+    const instance = manager(directory, new FakeGateway(), {}, callback, fakeBridgeQueue());
+    const exec = fakeExec("session-hugediff", repo, []);
+    const bridge = await bridgeWorkflow(instance, "session-hugediff", repo, newRequestId());
+    await instance.submit(bridge.id, { implementationSummary: "huge change", changedFiles: ["changed.txt"] }, exec);
+    const prompt = callback.requests[0]!.prompt;
+    assert.match(
+      prompt,
+      /\[diff truncated by evidence collection, observed \d+ bytes; the full diff was too large to embed\]/,
+      "the reviewer is told it is truncated",
+    );
+    assert.match(prompt, /read-only inspection commands/, "and allowed to inspect the rest itself");
+    assert.match(prompt, /MUST NOT write or modify any file/);
+  } finally {
+    await rmRetry(directory);
+  }
+});
+
+/** Accessible callback whose send blocks until released; rejects on abort. */
+class AbortableCallback implements CodexCallback {
+  results: Array<{ kind: "verdict"; verdict: ReviewResult } | { kind: "retryable_busy" } | Error> = [];
+  requests: Array<{ workflowId: string; submissionId: string }> = [];
+  sendCalls = 0;
+  cancelledWorkflows: string[] = [];
+  cancelledSubmissions: string[] = [];
+  stopped = false;
+  private releaseFn?: () => void;
+
+  async send(request: { workflowId: string; submissionId: string; codexThreadId: string; cwd: string; prompt: string }, signal?: AbortSignal): Promise<{ kind: "verdict"; verdict: ReviewResult } | { kind: "retryable_busy" }> {
+    this.requests.push(request);
+    this.sendCalls += 1;
+    await new Promise<void>((resolve, reject) => {
+      this.releaseFn = resolve;
+      signal?.addEventListener("abort", () => reject(new Error("callback aborted")), { once: true });
+    });
+    const next = this.results.shift();
+    if (next instanceof Error) throw next;
+    return next ?? { kind: "verdict", verdict: { verdict: "pass", findings: [], testGaps: [], summary: "pass" } };
+  }
+
+  release(): void {
+    this.releaseFn?.();
+    this.releaseFn = undefined;
+  }
+
+  cancel(workflowId: string): void {
+    this.cancelledWorkflows.push(workflowId);
+  }
+
+  cancelSubmission(workflowId: string, submissionId: string): void {
+    this.cancelledSubmissions.push(`${workflowId}:${submissionId}`);
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+  }
+}
+
+/** [#3 teardown] stop() awaits every recovery-derived background task; once it
+ * returns there can be no further enqueue, store update or callback spawn. */
+test("stop() awaits recovery-derived background tasks; nothing writes afterwards", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-stopbg-"));
+  try {
+    // Setup: a normal submit creates the submission.
+    const setupCb = new FakeCallback();
+    const setupManager = manager(directory, new FakeGateway(), {}, setupCb, fakeBridgeQueue());
+    const exec = fakeExec("session-stopbg", directory, []);
+    const bridge = await bridgeWorkflow(setupManager, "session-stopbg", directory, newRequestId());
+    await setupManager.submit(bridge.id, { implementationSummary: "bg", changedFiles: ["changed.txt"] }, exec);
+    // Simulate a crash: the submission is recoverable again.
+    await new WorkflowStore(directory).update(bridge.id, (r) => {
+      r.submissionState = "queued";
+      r.submissionAttempts = 0;
+      r.pendingReviewRequest = { implementationSummary: "bg", changedFiles: ["changed.txt"] };
+    });
+
+    // Recovery with an abortable callback; the derived task blocks on send.
+    const queueB = fakeBridgeQueue();
+    const cb = new AbortableCallback();
+    const instanceB = manager(directory, new FakeGateway(), { leaseTtlMs: 30_000 }, cb, queueB);
+    const recovered = await instanceB.recoverCallbacks();
+    assert.equal(recovered, 1);
+    await waitFor(async () => cb.sendCalls === 1);
+
+    // stop() must abort and await that in-flight derived task before returning.
+    await instanceB.stop();
+    assert.equal(cb.stopped, true, "callback dispatcher stopped");
+    // No further writes after stop returns — the task was awaited. Snapshot the
+    // record (including its revision) at stop-return and require it to be
+    // byte-identical later: no late store update may happen.
+    const snapshot = await new WorkflowStore(directory).load(bridge.id);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const later = await new WorkflowStore(directory).load(bridge.id);
+    assert.deepEqual(later, snapshot, "the record is unchanged after stop() returned");
+    assert.equal(cb.sendCalls, 1, "no callback respawn after stop");
+    assert.equal(queueB.commands.length, 0, "no verdict enqueued by the aborted task");
+    assert.notEqual(snapshot?.submissionState, "received", "the aborted task never committed received");
+  } finally {
+    await rmRetry(directory);
+  }
+});
+
+/** Finding 6: concurrent stop() calls share ONE settle promise — the second
+ * caller never resolves before the first has truly finished tearing down. */
+test("concurrent manager.stop() share one settle promise", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-stopconc-"));
+  try {
+    const cb = new DeferredCallback();
+    cb.deferredVerdict = { verdict: "pass", findings: [], testGaps: [], summary: "ok" };
+    const instance = manager(directory, new FakeGateway(), { leaseTtlMs: 30_000 }, cb, fakeBridgeQueue());
+    const exec = fakeExec("session-stopconc", directory, []);
+    const bridge = await bridgeWorkflow(instance, "session-stopconc", directory, newRequestId());
+    // Persist a recoverable (queued) submission directly; a recovery then
+    // spawns a derived callback task that blocks on the deferred gate (it
+    // ignores the abort, so stop() must wait for the release).
+    const submissionId = newRequestId();
+    await new WorkflowStore(directory).update(bridge.id, (r) => {
+      r.submissionId = submissionId;
+      r.submissionState = "queued";
+      r.submissionAttempts = 0;
+      r.callbackState = "queued";
+      r.pendingReviewRequest = { implementationSummary: "done", changedFiles: ["changed.txt"] };
+    });
+    const recovered = await instance.recoverCallbacks();
+    assert.equal(recovered, 1);
+    // The background task may or may not have reached its send by now (not a
+    // contract); wait until the deferred callback is parked before stopping.
+    await waitFor(async () => cb.sentRequests.length === 1);
+
+    const first = instance.stop();
+    let secondDone = false;
+    const second = instance.stop();
+    second.then(() => { secondDone = true; });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(secondDone, false, "the second stop must not resolve before the first settles");
+    cb.releaseDeferred();
+    await Promise.all([first, second]);
+    assert.equal(secondDone, true);
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("review infra failures keep the workflow retryable; first applied verdict is still cycle 1", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-cycles-revfail-"));
+  try {
+    const gateway = new FakeGateway();
+    gateway.reviewResults = [
+      { verdict: "changes_requested", findings: [blockingFinding], testGaps: [], summary: "no" },
+      { verdict: "pass", findings: [], testGaps: [], summary: "ok" },
+    ];
+    const instance = manager(directory, gateway, {}, new FakeCallback());
+    const exec = fakeExec("session-revfail", directory, []);
+    const planned = await instance.start({ task: "Do it" }, exec);
+    assert.equal(planned.phase, "executing");
+    // Three consecutive reviewer-infrastructure failures.
+    let infraFailures = 3;
+    const realStartReview = gateway.startReview.bind(gateway);
+    gateway.startReview = async (opts) => {
+      if (infraFailures > 0) {
+        infraFailures -= 1;
+        throw new Error("app-server restarting");
+      }
+      return realStartReview(opts);
+    };
+    for (let i = 0; i < 3; i += 1) {
+      await assert.rejects(
+        instance.review(planned.id, { implementationSummary: `try ${i}`, changedFiles: ["changed.txt"] }, exec),
+        /app-server restarting/,
+      );
+      const r = await new WorkflowStore(directory).load(planned.id);
+      assert.equal(r?.phase, "executing", `stays retryable after infra failure ${i + 1}`);
+      assert.equal(r?.reviewCycles, 0, "infra failure consumed no cycle");
+      assert.ok(r?.error, "the error is recorded for diagnosis");
+    }
+    assert.equal(infraFailures, 0);
+    // The FOURTH review is the first real verdict: it must be cycle 1.
+    const reviewed = await instance.review(planned.id, { implementationSummary: "real", changedFiles: ["changed.txt"] }, exec);
+    assert.equal(reviewed.reviewCycles, 1, "first applied verdict is cycle 1 after three infra failures");
+    assert.equal(reviewed.phase, "fixing");
+    void gateway;
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+/** Finding 1: invalidating a waiting_review_decision verdict must return the
+ * workflow to executing (cleared latestReview), so the VOID guidance (submit
+ * again) matches the tool's phase gate and another submit succeeds. */
+test("invalidating a waiting_review_decision verdict returns to executing and allows resubmit", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-inv-wrd-"));
+  try {
+    const queue = fakeBridgeQueue();
+    const callback = new FakeCallback();
+    callback.results = [{
+      kind: "verdict" as const,
+      verdict: { verdict: "changes_requested", findings: [nonBlockingFinding], testGaps: [], summary: "nits" },
+    }];
+    const instance = manager(directory, new FakeGateway(), {}, callback, queue);
+    const exec = fakeExec("session-inv-wrd", directory, []);
+    const codexThreadId = newRequestId();
+    const bridge = await bridgeWorkflow(instance, "session-inv-wrd", directory, codexThreadId);
+    const submitted = await instance.submit(bridge.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
+    assert.equal(submitted.phase, "executing", "submit queues the verdict but does not change the phase");
+    const stagedCommand = queue.commands[0]!;
+    assert.ok(stagedCommand.dshSessionId === "session-inv-wrd", "staged verdict carries the workflow session");
+    const applied = await instance.applyExternalVerdict(stagedCommand);
+    assert.equal(applied.phase, "waiting_review_decision", "non-blocking changes_requested reaches waiting_review_decision");
+    assert.ok((await new WorkflowStore(directory).load(bridge.id))?.latestReview, "the decision-gate review is present");
+    // The workspace changes before (prepare → relay): the verdict is void.
+    await writeFile(join(directory, "changed.txt"), "changed after the review\n", "utf8");
+    const inv = await instance.assertVerdictStillValid(stagedCommand);
+    assert.equal(inv.invalidated, true);
+    assert.equal(inv.record.phase, "executing", "waiting_review_decision invalidates back to executing");
+    assert.equal(inv.record.latestReview, undefined, "latestReview is cleared");
+    assert.equal(inv.record.appliedVerdictEvidenceFingerprint, undefined);
+    // The VOID guidance (call codex_workflow_submit again) now matches the
+    // phase gate: a fresh submit succeeds.
+    const resub = await instance.submit(bridge.id, { implementationSummary: "fresh", changedFiles: ["changed.txt"] }, exec);
+    assert.equal(resub.phase, "executing");
+    assert.equal(resub.submissionState, "received", "a fresh submission succeeds after invalidation");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+/** A WorkflowStore whose list() can be ARM-ed to park on a gate — used to make
+ * the single-flight recovery deterministic (see Finding 2 below). Nothing is
+ * gated until `holdNextList` is set, so setup (startExternalPlan etc.) runs
+ * normally. */
+class ListGateStore extends WorkflowStore {
+  holdNextList = false;
+  listGate?: DeferredGate;
+  override async list(): Promise<WorkflowRecord[]> {
+    if (this.holdNextList) {
+      this.holdNextList = false;
+      if (this.listGate) await this.listGate.promise;
+    }
+    return super.list();
+  }
+}
+
+/** Finding 2: recovery is single-flight; stop() must abort + await the ONE
+ * active run and only then finish — a concurrent recoverCallbacks() must never
+ * overwrite the chain stop() is waiting on. */
+test("concurrent recoverCallbacks are single-flight; stop awaits the active run", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-singleflight-"));
+  try {
+    const queue = fakeBridgeQueue();
+    const callback = new AbortableCallback();
+    const gate = deferredGate();
+    const store = new ListGateStore(directory);
+    const instance = new WorkflowManager(store, new FakeGateway(), { ...config, storageDir: directory }, callback, queue);
+    const exec = fakeExec("session-singleflight", directory, []);
+    const bridge = await bridgeWorkflow(instance, "session-singleflight", directory, newRequestId());
+    // Persist a recoverable submission directly.
+    const submissionId = newRequestId();
+    await store.update(bridge.id, (r) => {
+      r.submissionId = submissionId;
+      r.submissionState = "queued";
+      r.submissionAttempts = 0;
+      r.callbackState = "queued";
+      r.pendingReviewRequest = { implementationSummary: "done", changedFiles: ["changed.txt"] };
+    });
+
+    // First recovery parks on the gated list() BEFORE running recovery; the
+    // activeRecovery flag is already set by then. The gate is armed now that
+    // setup (which also lists) is complete.
+    store.holdNextList = true;
+    store.listGate = gate;
+    const p1 = instance.recoverCallbacks();
+    await waitFor(async () => instance["activeRecovery"] === true);
+    // A concurrent second recovery must be a no-op (single-flight).
+    const p2 = instance.recoverCallbacks();
+    assert.equal(await p2, 0, "concurrent second recovery returns 0 without overwriting the active run");
+
+    // stop() must abort AND await the single active run (parked on the gate),
+    // so it must NOT finish before the gate is released.
+    const stopPromise = instance.stop();
+    let stopDone = false;
+    stopPromise.then(() => { stopDone = true; });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(stopDone, false, "stop must not return while the active recovery is still parked");
+    assert.equal(callback.sendCalls, 0, "nothing was spawned while parked");
+    gate.release();
+    await Promise.all([p1, stopPromise]);
+    assert.equal(stopDone, true);
+    // The aborted recovery wrote nothing: record unchanged, no callback spawn.
+    assert.equal(callback.sendCalls, 0, "no callback was spawned by the aborted recovery");
+    const snapshot = await store.load(bridge.id);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const later = await store.load(bridge.id);
+    assert.deepEqual(later, snapshot, "record (incl. revision) does not change after stop() returned");
+    assert.equal(snapshot?.submissionState, "queued", "record untouched by the aborted recovery");
+    void exec;
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+/** Deterministic callback whose send can be parked and released later. */
+class DeferredCallback implements CodexCallback {
+  deferredVerdict?: ReviewResult;
+  sentRequests: Array<{ workflowId: string; submissionId: string }> = [];
+  cancelledSubmissions: string[] = [];
+  cancelledWorkflows: string[] = [];
+  stopped = false;
+  private releaseFn?: () => void;
+
+  async send(request: { workflowId: string; submissionId: string; codexThreadId: string; cwd: string; prompt: string }): Promise<{ kind: "verdict"; verdict: ReviewResult } | { kind: "retryable_busy" }> {
+    this.sentRequests.push(request);
+    await new Promise<void>((resolve) => { this.releaseFn = resolve; });
+    return { kind: "verdict", verdict: this.deferredVerdict! };
+  }
+
+  releaseDeferred(): void {
+    this.releaseFn?.();
+    this.releaseFn = undefined;
+  }
+
+  cancel(workflowId: string): void {
+    this.cancelledWorkflows.push(workflowId);
+  }
+
+  cancelSubmission(workflowId: string, submissionId: string): void {
+    this.cancelledSubmissions.push(`${workflowId}:${submissionId}`);
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+  }
+}
+
 function completed(threadId: string, text: string): TurnWaitResult {
   return { kind: "completed", threadId, turnId: `turn-${Math.random()}`, status: "completed", text };
 }
@@ -954,4 +2359,18 @@ function fakeExec(sessionId: string, cwd: string, deferred: unknown[]): ToolRunC
     signal: new AbortController().signal,
     deferContext: (message: unknown) => deferred.push(message),
   } as unknown as ToolRunContext;
+}
+
+/** Create a real git repository with one committed file, so git evidence can
+ * observe workspace changes via porcelain status + diff fingerprints. */
+async function initGitRepo(directory: string): Promise<void> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const run = promisify(execFile);
+  await writeFile(join(directory, "a.txt"), "v1", "utf8");
+  await run("git", ["init", "-q"], { cwd: directory });
+  await run("git", ["config", "user.email", "test@example.com"], { cwd: directory });
+  await run("git", ["config", "user.name", "Test"], { cwd: directory });
+  await run("git", ["add", "-A"], { cwd: directory });
+  await run("git", ["commit", "-q", "-m", "initial"], { cwd: directory });
 }

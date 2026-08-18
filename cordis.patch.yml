@@ -10,5 +10,9 @@
         maxReviewCycles: 3
         maxNoChangeReviewRounds: 1
         reviewDiffMaxBytes: 65536
+        bridgePollMs: 1000
+        callbackTimeoutMs: 600000
+        callbackMaxAttempts: 3
+        callbackRetryBaseMs: 2000
         turnTimeoutMs: 600000
         idleProcessMs: 900000
