@@ -53,6 +53,10 @@ export interface StartTurnOptions {
   effort?: ReasoningEffort;
   outputSchema?: JsonObject;
   planMode?: boolean;
+  /** Called as soon as turn/start has returned the turn id, before waiting
+   * for the turn to finish, so callers can persist the active turn for
+   * cancellation while it is still running. */
+  onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
 }
 
 export interface ReviewStartOptions {
@@ -60,6 +64,10 @@ export interface ReviewStartOptions {
   cwd: string;
   target: JsonObject;
   detached: boolean;
+  /** Called as soon as the reviewer thread and turn are known (and the thread
+   * settings are applied), before waiting for the turn to finish. Lets the
+   * caller persist the reviewer ids so cancellation can interrupt the run. */
+  onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
 }
 
 export class CodexAppServerClient {
@@ -150,6 +158,16 @@ export class CodexAppServerClient {
     const response = await this.request<JsonObject>("turn/start", params, signal);
     const turnId = string(object(response.turn).id, "turn/start result.turn.id");
     this.state(threadId, turnId);
+    if (options.onStarted) {
+      try {
+        await options.onStarted({ threadId, turnId });
+      } catch (error) {
+        // The turn is genuinely running by now; never leave it unmanaged when
+        // the caller's registration callback fails.
+        await this.interruptBestEffort(threadId, turnId);
+        throw error;
+      }
+    }
     return this.waitForTurn(threadId, turnId, signal);
   }
 
@@ -179,13 +197,21 @@ export class CodexAppServerClient {
     const reviewThreadId = string(response.reviewThreadId, "review/start result.reviewThreadId");
     const turnId = string(object(response.turn).id, "review/start result.turn.id");
     this.state(reviewThreadId, turnId);
-    // Detached reviews otherwise inherit the app-server process cwd in Codex Desktop.
-    await this.request("thread/settings/update", {
-      threadId: reviewThreadId,
-      cwd: options.cwd,
-      approvalPolicy: "never",
-      sandboxPolicy: { type: "readOnly", networkAccess: false },
-    }, signal);
+    try {
+      // Detached reviews otherwise inherit the app-server process cwd in Codex Desktop.
+      await this.request("thread/settings/update", {
+        threadId: reviewThreadId,
+        cwd: options.cwd,
+        approvalPolicy: "never",
+        sandboxPolicy: { type: "readOnly", networkAccess: false },
+      }, signal);
+      if (options.onStarted) await options.onStarted({ threadId: reviewThreadId, turnId });
+    } catch (error) {
+      // The reviewer turn is genuinely running; a failed settings update or
+      // registration callback must not leave it unmanaged.
+      await this.interruptBestEffort(reviewThreadId, turnId);
+      throw error;
+    }
     return { threadId: reviewThreadId, result: await this.waitForTurn(reviewThreadId, turnId, signal) };
   }
 
@@ -311,8 +337,12 @@ export class CodexAppServerClient {
     });
   }
 
-  private interruptBestEffort(threadId: string, turnId: string): void {
-    void this.request("turn/interrupt", { threadId, turnId }).catch(() => undefined);
+  private async interruptBestEffort(threadId: string, turnId: string): Promise<void> {
+    try {
+      await this.request("turn/interrupt", { threadId, turnId });
+    } catch {
+      // Never mask the original failure with an interrupt failure.
+    }
   }
 
   private onLine(line: string): void {

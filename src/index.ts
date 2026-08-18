@@ -45,6 +45,8 @@ function resolveConfig(raw: Config): WorkflowConfig {
     plannerEffort: raw.plannerEffort,
     reviewerEffort: raw.reviewerEffort,
     maxReviewCycles: Math.max(1, Math.min(10, Math.trunc(raw.maxReviewCycles))),
+    maxNoChangeReviewRounds: Math.max(1, Math.min(10, Math.trunc(raw.maxNoChangeReviewRounds))),
+    reviewDiffMaxBytes: Math.max(1024, Math.min(1024 * 1024, Math.trunc(raw.reviewDiffMaxBytes))),
     turnTimeoutMs: Math.max(10_000, Math.trunc(raw.turnTimeoutMs)),
     idleProcessMs: Math.max(0, Math.trunc(raw.idleProcessMs)),
     storageDir: raw.storageDir ? resolve(raw.storageDir) : join(dshHome, "storages", "dsh-codex-workflow"),
@@ -52,6 +54,7 @@ function resolveConfig(raw: Config): WorkflowConfig {
 }
 
 export { CodexAppServerClient } from "./app-server.js";
+export { collectEvidence, isGitRepository } from "./evidence.js";
 export { WorkflowStore } from "./store.js";
 export { WorkflowManager } from "./workflow.js";
 export type * from "./types.js";

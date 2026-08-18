@@ -37,7 +37,12 @@ lines.on("line", (line) => {
     const threadId = `thread-${++threadCounter}`;
     return send({ id, result: { thread: { id: threadId, preview: "", modelProvider: "openai", createdAt: 1 } } });
   }
-  if (method === "thread/name/set" || method === "thread/resume" || method === "thread/settings/update") return send({ id, result: {} });
+  if (method === "thread/name/set" || method === "thread/resume" || method === "thread/settings/update") {
+    if (method === "thread/settings/update" && process.env.FAKE_CODEX_FAIL_SETTINGS === "1") {
+      return send({ id, error: { code: -32000, message: "settings failed (injected)" } });
+    }
+    return send({ id, result: {} });
+  }
   if (method === "turn/interrupt") {
     if (process.env.FAKE_CODEX_INTERRUPT_MARKER) {
       writeFileSync(process.env.FAKE_CODEX_INTERRUPT_MARKER, `${params.threadId}:${params.turnId}`);
@@ -56,7 +61,7 @@ lines.on("line", (line) => {
     }
     const reviewSchema = params.outputSchema?.properties?.verdict;
     const text = reviewSchema
-      ? JSON.stringify({ verdict: "pass", findings: [], testGaps: [], summary: "Looks good" })
+      ? JSON.stringify({ verdict: "pass", findings: [{ severity: "high", blocking: true, title: "t", body: "b", file: null, line: null }], testGaps: ["gap"], summary: "Looks good" })
       : JSON.stringify({ status: "ready", planMarkdown: "<proposed_plan>\nImplement safely\n</proposed_plan>", questions: [], assumptions: [] });
     return setTimeout(() => complete(params.threadId, turnId, text), 0);
   }

@@ -34,6 +34,117 @@ test("starts a read-only planning thread and collects structured output", async 
   }
 });
 
+test("startTurn invokes onStarted with the turn id before waiting for completion", async () => {
+  const codex = client();
+  try {
+    const threadId = await codex.startThread({ cwd: process.cwd(), name: "onStarted plan" });
+    const started: Array<{ threadId: string; turnId: string }> = [];
+    const result = await codex.startTurn(threadId, {
+      prompt: "Plan it",
+      planMode: true,
+      outputSchema: PLANNER_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+      onStarted: (entry) => {
+        started.push(entry);
+      },
+    });
+    assert.equal(result.kind, "completed");
+    assert.equal(started.length, 1);
+    assert.equal(started[0]?.threadId, threadId);
+    assert.ok(started[0]?.turnId);
+  } finally {
+    await codex.stop();
+  }
+});
+
+test("startTurn interrupts the turn when onStarted fails", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-onstarted-turn-"));
+  const marker = join(directory, "interrupt.txt");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: { ...process.env, FAKE_CODEX_INTERRUPT_MARKER: marker },
+  });
+  try {
+    const threadId = await codex.startThread({ cwd: process.cwd(), name: "Failing onStarted" });
+    await assert.rejects(codex.startTurn(threadId, {
+      prompt: "Plan it",
+      planMode: true,
+      outputSchema: PLANNER_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+      onStarted: async () => { throw new Error("onStarted failed"); },
+    }), /onStarted failed/);
+    await waitForFile(marker);
+    const [thread, turn] = (await readFile(marker, "utf8")).trim().split(":");
+    assert.equal(thread, threadId);
+    assert.ok(turn);
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("startReview interrupts the reviewer turn when onStarted fails", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-onstarted-review-"));
+  const marker = join(directory, "interrupt.txt");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: { ...process.env, FAKE_CODEX_INTERRUPT_MARKER: marker },
+  });
+  try {
+    const planner = await codex.startThread({ cwd: process.cwd(), name: "Review source" });
+    await assert.rejects(codex.startReview({
+      threadId: planner,
+      cwd: process.cwd(),
+      target: { type: "uncommittedChanges" },
+      detached: true,
+      onStarted: async () => { throw new Error("onStarted failed"); },
+    }), /onStarted failed/);
+    await waitForFile(marker);
+    const [thread, turn] = (await readFile(marker, "utf8")).trim().split(":");
+    assert.notEqual(thread, planner, "interrupt must target the detached reviewer thread");
+    assert.ok(turn);
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("startReview interrupts the reviewer turn when thread settings fail", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-settingsfail-"));
+  const marker = join(directory, "interrupt.txt");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: {
+      ...process.env,
+      FAKE_CODEX_FAIL_SETTINGS: "1",
+      FAKE_CODEX_INTERRUPT_MARKER: marker,
+    },
+  });
+  try {
+    const planner = await codex.startThread({ cwd: process.cwd(), name: "Review source" });
+    await assert.rejects(codex.startReview({
+      threadId: planner,
+      cwd: process.cwd(),
+      target: { type: "uncommittedChanges" },
+      detached: true,
+    }), /settings failed/);
+    await waitForFile(marker);
+    const [thread, turn] = (await readFile(marker, "utf8")).trim().split(":");
+    assert.notEqual(thread, planner, "interrupt must target the detached reviewer thread");
+    assert.ok(turn);
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("bridges request_user_input and resumes the same turn", async () => {
   const codex = client();
   try {
@@ -66,7 +177,10 @@ test("starts a detached review and normalizes its result", async () => {
       prompt: "Normalize",
       outputSchema: REVIEW_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
     });
-    assert.match(normalized.kind === "completed" ? normalized.text : "", /"verdict":"pass"/);
+    const text = normalized.kind === "completed" ? normalized.text : "";
+    assert.match(text, /"verdict":"pass"/);
+    // New review schema round-trips the blocking flag on findings.
+    assert.match(text, /"blocking":true/);
   } finally {
     await codex.stop();
   }

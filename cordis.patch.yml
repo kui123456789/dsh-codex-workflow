@@ -8,5 +8,7 @@
         plannerEffort: high
         reviewerEffort: high
         maxReviewCycles: 3
+        maxNoChangeReviewRounds: 1
+        reviewDiffMaxBytes: 65536
         turnTimeoutMs: 600000
         idleProcessMs: 900000

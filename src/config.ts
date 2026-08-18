@@ -16,6 +16,8 @@ export const Config = z.object({
   plannerEffort: effort.default("high"),
   reviewerEffort: effort.default("high"),
   maxReviewCycles: z.number().default(3),
+  maxNoChangeReviewRounds: z.number().default(1),
+  reviewDiffMaxBytes: z.number().default(65536),
   turnTimeoutMs: z.number().default(10 * 60 * 1000),
   idleProcessMs: z.number().default(15 * 60 * 1000),
   storageDir: z.string().default(""),
