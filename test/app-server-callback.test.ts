@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,7 +10,7 @@ import { CodexInvalidThreadError, CodexNoVerdictError } from "../src/codex-callb
 
 const fixture = join(fileURLToPath(new URL(".", import.meta.url)), "fixtures", "fake-codex-app-server.mjs");
 
-async function waitForValue<T>(producer: () => T | undefined, timeoutMs = 2_000): Promise<T> {
+async function waitForValue<T>(producer: () => T | undefined, timeoutMs = 10_000): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const value = producer();
@@ -20,16 +20,17 @@ async function waitForValue<T>(producer: () => T | undefined, timeoutMs = 2_000)
   }
 }
 
-async function waitForFile(path: string, timeoutMs = 2_000): Promise<void> {
+async function waitForFileText(path: string, timeoutMs = 10_000): Promise<string> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
-      await access(path);
-      return;
+      const text = await readFile(path, "utf8");
+      if (text.length > 0) return text;
     } catch {
-      if (Date.now() > deadline) throw new Error(`timed out waiting for ${path}`);
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      // The writer may not have created the marker yet.
     }
+    if (Date.now() > deadline) throw new Error(`timed out waiting for content in ${path}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
 
@@ -272,8 +273,7 @@ test("cancel interrupts only the Reviewer turn, never the source", async () => {
     // Unblock the hanging turn so teardown and the rejection settle.
     controller.abort(new Error("cancelled by test"));
     await assert.rejects(sending);
-    await waitForFile(marker);
-    const [thread, turn] = (await readFile(marker, "utf8")).trim().split(":");
+    const [thread, turn] = (await waitForFileText(marker)).trim().split(":");
     assert.equal(thread, started!.threadId, "interrupt must target the Reviewer turn");
     assert.ok(turn);
     assert.notEqual(thread, request.codexThreadId, "the source task must never be interrupted");

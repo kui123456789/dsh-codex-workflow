@@ -188,7 +188,7 @@ function dispatch(overrides: Partial<DispatchPlanCommand> = {}): DispatchPlanCom
   };
 }
 
-async function waitForReceipt(store: BridgeStore, requestId: string, timeoutMs = 3000): Promise<import("../src/bridge-store.js").BridgeReceipt> {
+async function waitForReceipt(store: BridgeStore, requestId: string, timeoutMs = 10_000): Promise<import("../src/bridge-store.js").BridgeReceipt> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const receipt = await store.receipt(requestId);

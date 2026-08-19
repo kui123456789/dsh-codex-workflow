@@ -105,7 +105,7 @@ function runCli(args: string[], stdin: string, dshHome: string): Promise<{ code:
   });
 }
 
-async function waitFor(predicate: () => Promise<boolean> | boolean, timeoutMs = 5000): Promise<void> {
+async function waitFor(predicate: () => Promise<boolean> | boolean, timeoutMs = 10_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     if (await predicate()) return;

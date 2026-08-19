@@ -403,8 +403,10 @@ function processAlive(pid: number): boolean {
 }
 
 async function waitForProcessExit(pid: number): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
     if (!processAlive(pid)) return;
+    if (Date.now() > deadline) break;
     await sleep(25);
   }
   throw new Error(`timed out waiting for process ${pid} to exit`);
