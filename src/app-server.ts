@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { createInterface } from "node:readline";
 import crossSpawn from "cross-spawn";
 import type { ChildProcess } from "node:child_process";
+import { CodexInvalidThreadError } from "./codex-callback.js";
 import type {
   PlannerQuestion,
   ReasoningEffort,
@@ -60,10 +61,10 @@ export interface StartTurnOptions {
   onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
 }
 
-export interface ForkThreadOptions {
+export interface ReviewerStartOptions {
   cwd: string;
-  model?: string;
   name: string;
+  model?: string;
 }
 
 export interface ReviewStartOptions {
@@ -85,6 +86,7 @@ export class CodexAppServerClient {
   private starting?: Promise<void>;
   private nextId = 1;
   private idleTimer?: NodeJS.Timeout;
+  private turnWaiters = 0;
   private stderr = "";
 
   constructor(private readonly options: CodexAppServerOptions) {}
@@ -99,10 +101,10 @@ export class CodexAppServerClient {
   }
 
   async stop(): Promise<void> {
-    if (this.idleTimer) clearTimeout(this.idleTimer);
-    this.idleTimer = undefined;
+    this.clearIdleTimer();
     const child = this.child;
     this.child = undefined;
+    this.turns.clear();
     if (!child || child.exitCode !== null) return;
     child.kill();
     await Promise.race([
@@ -148,31 +150,52 @@ export class CodexAppServerClient {
     }, signal);
   }
 
-  /** Fork an existing Codex task into a separately owned, durable reviewer.
-   * Unlike thread/resume, fork only reads the source history and therefore can
-   * succeed while Codex Desktop remains the active writer for the source task. */
-  async forkThread(threadId: string, options: ForkThreadOptions, signal?: AbortSignal): Promise<string> {
+  /** Read-only validation of the source task before a Reviewer is created.
+   * `thread/read` with `includeTurns: false` confirms the source exists without
+   * resuming it and without touching its writer, so Codex Desktop may keep the
+   * source open (or be its active writer) without making the validation busy.
+   * A missing source maps to a terminal `CodexInvalidThreadError`. */
+  async validateSourceThread(threadId: string, signal?: AbortSignal): Promise<void> {
+    let response: JsonObject;
+    try {
+      response = await this.request<JsonObject>("thread/read", { threadId, includeTurns: false }, signal);
+    } catch (error) {
+      if (/no rollout found for thread id/i.test(errorMessage(error))) {
+        throw new CodexInvalidThreadError(`codex thread ${threadId} does not exist`);
+      }
+      throw error;
+    }
+    const thread = object(response.thread);
+    const id = typeof thread.id === "string" && thread.id ? thread.id : undefined;
+    if (id !== threadId) throw new CodexInvalidThreadError(`codex thread ${threadId} does not exist`);
+  }
+
+  /** Create a fresh, durable, independently owned Reviewer thread that carries
+   * none of the source task's history or writer state. Read-only, network
+   * disabled and approval-free are enforced at thread level here and again per
+   * review turn by `startTurn`. */
+  async startReviewerThread(options: ReviewerStartOptions, signal?: AbortSignal): Promise<string> {
     const params: JsonObject = {
-      threadId,
       cwd: options.cwd,
       runtimeWorkspaceRoots: [options.cwd],
       approvalPolicy: "never",
       sandbox: "read-only",
       serviceName: "dsh-codex-workflow",
+      sessionStartSource: "startup",
       ephemeral: false,
     };
     if (options.model) params.model = options.model;
-    const response = await this.request<JsonObject>("thread/fork", params, signal);
-    const fork = object(response.thread);
-    const forkId = string(fork.id, "thread/fork result.thread.id");
+    const response = await this.request<JsonObject>("thread/start", params, signal);
+    const thread = object(response.thread);
+    const threadId = string(thread.id, "thread/start result.thread.id");
     await this.request("thread/settings/update", {
-      threadId: forkId,
+      threadId,
       cwd: options.cwd,
       approvalPolicy: "never",
       sandboxPolicy: { type: "readOnly", networkAccess: false },
     }, signal);
-    await this.request("thread/name/set", { threadId: forkId, name: options.name }, signal);
-    return forkId;
+    await this.request("thread/name/set", { threadId, name: options.name }, signal);
+    return threadId;
   }
 
   async startTurn(threadId: string, options: StartTurnOptions, signal?: AbortSignal): Promise<TurnWaitResult> {
@@ -198,7 +221,7 @@ export class CodexAppServerClient {
       } catch (error) {
         // The turn is genuinely running by now; never leave it unmanaged when
         // the caller's registration callback fails.
-        await this.interruptBestEffort(threadId, turnId);
+        await this.abandonTurn(threadId, turnId);
         throw error;
       }
     }
@@ -243,7 +266,7 @@ export class CodexAppServerClient {
     } catch (error) {
       // The reviewer turn is genuinely running; a failed settings update or
       // registration callback must not leave it unmanaged.
-      await this.interruptBestEffort(reviewThreadId, turnId);
+      await this.abandonTurn(reviewThreadId, turnId);
       throw error;
     }
     return { threadId: reviewThreadId, result: await this.waitForTurn(reviewThreadId, turnId, signal) };
@@ -278,7 +301,7 @@ export class CodexAppServerClient {
     }, signal);
     if (typeof initialized.userAgent !== "string") throw new Error("invalid Codex initialize response");
     this.write({ method: "initialized", params: {} });
-    this.touchIdle();
+    this.scheduleIdle();
   }
 
   private async planMode(model?: string, effort?: ReasoningEffort, signal?: AbortSignal): Promise<JsonObject | undefined> {
@@ -303,15 +326,18 @@ export class CodexAppServerClient {
   }
 
   private requestRaw<T>(method: string, params: JsonObject, signal?: AbortSignal): Promise<T> {
+    this.clearIdleTimer();
     const id = this.nextId++;
     return new Promise<T>((resolve, reject) => {
       if (signal?.aborted) {
         reject(abortError(signal));
+        this.scheduleIdle();
         return;
       }
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`Codex request timed out: ${method}`));
+        this.scheduleIdle();
       }, this.options.requestTimeoutMs);
       const entry: PendingRequest = {
         resolve: (value) => resolve(value as T),
@@ -323,13 +349,13 @@ export class CodexAppServerClient {
           clearTimeout(timer);
           this.pending.delete(id);
           reject(abortError(signal));
+          this.scheduleIdle();
         };
         signal.addEventListener("abort", entry.abort, { once: true });
         entry.signal = signal;
       }
       this.pending.set(id, entry);
       this.write({ id, method, params });
-      this.touchIdle();
     });
   }
 
@@ -337,14 +363,22 @@ export class CodexAppServerClient {
     const key = turnKey(threadId, turnId);
     const current = this.turns.get(key);
     const ready = current && turnResult(current);
-    if (ready) return Promise.resolve(ready);
+    if (ready) {
+      this.scheduleIdle();
+      return Promise.resolve(ready);
+    }
+    this.clearIdleTimer();
+    this.turnWaiters += 1;
     return new Promise((resolve, reject) => {
       if (signal?.aborted) {
+        this.turnWaiters -= 1;
+        this.scheduleIdle();
         reject(abortError(signal));
         return;
       }
+      let cleaned = false;
       const timeout = setTimeout(() => {
-        this.interruptBestEffort(threadId, turnId);
+        void this.abandonTurn(threadId, turnId);
         cleanup();
         reject(new Error(`Codex turn timed out: ${turnId}`));
       }, this.options.requestTimeoutMs);
@@ -357,14 +391,18 @@ export class CodexAppServerClient {
         resolve(result);
       };
       const onAbort = () => {
-        this.interruptBestEffort(threadId, turnId);
+        void this.abandonTurn(threadId, turnId);
         cleanup();
         reject(abortError(signal!));
       };
       const cleanup = () => {
+        if (cleaned) return;
+        cleaned = true;
         clearTimeout(timeout);
         this.events.off(event, listener);
         signal?.removeEventListener("abort", onAbort);
+        this.turnWaiters -= 1;
+        this.scheduleIdle();
       };
       this.events.on(event, listener);
       signal?.addEventListener("abort", onAbort, { once: true });
@@ -377,6 +415,12 @@ export class CodexAppServerClient {
     } catch {
       // Never mask the original failure with an interrupt failure.
     }
+  }
+
+  private async abandonTurn(threadId: string, turnId: string): Promise<void> {
+    await this.interruptBestEffort(threadId, turnId);
+    this.turns.delete(turnKey(threadId, turnId));
+    this.scheduleIdle();
   }
 
   private onLine(line: string): void {
@@ -396,6 +440,7 @@ export class CodexAppServerClient {
       if (pending.abort && pending.signal) pending.signal.removeEventListener("abort", pending.abort);
       if (message.error) pending.reject(new Error(jsonRpcError(message.error)));
       else pending.resolve(message.result);
+      this.scheduleIdle();
       return;
     }
     if (typeof message.method !== "string") return;
@@ -419,6 +464,7 @@ export class CodexAppServerClient {
       const turnId = string(turn.id, "turn/completed turn.id");
       this.state(threadId, turnId).completed = turn;
       this.events.emit(`turn:${turnKey(threadId, turnId)}`);
+      this.scheduleIdle();
     }
   }
 
@@ -470,11 +516,26 @@ export class CodexAppServerClient {
     }
   }
 
-  private touchIdle(): void {
-    if (this.options.idleProcessMs <= 0) return;
+  private clearIdleTimer(): void {
     if (this.idleTimer) clearTimeout(this.idleTimer);
-    this.idleTimer = setTimeout(() => void this.stop(), this.options.idleProcessMs);
+    this.idleTimer = undefined;
+  }
+
+  private scheduleIdle(): void {
+    if (this.options.idleProcessMs <= 0) return;
+    this.clearIdleTimer();
+    if (!this.isIdle()) return;
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = undefined;
+      if (this.isIdle()) void this.stop();
+    }, this.options.idleProcessMs);
     this.idleTimer.unref();
+  }
+
+  private isIdle(): boolean {
+    if (!this.child || this.child.exitCode !== null) return false;
+    if (this.pending.size > 0 || this.turnWaiters > 0) return false;
+    return ![...this.turns.values()].some((turn) => !turn.completed);
   }
 }
 
@@ -551,6 +612,10 @@ function string(value: unknown, label: string): string {
 function jsonRpcError(value: unknown): string {
   const error = object(value);
   return typeof error.message === "string" ? error.message : JSON.stringify(error);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function abortError(signal: AbortSignal): Error {

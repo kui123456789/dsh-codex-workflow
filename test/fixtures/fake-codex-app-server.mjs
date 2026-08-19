@@ -6,6 +6,20 @@ let threadCounter = 0;
 let turnCounter = 0;
 const pendingQuestions = new Map();
 
+if (process.env.FAKE_CODEX_PROCESS_MARKER) {
+  writeFileSync(process.env.FAKE_CODEX_PROCESS_MARKER, String(process.pid));
+}
+
+// Simulate an active writer on ONE specific thread (the source task). Metadata
+// reads (`thread/read`) are never blocked by it; only `thread/resume` and
+// `turn/start` against that exact thread would be busy — proving the reviewer
+// flow never touches the source's writer.
+const sourceThreadForWriter = process.env.FAKE_CODEX_SOURCE_THREAD || "";
+const sourceHasActiveWriter = process.env.FAKE_CODEX_SOURCE_ACTIVE_WRITER === "1";
+function sourceBusy(threadId) {
+  return sourceHasActiveWriter && sourceThreadForWriter && threadId === sourceThreadForWriter;
+}
+
 function send(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
 }
@@ -26,13 +40,20 @@ lines.on("line", (line) => {
     return;
   }
   const { id, method, params = {} } = message;
-  if (process.env.FAKE_CODEX_THREAD_PARAMS_MARKER && ["thread/start", "thread/fork", "thread/resume", "thread/settings/update", "thread/name/set", "turn/start"].includes(method)) {
+  if (process.env.FAKE_CODEX_THREAD_PARAMS_MARKER && ["thread/read", "thread/start", "thread/fork", "thread/resume", "thread/settings/update", "thread/name/set", "turn/start"].includes(method)) {
     appendFileSync(process.env.FAKE_CODEX_THREAD_PARAMS_MARKER, `${JSON.stringify({ method, params })}\n`);
   }
   if (method === "initialized") return;
   if (method === "initialize") return send({ id, result: { userAgent: "fake", codexHome: "C:/fake", platformFamily: "windows", platformOs: "windows" } });
   if (method === "model/list") return send({ id, result: { data: [{ id: "fake-model" }] } });
   if (method === "collaborationMode/list") return send({ id, result: { data: [{ name: "Plan", mode: "plan", model: "fake-model", reasoning_effort: "high" }] } });
+  if (method === "thread/read") {
+    if (process.env.FAKE_CODEX_MISSING_SOURCE === "1") {
+      return send({ id, error: { code: -32000, message: `no rollout found for thread id ${params.threadId}` } });
+    }
+    // Metadata reads never contend with an active writer on the source.
+    return send({ id, result: { thread: { id: params.threadId, preview: "", modelProvider: "openai", createdAt: 1 } } });
+  }
   if (method === "thread/start") {
     const threadId = `thread-${++threadCounter}`;
     return send({ id, result: { thread: { id: threadId, preview: "", modelProvider: "openai", createdAt: 1 } } });
@@ -45,6 +66,9 @@ lines.on("line", (line) => {
     if (method === "thread/settings/update" && process.env.FAKE_CODEX_FAIL_SETTINGS === "1") {
       return send({ id, error: { code: -32000, message: "settings failed (injected)" } });
     }
+    if ((method === "thread/resume") && sourceBusy(params.threadId)) {
+      return send({ id, error: { code: -32000, message: `thread-store conflict: thread ${params.threadId} already has an active writer` } });
+    }
     return send({ id, result: {} });
   }
   if (method === "turn/interrupt") {
@@ -54,6 +78,9 @@ lines.on("line", (line) => {
     return send({ id, result: {} });
   }
   if (method === "turn/start") {
+    if (sourceBusy(params.threadId)) {
+      return send({ id, error: { code: -32000, message: `thread-store conflict: thread ${params.threadId} already has an active writer` } });
+    }
     const turnId = `turn-${++turnCounter}`;
     send({ id, result: { turn: { id: turnId, items: [], itemsView: "full", status: "inProgress", error: null, startedAt: 1, completedAt: null, durationMs: null } } });
     const prompt = params.input?.[0]?.text ?? "";
@@ -67,7 +94,8 @@ lines.on("line", (line) => {
     const text = reviewSchema
       ? (process.env.FAKE_CODEX_REVIEW_VERDICT || JSON.stringify({ verdict: "pass", findings: [{ severity: "high", blocking: true, title: "t", body: "b", file: null, line: null }], testGaps: ["gap"], summary: "Looks good" }))
       : JSON.stringify({ status: "ready", planMarkdown: "<proposed_plan>\nImplement safely\n</proposed_plan>", questions: [], assumptions: [] });
-    return setTimeout(() => complete(params.threadId, turnId, text), 0);
+    const delay = Number(process.env.FAKE_CODEX_TURN_DELAY_MS || 0);
+    return setTimeout(() => complete(params.threadId, turnId, text), delay);
   }
   if (method === "review/start") {
     const turnId = `turn-${++turnCounter}`;

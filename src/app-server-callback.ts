@@ -18,9 +18,12 @@ interface ActiveReview {
  * Production callback path for Codex-led workflows.
  *
  * The originating Codex Desktop task remains the immutable source. The first
- * review forks that history into a durable reviewer task, avoiding the source
- * task's cross-process writer lock. Later review cycles resume the same forked
- * reviewer so review context is preserved without ever mutating the source.
+ * review validates the source task read-only (`thread/read`, no turns), then
+ * creates a brand-new durable Reviewer task (`thread/start`) that inherits none
+ * of the source history or writer state — so Codex Desktop can keep the source
+ * open and be its active writer without any conflict. Later review cycles
+ * resume that same persisted Reviewer so review context is preserved without
+ * ever mutating the source.
  */
 export class AppServerCodexCallbackDispatcher {
   private readonly active = new Map<string, ActiveReview>();
@@ -73,7 +76,10 @@ export class AppServerCodexCallbackDispatcher {
       if (reviewerThreadId) {
         await this.codex.resumeThread(reviewerThreadId, request.cwd, signal);
       } else {
-        reviewerThreadId = await this.codex.forkThread(request.codexThreadId, {
+        // First review: validate the source task exists, then create a fresh
+        // durable Reviewer that inherits nothing from the source history.
+        await this.codex.validateSourceThread(request.codexThreadId, signal);
+        reviewerThreadId = await this.codex.startReviewerThread({
           cwd: request.cwd,
           name: request.reviewerName ?? `DSH Reviewer ${request.workflowId}`,
           ...(request.model ? { model: request.model } : {}),
@@ -92,18 +98,18 @@ export class AppServerCodexCallbackDispatcher {
         },
       }, signal);
       if (result.kind !== "completed") {
-        throw new CodexNoVerdictError("forked reviewer unexpectedly requested user input");
+        throw new CodexNoVerdictError("reviewer unexpectedly requested user input");
       }
       if (result.status !== "completed") {
         if (result.status === "interrupted") return { kind: "retryable_busy" };
         throw new CodexCallbackProcessError(
-          `forked reviewer turn ${result.turnId} failed${result.error ? `: ${result.error}` : ""}`,
+          `reviewer turn ${result.turnId} failed${result.error ? `: ${result.error}` : ""}`,
         );
       }
       try {
         return { kind: "verdict", verdict: parseReviewResult(JSON.parse(result.text)) };
       } catch (error) {
-        throw new CodexNoVerdictError(`forked reviewer returned an invalid verdict: ${errorMessage(error)}`);
+        throw new CodexNoVerdictError(`reviewer returned an invalid verdict: ${errorMessage(error)}`);
       }
     } catch (error) {
       if (signal?.aborted) throw abortError(signal);
@@ -119,7 +125,7 @@ export class AppServerCodexCallbackDispatcher {
       if (/429 Too Many Requests|exceeded retry limit|rate limit|already in use|already has an active writer/i.test(message)) {
         return { kind: "retryable_busy" };
       }
-      throw new CodexCallbackProcessError(`forked reviewer failed: ${compactDiagnostic(message)}`);
+      throw new CodexCallbackProcessError(`reviewer failed: ${compactDiagnostic(message)}`);
     } finally {
       this.active.delete(key);
     }

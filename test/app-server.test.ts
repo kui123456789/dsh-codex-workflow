@@ -161,6 +161,92 @@ test("bridges request_user_input and resumes the same turn", async () => {
   }
 });
 
+test("idle shutdown waits for an active turn and releases the task after completion", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-idle-turn-"));
+  const marker = join(directory, "process.txt");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 50,
+    env: {
+      ...process.env,
+      FAKE_CODEX_PROCESS_MARKER: marker,
+      FAKE_CODEX_TURN_DELAY_MS: "250",
+    },
+  });
+  try {
+    const threadId = await codex.startThread({ cwd: process.cwd(), name: "Idle release" });
+    const turn = codex.startTurn(threadId, { prompt: "Slow plan", planMode: true });
+    const pid = Number(await readFile(marker, "utf8"));
+    await sleep(125);
+    assert.equal(processAlive(pid), true, "idle timer must not kill a running turn");
+    const completed = await turn;
+    assert.equal(completed.kind, "completed");
+    await waitForProcessExit(pid);
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("idle shutdown keeps a clarification turn alive until answers are submitted", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-idle-input-"));
+  const marker = join(directory, "process.txt");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 50,
+    env: { ...process.env, FAKE_CODEX_PROCESS_MARKER: marker },
+  });
+  try {
+    const threadId = await codex.startThread({ cwd: process.cwd(), name: "Idle clarification" });
+    const paused = await codex.startTurn(threadId, { prompt: "ASK_INPUT", planMode: true });
+    assert.equal(paused.kind, "needs_input");
+    if (paused.kind !== "needs_input") return;
+    const pid = Number(await readFile(marker, "utf8"));
+    await sleep(125);
+    assert.equal(processAlive(pid), true, "pending clarification must retain its App Server");
+    const completed = await codex.continueTurn(paused, { scope: ["Focused"] });
+    assert.equal(completed.kind, "completed");
+    await waitForProcessExit(pid);
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("idle shutdown releases an interrupted turn even without a completion event", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-idle-interrupt-"));
+  const processMarker = join(directory, "process.txt");
+  const interruptMarker = join(directory, "interrupt.txt");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 50,
+    env: {
+      ...process.env,
+      FAKE_CODEX_PROCESS_MARKER: processMarker,
+      FAKE_CODEX_INTERRUPT_MARKER: interruptMarker,
+    },
+  });
+  try {
+    const threadId = await codex.startThread({ cwd: process.cwd(), name: "Idle interrupted" });
+    const controller = new AbortController();
+    const turn = codex.startTurn(threadId, { prompt: "HANG" }, controller.signal);
+    const pid = Number(await readFile(processMarker, "utf8"));
+    controller.abort(new Error("cancelled"));
+    await assert.rejects(turn, /cancelled/);
+    await waitForFile(interruptMarker);
+    await waitForProcessExit(pid);
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("starts a detached review and normalizes its result", async () => {
   const codex = client();
   try {
@@ -221,7 +307,10 @@ test("interrupts an active Codex turn when it times out", async () => {
   const codex = new CodexAppServerClient({
     command: process.execPath,
     args: [fixture],
-    requestTimeoutMs: 200,
+    // This timeout also covers process startup and initialize. Keep it long
+    // enough for a loaded Windows CI host while still proving the hung turn is
+    // interrupted by the client's own timeout.
+    requestTimeoutMs: 2_000,
     idleProcessMs: 0,
     env: { ...process.env, FAKE_CODEX_INTERRUPT_MARKER: marker },
   });
@@ -293,4 +382,25 @@ async function waitForFile(path: string): Promise<void> {
     }
   }
   throw new Error(`timed out waiting for ${path}`);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForProcessExit(pid: number): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (!processAlive(pid)) return;
+    await sleep(25);
+  }
+  throw new Error(`timed out waiting for process ${pid} to exit`);
 }
