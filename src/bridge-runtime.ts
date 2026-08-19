@@ -227,6 +227,10 @@ export class BridgeRuntime {
     if (this.polling || this.stopped) return;
     this.polling = true;
     try {
+      // A Codex-led submission may outlive the originating Codex turn. Busy
+      // callbacks stay durably retrying, and every normal pump gives due work
+      // another fenced recovery round without requiring a DSH restart.
+      await this.options.manager.recoverCallbacks().catch(() => 0);
       for (;;) {
         const claim = await this.store.claimNext(this.claimOwner, (command) => this.isClaimEligible(command));
         if (!claim) break;

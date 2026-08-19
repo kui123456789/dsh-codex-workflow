@@ -6,7 +6,11 @@ import test from "node:test";
 import type { ToolRunContext } from "@deepseek-ai/dsh-tools";
 import { closeCoordinationStoresForDirectory } from "../src/coordination.js";
 import { newRequestId } from "../src/bridge-protocol.js";
-import { CodexInvalidThreadError, CodexNoVerdictError } from "../src/codex-callback.js";
+import {
+  CodexCallbackProcessError,
+  CodexInvalidThreadError,
+  CodexNoVerdictError,
+} from "../src/codex-callback.js";
 import { WorkflowStore } from "../src/store.js";
 import type { ReviewResult, TurnWaitResult, WorkflowConfig, WorkflowRecord } from "../src/types.js";
 import { WorkflowManager, type CodexCallback, type CodexGateway } from "../src/workflow.js";
@@ -1101,7 +1105,7 @@ test("submit rejects a second active submission", async () => {
   }
 });
 
-test("submit retries busy callbacks with backoff and fails after the attempt cap", async () => {
+test("submit keeps a busy Codex task durably retryable after each bounded attempt round", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-submit-busy-"));
   try {
     const callback = new FakeCallback();
@@ -1113,15 +1117,16 @@ test("submit retries busy callbacks with backoff and fails after the attempt cap
     const instance = manager(
       directory,
       new FakeGateway(),
-      { callbackMaxAttempts: 3, callbackRetryBaseMs: 1 },
+      { callbackMaxAttempts: 3, callbackRetryBaseMs: 100 },
       callback,
     );
     const exec = fakeExec("session-submit-busy", directory, []);
     const bridge = await bridgeWorkflow(instance, "session-submit-busy", directory, newRequestId());
     const submitted = await instance.submit(bridge.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
-    assert.equal(submitted.submissionState, "failed");
+    assert.equal(submitted.submissionState, "retrying");
     assert.equal(submitted.submissionAttempts, 3);
-    assert.match(submitted.submissionError ?? "", /busy after 3 attempts/);
+    assert.match(submitted.submissionError ?? "", /busy after 3 attempts in this round; recovery will retry/);
+    assert.ok((submitted.submissionRetryAt ?? 0) > Date.now(), "a future recovery round is scheduled");
     assert.equal(callback.requests.length, 3);
     assert.equal(submitted.phase, "executing", "the DSH workflow stays intact");
   } finally {
@@ -1129,7 +1134,7 @@ test("submit retries busy callbacks with backoff and fails after the attempt cap
   }
 });
 
-test("submit treats invalid thread ids and missing verdicts as terminal failures", async () => {
+test("submit treats invalid threads, missing verdicts and CLI failures as terminal", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-submit-invalid-"));
   try {
     const callback = new FakeCallback();
@@ -1149,6 +1154,15 @@ test("submit treats invalid thread ids and missing verdicts as terminal failures
     const submitted2 = await instance2.submit(bridge2.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec2);
     assert.equal(submitted2.submissionState, "failed");
     assert.match(submitted2.submissionError ?? "", /no final agent message/);
+
+    const callback3 = new FakeCallback();
+    callback3.results = [new CodexCallbackProcessError("codex callback exited with code 1: invalid CLI configuration")];
+    const instance3 = manager(directory, new FakeGateway(), {}, callback3);
+    const bridge3 = await bridgeWorkflow(instance3, "session-submit-process-error", directory, newRequestId());
+    const exec3 = fakeExec("session-submit-process-error", directory, []);
+    const submitted3 = await instance3.submit(bridge3.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec3);
+    assert.equal(submitted3.submissionState, "failed");
+    assert.match(submitted3.submissionError ?? "", /invalid CLI configuration/);
   } finally {
     await rmClosed(directory);
   }
@@ -1340,18 +1354,38 @@ test("recoverCallbacks resumes persisted submissions exactly once with bounded a
     // Wait for the fire-and-forget recovery chain to finish its writes.
     await waitFor(async () => (await new WorkflowStore(directory).load(bridge.id))?.submissionState === "received");
 
-    // Exhausted attempts are failed, not re-spawned.
+    // Migrate an early-1.0.0 busy-exhaustion record back into persistent
+    // recovery. A high lifetime attempt count must not prevent a new round.
     await new WorkflowStore(directory).update(bridge.id, (r) => {
-      r.submissionState = "queued";
+      r.submissionState = "failed";
       r.submissionAttempts = 5;
+      r.submissionError = "codex thread busy after 5 attempts";
+      r.callbackState = "failed";
+      r.stagedVerdict = undefined;
     });
-    callback.results.length = 0;
+    callback.results.push({ kind: "verdict", verdict: { verdict: "pass", findings: [], testGaps: [], summary: "recovered legacy busy" } });
     const recovered = await instance.recoverCallbacks();
-    assert.equal(recovered, 0);
-    assert.equal(callback.requests.length, 1);
-    assert.equal((await new WorkflowStore(directory).load(bridge.id))?.submissionState, "failed");
-    // Let the fire-and-forget recovery chain settle before removing the dir.
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(recovered, 1);
+    await waitFor(async () => callback.requests.length === 2);
+    await waitFor(async () => (await new WorkflowStore(directory).load(bridge.id))?.submissionState === "received");
+    const recoveredRecord = await new WorkflowStore(directory).load(bridge.id);
+    assert.equal(recoveredRecord?.submissionAttempts, 6, "lifetime attempts remain an audit trail");
+
+    // Recover the newer Codex thread-store contention wording too. Other
+    // explicit process failures stay terminal.
+    await new WorkflowStore(directory).update(bridge.id, (r) => {
+      r.submissionState = "failed";
+      r.submissionAttempts = 6;
+      r.submissionError = `codex callback exited with code 1: thread-store conflict: thread ${r.codexThreadId} already has an active writer`;
+      r.callbackState = "failed";
+      r.stagedVerdict = undefined;
+    });
+    callback.results.push({ kind: "verdict", verdict: { verdict: "pass", findings: [], testGaps: [], summary: "recovered active writer" } });
+    assert.equal(await instance.recoverCallbacks(), 1);
+    await waitFor(async () => callback.requests.length === 3);
+    await waitFor(async () => (await new WorkflowStore(directory).load(bridge.id))?.submissionState === "received");
+    const activeWriterRecord = await new WorkflowStore(directory).load(bridge.id);
+    assert.equal(activeWriterRecord?.submissionAttempts, 7);
   } finally {
     await rmRetry(directory);
   }
@@ -1372,13 +1406,17 @@ test("callback infrastructure failures do not consume a review cycle; first appl
     const instance = manager(directory, new FakeGateway(), { callbackMaxAttempts: 3, callbackRetryBaseMs: 30 }, callback, queue);
     const exec = fakeExec("session-cycles", directory, []);
     const bridge = await bridgeWorkflow(instance, "session-cycles", directory, newRequestId());
-    const failed = await instance.submit(bridge.id, { implementationSummary: "try 1", changedFiles: ["changed.txt"] }, exec);
-    assert.equal(failed.submissionState, "failed", "busy exhaustion fails the submission, not the workflow");
-    assert.equal(failed.reviewCycles, 0, "infrastructure failures consume no cycle");
-    assert.equal(failed.phase, "executing", "the workflow stays retryable");
+    const retrying = await instance.submit(bridge.id, { implementationSummary: "try 1", changedFiles: ["changed.txt"] }, exec);
+    assert.equal(retrying.submissionState, "retrying", "busy exhaustion keeps the same submission active");
+    assert.equal(retrying.reviewCycles, 0, "infrastructure failures consume no cycle");
+    assert.equal(retrying.phase, "executing", "the workflow stays retryable");
+    await new WorkflowStore(directory).update(bridge.id, (r) => { r.submissionRetryAt = 0; });
+    callback.results.push({ kind: "verdict", verdict: { verdict: "pass", findings: [], testGaps: [], summary: "ok" } });
+    assert.equal(await instance.recoverCallbacks(), 1);
+    await waitFor(async () => (await new WorkflowStore(directory).load(bridge.id))?.submissionState === "received");
+    const submitted = await new WorkflowStore(directory).load(bridge.id);
+    assert.equal(submitted?.reviewCycles, 0, "still zero until the verdict is applied");
     // The first APPLIED verdict is cycle 1.
-    const submitted = await instance.submit(bridge.id, { implementationSummary: "try 2", changedFiles: ["changed.txt"] }, exec);
-    assert.equal(submitted.reviewCycles, 0, "still zero until the verdict is applied");
     const applied = await instance.applyExternalVerdict(queue.commands[0]!);
     assert.equal(applied.reviewCycles, 1, "first applied verdict is cycle 1");
   } finally {

@@ -3,9 +3,9 @@ import { join, resolve } from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
 import { writeFile, mkdir } from "node:fs/promises";
 import { CodexAppServerClient } from "./app-server.js";
+import { AppServerCodexCallbackDispatcher } from "./app-server-callback.js";
 import { BridgeStore } from "./bridge-store.js";
 import { BridgeRuntime } from "./bridge-runtime.js";
-import { CodexCallbackDispatcher } from "./codex-callback.js";
 import { Config as ConfigSchema, type Config as RawConfig } from "./config.js";
 import { REVIEW_OUTPUT_SCHEMA } from "./schemas.js";
 import { WorkflowStore } from "./store.js";
@@ -24,8 +24,8 @@ export function apply(ctx: Context, raw: Config): void {
     const store = new WorkflowStore(config.storageDir);
     await store.init();
     const bridgeStore = new BridgeStore(config.storageDir, config.bridgeMaxPayloadBytes);
-    // The review output schema file: prepared by the plugin (outside any
-    // sandbox) and passed to the read-only Codex child via --output-schema.
+    // Keep a materialized review schema for diagnostics and compatibility with
+    // the legacy CLI dispatcher; production App Server turns receive it inline.
     const schemaFile = join(config.storageDir, "bridge", "review-schema.json");
     await mkdir(join(config.storageDir, "bridge"), { recursive: true });
     await writeFile(schemaFile, `${JSON.stringify(REVIEW_OUTPUT_SCHEMA)}\n`, "utf8");
@@ -34,11 +34,7 @@ export function apply(ctx: Context, raw: Config): void {
       requestTimeoutMs: config.turnTimeoutMs,
       idleProcessMs: config.idleProcessMs,
     });
-    const callback = new CodexCallbackDispatcher({
-      command: config.codexCommand,
-      schemaFile,
-      timeoutMs: config.callbackTimeoutMs,
-    });
+    const callback = new AppServerCodexCallbackDispatcher(codex);
     const manager = new WorkflowManager(store, codex, config, callback, bridgeStore);
     const runtime = new BridgeRuntime(bridgeStore, ctx.agents, {
       pollMs: config.bridgePollMs,
@@ -61,7 +57,7 @@ export function apply(ctx: Context, raw: Config): void {
       disposedListener();
       for (const dispose of disposers.reverse()) dispose();
       // Manager teardown blocks new callback sends, aborts in-flight recovery
-      // and its backoff, then kills and awaits every callback child.
+      // and its backoff, then cancels and awaits every Reviewer operation.
       await manager.stop();
       await codex.stop();
       bridgeStore.close();
@@ -94,8 +90,10 @@ function resolveConfig(raw: Config): WorkflowConfig {
 }
 
 export { CodexAppServerClient } from "./app-server.js";
+export { AppServerCodexCallbackDispatcher } from "./app-server-callback.js";
 export { BridgeRuntime } from "./bridge-runtime.js";
 export { collectEvidence, isGitRepository } from "./evidence.js";
 export { WorkflowStore } from "./store.js";
 export { WorkflowManager } from "./workflow.js";
+export { PLUGIN_VERSION } from "./version.js";
 export type * from "./types.js";

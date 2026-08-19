@@ -7,7 +7,12 @@ import {
   parseBridgeCommand,
   type BridgeCommand,
 } from "./bridge-protocol.js";
-import { CoordinationStore, coordinationPath } from "./coordination.js";
+import {
+  CoordinationStore,
+  coordinationPath,
+  type PruneRequestCandidate,
+  type PruneWorkflowCandidate,
+} from "./coordination.js";
 
 export const BRIDGE_QUEUE_DIRS = ["inbox", "processing", "retry", "receipts", "dead-letter"] as const;
 export type BridgeQueueDir = (typeof BRIDGE_QUEUE_DIRS)[number];
@@ -175,7 +180,7 @@ export class BridgeStore {
       status: result.status,
       commandHash: result.commandHash ?? commandHash(claim.command),
       ...(result.workflowId ? { workflowId: result.workflowId } : {}),
-      ...(result.deliveredAt ? { deliveredAt: result.deliveredAt } : {}),
+      deliveredAt: result.deliveredAt ?? new Date().toISOString(),
       ...(result.error ? { error: result.error } : {}),
     };
     return this.coordination!.ackClaim(
@@ -235,6 +240,34 @@ export class BridgeStore {
       attempts: row.attempts,
       ...(row.lastError ? { lastError: row.lastError } : {}),
     }));
+  }
+
+  /** Ops: requeue a dead-letter/failed request (idempotent; see
+   * CoordinationStore.requeueRequest). */
+  async requeue(requestId: string): Promise<{ changed: boolean; from?: string }> {
+    await this.init();
+    this.assertRequestId(requestId);
+    return this.coordination!.requeueRequest(requestId);
+  }
+
+  /** Ops: preview safe-prune candidates (terminal rows/workflows older than
+   * `olderThanMs`; active/undelivered/diagnostic data is never a candidate). */
+  async pruneCandidates(olderThanMs: number): Promise<{
+    requests: PruneRequestCandidate[];
+    workflows: PruneWorkflowCandidate[];
+  }> {
+    await this.init();
+    return this.coordination!.pruneCandidates(olderThanMs);
+  }
+
+  /** Ops: revalidate and delete exactly the previewed candidates. */
+  async pruneApply(
+    requests: PruneRequestCandidate[],
+    workflows: PruneWorkflowCandidate[],
+    olderThanMs: number,
+  ): Promise<{ removedRequests: number; removedWorkflows: number }> {
+    await this.init();
+    return this.coordination!.pruneApply(requests, workflows, olderThanMs);
   }
 
   // ------------------------------------------------------------ internals

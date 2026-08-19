@@ -26,7 +26,7 @@ lines.on("line", (line) => {
     return;
   }
   const { id, method, params = {} } = message;
-  if (process.env.FAKE_CODEX_THREAD_PARAMS_MARKER && ["thread/start", "thread/resume", "thread/settings/update"].includes(method)) {
+  if (process.env.FAKE_CODEX_THREAD_PARAMS_MARKER && ["thread/start", "thread/fork", "thread/resume", "thread/settings/update", "thread/name/set", "turn/start"].includes(method)) {
     appendFileSync(process.env.FAKE_CODEX_THREAD_PARAMS_MARKER, `${JSON.stringify({ method, params })}\n`);
   }
   if (method === "initialized") return;
@@ -36,6 +36,10 @@ lines.on("line", (line) => {
   if (method === "thread/start") {
     const threadId = `thread-${++threadCounter}`;
     return send({ id, result: { thread: { id: threadId, preview: "", modelProvider: "openai", createdAt: 1 } } });
+  }
+  if (method === "thread/fork") {
+    const threadId = `thread-${++threadCounter}`;
+    return send({ id, result: { thread: { id: threadId, forkedFromId: params.threadId, preview: "", modelProvider: "openai", createdAt: 1 } } });
   }
   if (method === "thread/name/set" || method === "thread/resume" || method === "thread/settings/update") {
     if (method === "thread/settings/update" && process.env.FAKE_CODEX_FAIL_SETTINGS === "1") {
@@ -53,7 +57,7 @@ lines.on("line", (line) => {
     const turnId = `turn-${++turnCounter}`;
     send({ id, result: { turn: { id: turnId, items: [], itemsView: "full", status: "inProgress", error: null, startedAt: 1, completedAt: null, durationMs: null } } });
     const prompt = params.input?.[0]?.text ?? "";
-    if (prompt.includes("HANG")) return;
+    if (prompt === "HANG") return;
     if (prompt.includes("ASK_INPUT")) {
       const requestId = `question-${turnId}`;
       pendingQuestions.set(requestId, { threadId: params.threadId, turnId });
@@ -61,7 +65,7 @@ lines.on("line", (line) => {
     }
     const reviewSchema = params.outputSchema?.properties?.verdict;
     const text = reviewSchema
-      ? JSON.stringify({ verdict: "pass", findings: [{ severity: "high", blocking: true, title: "t", body: "b", file: null, line: null }], testGaps: ["gap"], summary: "Looks good" })
+      ? (process.env.FAKE_CODEX_REVIEW_VERDICT || JSON.stringify({ verdict: "pass", findings: [{ severity: "high", blocking: true, title: "t", body: "b", file: null, line: null }], testGaps: ["gap"], summary: "Looks good" }))
       : JSON.stringify({ status: "ready", planMarkdown: "<proposed_plan>\nImplement safely\n</proposed_plan>", questions: [], assumptions: [] });
     return setTimeout(() => complete(params.threadId, turnId, text), 0);
   }

@@ -7,11 +7,12 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import type { Agent } from "@deepseek-ai/dsh-agent";
+import { CodexAppServerClient } from "../src/app-server.js";
+import { AppServerCodexCallbackDispatcher } from "../src/app-server-callback.js";
 import { closeCoordinationStoresForDirectory } from "../src/coordination.js";
 import { newRequestId } from "../src/bridge-protocol.js";
 import { BridgeStore } from "../src/bridge-store.js";
 import { BridgeRuntime, type AgentRegistryLike } from "../src/bridge-runtime.js";
-import { CodexCallbackDispatcher } from "../src/codex-callback.js";
 import { WorkflowStore } from "../src/store.js";
 import type { WorkflowConfig } from "../src/types.js";
 import { WorkflowManager, type CodexGateway } from "../src/workflow.js";
@@ -19,7 +20,7 @@ import { WorkflowManager, type CodexGateway } from "../src/workflow.js";
 const require = createRequire(import.meta.url);
 const tsxCli = require.resolve("tsx/cli");
 const cli = join(fileURLToPath(new URL("..", import.meta.url)), "src", "bridge-cli.ts");
-const fakeCodex = join(fileURLToPath(new URL(".", import.meta.url)), "fixtures", "fake-codex-resume.mjs");
+const fakeCodexAppServer = join(fileURLToPath(new URL(".", import.meta.url)), "fixtures", "fake-codex-app-server.mjs");
 
 async function rmClosed(path: string): Promise<void> {
   // Close only this tree's coordination connections first (Windows locks an
@@ -112,7 +113,7 @@ async function waitFor(predicate: () => Promise<boolean> | boolean, timeoutMs = 
   }
 }
 
-test("end-to-end: CLI dispatch -> followup -> submit -> exact-thread callback -> CLI respond -> final followup", async () => {
+test("end-to-end: CLI dispatch -> followup -> submit -> forked Reviewer -> final followup", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-e2e-bridge-"));
   const dshHome = join(directory, "dsh-home");
   const storageDir = join(dshHome, "storages", "dsh-codex-workflow");
@@ -127,31 +128,20 @@ test("end-to-end: CLI dispatch -> followup -> submit -> exact-thread callback ->
     const store = new BridgeStore(storageDir);
     const workflowStore = new WorkflowStore(join(directory, "workflows"));
     const codexThreadId = newRequestId();
-    const schemaFile = join(storageDir, "bridge", "review-schema.json");
-    await mkdir(join(storageDir, "bridge"), { recursive: true });
-    await writeFile(schemaFile, JSON.stringify({
-      type: "object",
-      properties: {
-        verdict: { type: "string", enum: ["pass", "changes_requested"] },
-        findings: { type: "array" },
-        testGaps: { type: "array" },
-        summary: { type: "string" },
-      },
-      required: ["verdict", "findings", "testGaps", "summary"],
-    }), "utf8");
-    const callback = new CodexCallbackDispatcher({
+    const callsFile = join(directory, "app-server-calls.jsonl");
+    const codex = new CodexAppServerClient({
       command: process.execPath,
-      args: [fakeCodex],
-      schemaFile,
-      timeoutMs: 10_000,
+      args: [fakeCodexAppServer],
+      requestTimeoutMs: 10_000,
+      idleProcessMs: 0,
       env: {
         ...process.env,
-        FAKE_CALLBACK_ARGS_FILE: join(directory, "callback-args.jsonl"),
-        FAKE_CALLBACK_STDIN_FILE: join(directory, "callback-stdin.txt"),
-        FAKE_CALLBACK_VERDICT: JSON.stringify({ verdict: "pass", findings: [], testGaps: [], summary: "通过" }),
+        FAKE_CODEX_THREAD_PARAMS_MARKER: callsFile,
+        FAKE_CODEX_REVIEW_VERDICT: JSON.stringify({ verdict: "pass", findings: [], testGaps: [], summary: "通过" }),
       },
     });
-    const manager = new WorkflowManager(workflowStore, new NoopGateway(), { ...config, storageDir }, callback, store);
+    const callback = new AppServerCodexCallbackDispatcher(codex);
+    const manager = new WorkflowManager(workflowStore, codex, { ...config, storageDir }, callback, store);
     const { agent, followups } = makeAgent("session-e2e", cwd);
     const registry: AgentRegistryLike = { get: () => agent, list: () => [agent] };
     const runtime = new BridgeRuntime(store, registry, {
@@ -184,8 +174,8 @@ test("end-to-end: CLI dispatch -> followup -> submit -> exact-thread callback ->
       const workflow = (await workflowStore.byBridgeRequest(dispatched.requestId))!;
       assert.equal(workflow.origin, "codex_bridge");
 
-      // 3) DSH submits implementation; the callback resumes the exact thread
-      //    with the structured-output argv contract and review prompt on stdin.
+      // 3) DSH submits implementation; the callback forks the originating task
+      //    into a separately owned read-only Reviewer and starts a schema turn.
       const submitted = await manager.submit(workflow.id, {
         implementationSummary: "实现完成",
         changedFiles: ["src/search.ts"],
@@ -195,22 +185,25 @@ test("end-to-end: CLI dispatch -> followup -> submit -> exact-thread callback ->
         signal: new AbortController().signal,
         deferContext: () => undefined,
       } as never);
-      assert.equal(submitted.submissionState, "received");
+      assert.equal(submitted.submissionState, "received", submitted.submissionError);
       assert.ok(submitted.submissionId);
-      const args = (await readFile(join(directory, "callback-args.jsonl"), "utf8"))
-        .trim().split("\n").map((line) => JSON.parse(line) as string[]);
-      assert.deepEqual(args[0], [
-        "exec",
-        "--json",
-        "--output-schema", schemaFile,
-        "-C", cwd,
-        "--sandbox", "read-only",
-        "-c", "approval_policy=never",
-        "resume", codexThreadId, "-",
-      ]);
-      const stdin = await readFile(join(directory, "callback-stdin.txt"), "utf8");
-      assert.match(stdin, /实现完成/);
-      assert.match(stdin, /SUBMISSION:/);
+      assert.ok(submitted.reviewerThreadId);
+      assert.notEqual(submitted.reviewerThreadId, codexThreadId);
+      const calls = (await readFile(callsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
+        method: string;
+        params: Record<string, any>;
+      });
+      const fork = calls.find((call) => call.method === "thread/fork");
+      const settings = calls.find((call) => call.method === "thread/settings/update");
+      const turn = calls.find((call) => call.method === "turn/start");
+      assert.equal(fork?.params.threadId, codexThreadId);
+      assert.equal(fork?.params.cwd, cwd);
+      assert.equal(fork?.params.sandbox, "read-only");
+      assert.equal(settings?.params.threadId, submitted.reviewerThreadId);
+      assert.deepEqual(settings?.params.sandboxPolicy, { type: "readOnly", networkAccess: false });
+      assert.equal(turn?.params.threadId, submitted.reviewerThreadId);
+      assert.match(turn?.params.input?.[0]?.text ?? "", /实现完成/);
+      assert.match(turn?.params.input?.[0]?.text ?? "", /SUBMISSION:/);
 
       // 4) The automatic callback enqueued the structured verdict itself and
       //    committed `received`; the staged identity is KEPT in the record.
@@ -255,6 +248,8 @@ test("end-to-end: CLI dispatch -> followup -> submit -> exact-thread callback ->
       assert.equal(after?.submissionState, "delivered");
     } finally {
       await runtime.stop();
+      await manager.stop();
+      await codex.stop();
     }
   } finally {
     await rmClosed(directory);

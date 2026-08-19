@@ -1325,10 +1325,12 @@ test("live session registry merges, teardown/expiry/takeover semantics", async (
       await new Promise((resolve) => setTimeout(resolve, 500));
       assert.deepEqual(coord.listLiveSessions().map((row) => row.sessionId), ["session-b1"], "no resurrection after stop");
       // TTL expiry prunes a crashed (non-stopping) owner.
-      coord.refreshOwnerSessions("owner-crash", [{ sessionId: "session-crash", cwd: "C:\\work" }], 120);
-      assert.ok(coord.liveSessionsForCwd((await import("../src/coordination.js")).cwdKey("C:\\work")).some((row) => row.sessionId === "session-crash"));
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      assert.ok(!coord.liveSessionsForCwd((await import("../src/coordination.js")).cwdKey("C:\\work")).some((row) => row.sessionId === "session-crash"), "crashed lease expiry");
+      const crashNow = Date.now();
+      const crashTtlMs = 120;
+      const crashCwdKey = (await import("../src/coordination.js")).cwdKey("C:\\work");
+      coord.refreshOwnerSessions("owner-crash", [{ sessionId: "session-crash", cwd: "C:\\work" }], crashTtlMs, crashNow);
+      assert.ok(coord.liveSessionsForCwd(crashCwdKey, crashNow + crashTtlMs - 1).some((row) => row.sessionId === "session-crash"));
+      assert.ok(!coord.liveSessionsForCwd(crashCwdKey, crashNow + crashTtlMs).some((row) => row.sessionId === "session-crash"), "crashed lease expiry");
       // A new owner takes over the same session id (after B stops renewing it).
       await rtB.stop();
       coord.refreshOwnerSessions("owner-new", [{ sessionId: "session-b1", cwd: "C:\\work" }], 60_000);
@@ -1476,6 +1478,22 @@ test("concurrent BridgeRuntime.stop() share one settle promise", async () => {
     await Promise.all([first, second]);
     assert.equal(secondDone, true);
   } finally {
+    await rmClosed(h.directory);
+  }
+});
+
+test("the normal bridge pump continuously retries due Codex callbacks", async () => {
+  const h = await harness(20);
+  try {
+    let recoveries = 0;
+    h.manager.recoverCallbacks = async () => {
+      recoveries += 1;
+      return 0;
+    };
+    h.runtime.start();
+    await waitFor(() => recoveries >= 2);
+  } finally {
+    await h.runtime.stop();
     await rmClosed(h.directory);
   }
 });

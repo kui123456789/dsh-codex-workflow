@@ -8,6 +8,7 @@ import type {
   TurnNeedsInputResult,
   TurnWaitResult,
 } from "./types.js";
+import { PLUGIN_VERSION } from "./version.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -57,6 +58,12 @@ export interface StartTurnOptions {
    * for the turn to finish, so callers can persist the active turn for
    * cancellation while it is still running. */
   onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
+}
+
+export interface ForkThreadOptions {
+  cwd: string;
+  model?: string;
+  name: string;
 }
 
 export interface ReviewStartOptions {
@@ -139,6 +146,33 @@ export class CodexAppServerClient {
       sandbox: "read-only",
       excludeTurns: true,
     }, signal);
+  }
+
+  /** Fork an existing Codex task into a separately owned, durable reviewer.
+   * Unlike thread/resume, fork only reads the source history and therefore can
+   * succeed while Codex Desktop remains the active writer for the source task. */
+  async forkThread(threadId: string, options: ForkThreadOptions, signal?: AbortSignal): Promise<string> {
+    const params: JsonObject = {
+      threadId,
+      cwd: options.cwd,
+      runtimeWorkspaceRoots: [options.cwd],
+      approvalPolicy: "never",
+      sandbox: "read-only",
+      serviceName: "dsh-codex-workflow",
+      ephemeral: false,
+    };
+    if (options.model) params.model = options.model;
+    const response = await this.request<JsonObject>("thread/fork", params, signal);
+    const fork = object(response.thread);
+    const forkId = string(fork.id, "thread/fork result.thread.id");
+    await this.request("thread/settings/update", {
+      threadId: forkId,
+      cwd: options.cwd,
+      approvalPolicy: "never",
+      sandboxPolicy: { type: "readOnly", networkAccess: false },
+    }, signal);
+    await this.request("thread/name/set", { threadId: forkId, name: options.name }, signal);
+    return forkId;
   }
 
   async startTurn(threadId: string, options: StartTurnOptions, signal?: AbortSignal): Promise<TurnWaitResult> {
@@ -239,7 +273,7 @@ export class CodexAppServerClient {
       if (unexpected) this.failProcess(new Error(`codex app-server exited ${code ?? "unknown"} (${reason ?? "no signal"}): ${this.stderr.trim()}`));
     });
     const initialized = await this.requestRaw<JsonObject>("initialize", {
-      clientInfo: { name: "dsh-codex-workflow", title: "DSH Codex Workflow", version: "0.1.0" },
+      clientInfo: { name: "dsh-codex-workflow", title: "DSH Codex Workflow", version: PLUGIN_VERSION },
       capabilities: { experimentalApi: true },
     }, signal);
     if (typeof initialized.userAgent !== "string") throw new Error("invalid Codex initialize response");

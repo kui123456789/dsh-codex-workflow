@@ -8,7 +8,7 @@ export type WorkflowMode = "planned" | "review_only";
  * Codex-led bridge. Old records default to "dsh". */
 export type WorkflowOrigin = "dsh" | "codex_bridge";
 
-/** Durable state of the callback that resumes the originating Codex task. */
+/** Durable state of the callback that forks/resumes the independent Reviewer. */
 export type CallbackState = "idle" | "queued" | "sending" | "waiting_verdict" | "retrying" | "failed";
 
 /** Per-submission lifecycle inside a bridge workflow. */
@@ -165,6 +165,9 @@ export interface WorkflowRecord {
   submissionState?: SubmissionState;
   submissionAttempts?: number;
   submissionError?: string;
+  /** Earliest wall-clock time at which the persistent callback recovery loop
+   * may start another bounded retry round after the Codex task was busy. */
+  submissionRetryAt?: number;
   /** Idempotency checkpoint for verdict application/replay. */
   appliedVerdictRequestId?: string;
   appliedVerdictSubmissionId?: string;
@@ -185,8 +188,8 @@ export interface WorkflowRecord {
     createdAt: string;
   };
   /** Fenced submission callback lease: the random owner token/epoch and
-   * expiry of the process currently running (or last running) the
-   * exact-thread resume. Recovery and re-claims verify these, so an old owner
+   * expiry of the process currently running (or last running) the Reviewer
+   * callback. Recovery and re-claims verify these, so an old owner
    * can never interfere with a new owner's claim and a live callback is never
    * double-spawned. */
   submissionLeaseToken?: string;

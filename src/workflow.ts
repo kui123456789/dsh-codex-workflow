@@ -5,7 +5,12 @@ import type { Agent } from "@deepseek-ai/dsh-agent";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import type { ToolRunContext } from "@deepseek-ai/dsh-tools";
 import type { CoordinationStore } from "./coordination.js";
-import { CodexInvalidThreadError, CodexNoVerdictError } from "./codex-callback.js";
+import {
+  CodexCallbackProcessError,
+  CodexInvalidThreadError,
+  CodexNoVerdictError,
+  type CodexCallbackRequest,
+} from "./codex-callback.js";
 import { newRequestId, type DispatchPlanCommand, type SubmitVerdictCommand } from "./bridge-protocol.js";
 import { collectEvidence, isGitRepository } from "./evidence.js";
 import { PLANNER_OUTPUT_SCHEMA, REVIEW_OUTPUT_SCHEMA } from "./schemas.js";
@@ -53,18 +58,18 @@ export interface CodexGateway {
 
 export type { ReviewInput };
 
-/** Resumable exact-thread callback injected by the host. */
+/** Resumable Reviewer callback injected by the host. */
 export interface CodexCallback {
   send(
-    request: { workflowId: string; submissionId: string; codexThreadId: string; cwd: string; prompt: string },
+    request: CodexCallbackRequest,
     signal?: AbortSignal,
   ): Promise<
     | { kind: "verdict"; verdict: ReviewResult }
     | { kind: "retryable_busy" }
   >;
   cancel(workflowId: string): void;
-  /** Kill the exact callback child for one submission (lease-loss fencing:
-   * an owner that lost its lease must kill its own child, never the new
+  /** Cancel the exact Reviewer operation for one submission (lease-loss
+   * fencing: an owner that lost its lease must cancel its own operation, never the new
    * owner's). */
   cancelSubmission(workflowId: string, submissionId: string): void;
   stop(): Promise<void>;
@@ -105,8 +110,8 @@ export class WorkflowManager {
   /** Teardown: block new sends, abort in-flight recovery (and its backoff
    * delays), await EVERY recovery-derived background task (recoverStagedVerdict
    * enqueue/commit, runSubmissionCallback chains), and finally kill + await
-   * every callback child. No late task may still be enqueueing, updating the
-   * store or spawning a child when stop() returns. Concurrent stop() calls
+   * every callback operation. No late task may still be enqueueing, updating
+   * the store or starting a review when stop() returns. Concurrent stop() calls
    * share ONE settle promise, so a second caller can never resolve before the
    * first has truly finished tearing down.
    */
@@ -200,7 +205,7 @@ export class WorkflowManager {
   }
 
   /**
-   * Apply a verdict for the exact originating Codex thread and submission.
+   * Apply a verdict bound to the exact originating Codex task and submission.
    * State-machine invariants:
    *  - The FIRST apply of an external verdict only ever moves `received` →
    *    `applied`. `verdict_ready` (verdict staged, enqueue not yet committed)
@@ -584,6 +589,7 @@ export class WorkflowManager {
         r.submissionState = "queued";
         r.submissionAttempts = 0;
         r.submissionError = undefined;
+        r.submissionRetryAt = undefined;
         r.submissionLeaseToken = lease!.owner;
         r.submissionLeaseEpoch = lease!.epoch;
         r.submissionLeaseUntil = Date.now() + this.leaseTtlMs;
@@ -651,7 +657,7 @@ export class WorkflowManager {
   }
 
   /**
-   * One callback run for a submission: spawn the exact-thread resume, apply
+   * One callback run for a submission: fork/resume the Reviewer task, apply
    * the structured verdict or classify the failure, with bounded retry on
    * busy conditions. Verdict handling is a durable two-phase pipeline so a
    * crash can never lose the only valid verdict:
@@ -679,6 +685,7 @@ export class WorkflowManager {
     lease?: ManagerLease,
   ): Promise<WorkflowRecord> {
     let current = seed;
+    const roundStartAttempt = current.submissionAttempts ?? 0;
     let leaseLost = false;
     // Every state write must stay fenced to THIS lease (submissionId + token +
     // epoch): a stale owner can never rewrite a submission the lease moved on.
@@ -708,6 +715,7 @@ export class WorkflowManager {
         const sending = await updateCurrent((r) => {
           r.submissionState = "sending";
           r.submissionAttempts = attempt;
+          r.submissionRetryAt = undefined;
         });
         if (sending.submissionId !== submissionId || submissionTerminal(sending.submissionState)) {
           return sending; // cancelled or re-claimed by another restarter
@@ -720,13 +728,41 @@ export class WorkflowManager {
             codexThreadId: current.codexThreadId!,
             cwd: current.cwd,
             prompt,
+            reviewerThreadId: current.reviewerThreadId,
+            reviewerName: `DSH Reviewer: ${workflowId}`,
+            ...(current.reviewerModel || this.config.reviewerModel
+              ? { model: current.reviewerModel || this.config.reviewerModel }
+              : {}),
+            effort: current.reviewerEffort ?? this.config.reviewerEffort,
+            onThread: async (threadId) => {
+              const registered = await updateCurrent((r) => {
+                r.reviewerThreadId = threadId;
+              });
+              if (registered.reviewerThreadId !== threadId) {
+                throw new Error("submission no longer owns the forked reviewer thread");
+              }
+            },
+            onStarted: async ({ threadId, turnId }) => {
+              const registered = await updateCurrent((r) => {
+                r.reviewerThreadId = threadId;
+                r.reviewerTurnId = turnId;
+              });
+              if (registered.reviewerThreadId !== threadId || registered.reviewerTurnId !== turnId) {
+                throw new Error("submission no longer owns the active reviewer turn");
+              }
+            },
           }, signal);
         } catch (error) {
           if (leaseLost) return current; // we were taken over mid-flight: write nothing
-          if (error instanceof CodexInvalidThreadError || error instanceof CodexNoVerdictError) {
+          if (
+            error instanceof CodexInvalidThreadError
+            || error instanceof CodexNoVerdictError
+            || error instanceof CodexCallbackProcessError
+          ) {
             await updateCurrent((r) => {
               r.submissionState = "failed";
               r.submissionError = error.message;
+              r.submissionRetryAt = undefined;
               r.callbackState = "failed";
             });
             return current;
@@ -766,6 +802,7 @@ export class WorkflowManager {
             r.submissionState = "verdict_ready";
             r.stagedVerdict = { command, createdAt: command.createdAt };
             r.submissionError = undefined;
+            r.submissionRetryAt = undefined;
           });
           if (staged.submissionId !== submissionId || submissionTerminal(staged.submissionState)) return staged;
           // Phase B: idempotent enqueue of the exact staged command.
@@ -788,15 +825,18 @@ export class WorkflowManager {
           r.callbackState = "retrying";
         });
         if (busy.submissionId !== submissionId || submissionTerminal(busy.submissionState)) return busy;
-        if (attempt >= this.config.callbackMaxAttempts) {
+        const attemptsThisRound = attempt - roundStartAttempt;
+        if (attemptsThisRound >= this.config.callbackMaxAttempts) {
+          const retryDelayMs = callbackRecoveryDelay(this.config.callbackRetryBaseMs, attemptsThisRound);
           await updateCurrent((r) => {
-            r.submissionState = "failed";
-            r.submissionError = `codex thread busy after ${attempt} attempts`;
-            r.callbackState = "failed";
+            r.submissionState = "retrying";
+            r.submissionError = `codex thread busy after ${attemptsThisRound} attempts in this round; recovery will retry`;
+            r.submissionRetryAt = Date.now() + retryDelayMs;
+            r.callbackState = "retrying";
           });
           return current;
         }
-        await delay(this.config.callbackRetryBaseMs * 2 ** (attempt - 1), signal);
+        await delay(this.config.callbackRetryBaseMs * 2 ** (attemptsThisRound - 1), signal);
         if (signal?.aborted) throw abortError(signal);
       }
     } catch (error) {
@@ -804,6 +844,7 @@ export class WorkflowManager {
       await updateCurrent((r) => {
         r.submissionState = "failed";
         r.submissionError = errorMessage(error);
+        r.submissionRetryAt = undefined;
         r.callbackState = "failed";
       });
       return current;
@@ -862,7 +903,7 @@ export class WorkflowManager {
 
   /**
    * Plugin-start recovery: resume callbacks that were durably persisted but
-   * never finished, using the persisted exact thread id and submission id.
+   * never finished, using the persisted source/Reviewer task and submission ids.
    * Only queued/sending/retrying submissions are re-spawned (received means
    * the callback already finished and the verdict is queued); a `verdict_ready`
    * submission is NOT re-spawned — its staged verdict is re-enqueued with the
@@ -894,11 +935,32 @@ export class WorkflowManager {
 
   private async runRecovery(signal: AbortSignal): Promise<number> {
     let recovered = 0;
-    for (const record of await this.store.list()) {
+    for (const loaded of await this.store.list()) {
       if (signal.aborted || this.stopped) break;
+      let record = loaded;
       if (record.origin !== "codex_bridge") continue;
       const submissionId = record.submissionId;
       if (!submissionId) continue;
+
+      // 1.0.0 migration: early builds treated ordinary task contention as a
+      // terminal submission, either after exhausting a bounded retry round or
+      // when Codex reported the newer thread-store "active writer" wording.
+      // Restore only these known contention shapes; invalid-thread/schema/
+      // no-verdict and other process failures remain terminal.
+      if (record.submissionState === "failed" && isRecoverableContentionFailure(record)) {
+        const restored = await this.store.update(record.id, (r) => {
+          if (
+            r.submissionId !== submissionId
+            || r.submissionState !== "failed"
+            || !isRecoverableContentionFailure(r)
+          ) return;
+          r.submissionState = "retrying";
+          r.submissionError = "codex thread contention detected; persistent recovery will retry";
+          r.submissionRetryAt = 0;
+          r.callbackState = "retrying";
+        }, { ignoreCancelled: false });
+        record = restored.record;
+      }
 
       // Verdict obtained but never enqueued: durable two-phase recovery.
       if (record.submissionState === "verdict_ready" && record.stagedVerdict) {
@@ -912,16 +974,8 @@ export class WorkflowManager {
       }
 
       if (!RECOVERABLE_STATES.has(record.submissionState as SubmissionState)) continue;
+      if ((record.submissionRetryAt ?? 0) > Date.now()) continue;
       if (this.recovering.has(submissionId)) continue;
-      if ((record.submissionAttempts ?? 0) >= this.config.callbackMaxAttempts) {
-        await this.store.update(record.id, (r) => {
-          if (r.submissionId !== submissionId) return;
-          r.submissionState = "failed";
-          r.submissionError = "callback attempts exhausted before recovery";
-          r.callbackState = "failed";
-        }, { ignoreCancelled: false });
-        continue;
-      }
       // Cross-process claim gate: a live lease (another DSH process) means the
       // submission is being handled right now; only expired leases are taken.
       const lease = await this.acquireSubmissionLease(record.id, submissionId);
@@ -934,6 +988,7 @@ export class WorkflowManager {
         // owner holds it after an atomic acquire); stamp the record with the
         // fence so the running callback's writes stay bound to this owner.
         r.submissionState = "sending";
+        r.submissionRetryAt = undefined;
         r.submissionLeaseToken = lease!.owner;
         r.submissionLeaseEpoch = lease!.epoch;
         r.submissionLeaseUntil = Date.now() + this.leaseTtlMs;
@@ -1015,7 +1070,7 @@ export class WorkflowManager {
   /**
    * Review-only entry: unlike `start`, it never runs the Codex planner. A fresh
    * read-only source thread hosts the first detached reviewer; later rounds
-   * reuse the persisted reviewer thread via the ordinary `review` tool. All
+   * reuse the persisted Reviewer task via the ordinary `review` tool. All
    * evidence, decision-gate, no-change and cycle-limit logic is shared.
    */
   async reviewOnly(
@@ -1150,7 +1205,7 @@ export class WorkflowManager {
     if (target) {
       await this.codex.interrupt(target.threadId, target.turnId, exec.signal).catch(() => undefined);
     }
-    // Kill the active callback child, if any; cancelled is terminal for it too.
+    // Cancel the active Reviewer operation, if any; cancelled is terminal for it too.
     this.callback?.cancel(workflowId);
     return outcome.record;
   }
@@ -1462,8 +1517,8 @@ function normalizeReviewPrompt(
   return `Convert the code review you just completed into the required JSON schema. For every finding set blocking to true only when it must be fixed before delivery: critical and high findings block by default; medium and low findings block only when they create an actual correctness, regression, security, or delivery-required test gap. Every entry in testGaps counts as blocking. verdict is pass only when there are no actionable correctness, regression, security, or material test findings. Preserve concrete file and line references.\n\nWorkflow: ${record.id}\nImplementation: ${input.implementationSummary}\nRaw review:\n${rawReview}`;
 }
 
-/** Prompt that resumes the exact originating Codex thread: the reviewer stays
- * read-only and returns the verdict as its final structured message. The
+/** Prompt used by the forked Reviewer task: it inherits the originating task's
+ * history, stays read-only and returns the verdict as its final structured message. The
  * verdict is captured by the plugin from stdout and applied outside the
  * sandbox; the reviewer never writes the bridge queue itself.
  *
@@ -1513,6 +1568,20 @@ Your JSON verdict is collected automatically from this reply; never write it to 
 const SUBMISSION_ACTIVE = new Set<SubmissionState>(["queued", "sending", "waiting_verdict", "retrying", "verdict_ready", "received"]);
 const SUBMISSION_TERMINAL = new Set<SubmissionState>(["applied", "delivered", "failed"]);
 const RECOVERABLE_STATES = new Set<SubmissionState>(["queued", "sending", "retrying"]);
+
+function callbackRecoveryDelay(baseMs: number, attemptsThisRound: number): number {
+  return Math.min(5 * 60 * 1000, baseMs * 2 ** Math.min(attemptsThisRound, 8));
+}
+
+function isRecoverableContentionFailure(record: WorkflowRecord): boolean {
+  return record.origin === "codex_bridge"
+    && record.submissionState === "failed"
+    && Boolean(record.pendingReviewRequest)
+    && (
+      /^codex thread busy after \d+ attempts$/.test(record.submissionError ?? "")
+      || /already has an active writer/i.test(record.submissionError ?? "")
+    );
+}
 
 function submissionActive(state: SubmissionState | undefined): boolean {
   return state !== undefined && SUBMISSION_ACTIVE.has(state);

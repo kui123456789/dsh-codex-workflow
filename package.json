@@ -1,7 +1,8 @@
 {
   "name": "dsh-codex-workflow",
-  "version": "0.1.0",
+  "version": "1.0.1",
   "description": "DeepSeek Harness plugin that uses Codex to plan and review while DSH executes.",
+  "packageManager": "pnpm@10.33.2",
   "type": "module",
   "main": "./lib/index.js",
   "types": "./lib/index.d.ts",
@@ -20,14 +21,18 @@
     "scripts",
     "cordis.patch.yml",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
+    "pretest": "pnpm build",
     "test": "tsx --test test/*.test.ts",
-    "verify": "pnpm typecheck && pnpm test && pnpm build",
-    "doctor": "pnpm build && node scripts/doctor.mjs"
+    "verify": "pnpm typecheck && pnpm test",
+    "doctor": "pnpm build && node scripts/doctor.mjs",
+    "doctor:offline": "pnpm build && node scripts/doctor.mjs --offline",
+    "release:check": "node scripts/release-check.mjs"
   },
   "dsh": {
     "bundle": {

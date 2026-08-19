@@ -2,7 +2,7 @@ import crossSpawn from "cross-spawn";
 import type { ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { parseReviewResult } from "./bridge-protocol.js";
-import type { ReviewResult } from "./types.js";
+import type { ReasoningEffort, ReviewResult } from "./types.js";
 
 export interface CodexCallbackRequest {
   workflowId: string;
@@ -10,6 +10,12 @@ export interface CodexCallbackRequest {
   codexThreadId: string;
   cwd: string;
   prompt: string;
+  reviewerThreadId?: string;
+  reviewerName?: string;
+  model?: string;
+  effort?: ReasoningEffort;
+  onThread?: (threadId: string) => Promise<void> | void;
+  onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
 }
 
 export interface CodexCallbackOptions {
@@ -53,18 +59,30 @@ export class CodexNoVerdictError extends Error {
   }
 }
 
+/** Terminal child-process failure that is neither a busy/rate-limit condition
+ * nor an invalid thread. Retrying it as "busy" would hide actionable CLI
+ * configuration and environment errors from the operator. */
+export class CodexCallbackProcessError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CodexCallbackProcessError";
+  }
+}
+
 const BUSY_PATTERNS = [
   /429 Too Many Requests/i,
   /exceeded retry limit/i,
   /rate limit/i,
   /already in use/i,
+  /already has an active writer/i,
 ];
 
 /**
  * Resumes the exact stored Codex thread with a read-only review and a strict
  * structured-output contract:
  *
- *   codex exec --json --output-schema <schema> -C <cwd> --sandbox read-only \
+ *   codex exec --json --output-schema <schema> -C <cwd> \
+ *     --skip-git-repo-check --sandbox read-only \
  *     -c approval_policy=never resume <codexThreadId> -
  *
  * Never uses `--last` and never creates a replacement thread. The child runs
@@ -151,6 +169,7 @@ export class CodexCallbackDispatcher {
         "--json",
         "--output-schema", this.options.schemaFile,
         "-C", request.cwd,
+        "--skip-git-repo-check",
         "--sandbox", "read-only",
         "-c", "approval_policy=never",
         "resume", request.codexThreadId, "-",
@@ -265,8 +284,18 @@ export class CodexCallbackDispatcher {
             finish({ kind: "retryable_busy" });
             return;
           }
-          // Any other nonzero exit is safer to retry than to lose the workflow.
-          finish({ kind: "retryable_busy" });
+          // A signal-only exit can result from an interrupted child whose
+          // thread may still be settling, so it remains retryable. A real
+          // nonzero exit is actionable and terminal; calling it "busy" hides
+          // errors such as invalid CLI configuration or authentication.
+          if (code === null) {
+            finish({ kind: "retryable_busy" });
+            return;
+          }
+          const detail = compactProcessDiagnostic(stderr || stdout);
+          finish("error", new CodexCallbackProcessError(
+            `codex callback exited with code ${code}${detail ? `: ${detail}` : ""}`,
+          ));
           return;
         }
         try {
@@ -325,6 +354,14 @@ export class CodexCallbackDispatcher {
     this.kill(child);
     return exited;
   }
+}
+
+function compactProcessDiagnostic(value: string): string {
+  return value
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 2_048);
 }
 
 /** Extract the final agent message from a bounded JSONL event stream and

@@ -48,6 +48,7 @@ export interface QueueRow {
   claimEpoch: number;
   claimOwner: string;
   claimUntil: number;
+  createdAt: number;
   lastError?: string;
   nextAttemptAt?: number;
   receiptJson?: string;
@@ -61,7 +62,20 @@ export interface WorkflowRow {
   updatedAt: number;
 }
 
-export type QueueStatus = "inbox" | "retry" | "processing" | "done" | "dead-letter";
+export type QueueStatus = "inbox" | "retry" | "processing" | "done" | "dead-letter" | "failed";
+
+export interface PruneRequestCandidate {
+  requestId: string;
+  status: string;
+  terminalAt: number;
+}
+
+export interface PruneWorkflowCandidate {
+  id: string;
+  phase: string;
+  revision: number;
+  updatedAt: number;
+}
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS leases (
@@ -147,12 +161,25 @@ export class CoordinationStore {
   constructor(readonly path: string, options: CoordinationOptions = {}) {
     assertLocalDisk(path);
     this.db = new DatabaseSync(path);
-    // Rollback journal (DELETE), NOT WAL: see the module docs — SQLite <=
-    // 3.51.2 (Node 24.14.0) has a WAL-reset bug under concurrent writers.
-    this.db.exec(`PRAGMA journal_mode=DELETE`);
-    this.db.exec(`PRAGMA synchronous=FULL`);
-    this.db.exec(`PRAGMA busy_timeout=${options.busyTimeoutMs ?? 10_000}`);
-    this.db.exec(SCHEMA);
+    try {
+      // Busy handling must be installed before any PRAGMA that can acquire a
+      // write lock. Two DSH processes may open/create the same database at the
+      // same time during startup.
+      this.db.exec(`PRAGMA busy_timeout=${options.busyTimeoutMs ?? 10_000}`);
+      // Rollback journal (DELETE), NOT WAL: see the module docs — SQLite <=
+      // 3.51.2 (Node 24.14.0) has a WAL-reset bug under concurrent writers.
+      const journal = this.db.prepare("PRAGMA journal_mode").get() as { journal_mode: string };
+      if (journal.journal_mode.toLowerCase() !== "delete") this.db.exec("PRAGMA journal_mode=DELETE");
+      this.db.exec("PRAGMA synchronous=FULL");
+      this.db.exec(SCHEMA);
+    } catch (error) {
+      try {
+        this.db.close();
+      } catch {
+        // Preserve the initialization error.
+      }
+      throw error;
+    }
     const key = normalizeDbPath(path);
     let group = LIVE_BY_PATH.get(key);
     if (!group) {
@@ -600,6 +627,135 @@ export class CoordinationStore {
     }
   }
 
+  // ------------------------------------------------------------ ops: requeue
+
+  /**
+   * Ops requeue: bring a request back to 'retry' so a runtime picks it up
+   * again. IDEMPOTENT: already-inbox/retry returns { changed: false } (no-op
+   * success). Only 'dead-letter'/'failed' rows are re-enqueued. Processing
+   * (a claim could be followed by side effects from the waiter), done (final
+   * receipt), cancelled (terminal) and inbox (already queued) are never moved
+   * backwards — a replayed or conflicting identity cannot resurrect a finished
+   * exchange. attempts stay as an audit trail; next_attempt_at is set to now.
+   */
+  requeueRequest(requestId: string, now = Date.now()): { changed: boolean; from?: string } {
+    this.assertOpen();
+    const row = this.queueRow(requestId);
+    if (!row) return { changed: false };
+    if (row.status === "inbox" || row.status === "retry") return { changed: false, from: row.status };
+    if (row.status === "dead-letter" || row.status === "failed") {
+      const result = this.db.prepare(
+        `UPDATE queue SET status = 'retry', next_attempt_at = ?, dead_letter_at = NULL, claim_owner = '', claim_until = 0
+         WHERE request_id = ? AND status IN ('dead-letter', 'failed')`,
+      ).run(now, requestId);
+      if (Number(result.changes) === 1) return { changed: true, from: row.status };
+      return { changed: false, from: row.status };
+    }
+    throw new Error(`cannot requeue request in status ${row.status}`);
+  }
+
+  // --------------------------------------------------------------- ops: prune
+
+  /**
+   * Safe prune candidates. Only TERMINAL evidence older than `olderThanMs` is
+   * eligible — never anything live:
+   *   - queue rows with a FINAL receipt (status done/cancelled with a stored
+   *     receipt) older than the retention window (age by deliveredAt in the
+   *     receipt, never by the original enqueue time);
+   *   - workflow records in a terminal phase (passed/cancelled) older than the
+   *     retention window (age by updated_at), whose submission is no longer
+   *     active.
+   * Failed/blocked workflows (diagnostics) and never-delivered verdicts are
+   * NEVER candidates. Returns request/workflow id lists so the CLI can preview
+   * (dry-run) before applying.
+   */
+  pruneCandidates(olderThanMs: number, now = Date.now()): {
+    requests: PruneRequestCandidate[];
+    workflows: PruneWorkflowCandidate[];
+  } {
+    this.assertOpen();
+    const cutoff = now - olderThanMs;
+    const requestRows = this.db.prepare(
+      `SELECT request_id, status, receipt_json FROM queue
+       WHERE status IN ('done', 'cancelled') AND receipt_json IS NOT NULL ORDER BY created_at`,
+    ).all() as Array<{ request_id: string; status: string; receipt_json: string }>;
+    const requests: PruneRequestCandidate[] = [];
+    for (const row of requestRows) {
+      const terminalAt = receiptDeliveredAt(row.receipt_json);
+      if (terminalAt === undefined || terminalAt > cutoff) continue;
+      requests.push({ requestId: String(row.request_id), status: String(row.status), terminalAt });
+    }
+    const workflowRows = this.db.prepare(
+      "SELECT id, revision, record_json, updated_at FROM workflows WHERE updated_at <= ? ORDER BY updated_at",
+    ).all(cutoff) as Array<{ id: string; revision: number; record_json: string; updated_at: number }>;
+    const workflows: PruneWorkflowCandidate[] = [];
+    for (const row of workflowRows) {
+      let phase = "";
+      let submissionActive = false;
+      try {
+        const record = JSON.parse(row.record_json) as {
+          phase?: string;
+          submissionState?: string;
+          submissionActive?: boolean;
+        };
+        phase = record.phase ?? "";
+        submissionActive = record.submissionState === "queued"
+          || record.submissionState === "sending"
+          || record.submissionState === "retrying"
+          || record.submissionState === "verdict_ready"
+          || record.submissionState === "received"
+          || record.submissionState === "applied";
+      } catch {
+        continue;
+      }
+      if (submissionActive) continue;
+      if (phase !== "passed" && phase !== "cancelled") continue; // keep failed/blocked diagnostics
+      workflows.push({ id: String(row.id), phase, revision: Number(row.revision), updatedAt: Number(row.updated_at) });
+    }
+    return { requests, workflows };
+  }
+
+  /** Apply preview tokens after re-validating every mutable field inside one
+   * write transaction. A row changed after preview is skipped, never deleted. */
+  pruneApply(
+    requests: PruneRequestCandidate[],
+    workflows: PruneWorkflowCandidate[],
+    olderThanMs: number,
+    now = Date.now(),
+  ): { removedRequests: number; removedWorkflows: number } {
+    this.assertOpen();
+    const cutoff = now - olderThanMs;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      let removedRequests = 0;
+      const loadRequest = this.db.prepare("SELECT status, receipt_json FROM queue WHERE request_id = ?");
+      const deleteRequest = this.db.prepare("DELETE FROM queue WHERE request_id = ? AND status = ? AND receipt_json = ?");
+      for (const candidate of requests) {
+        const row = loadRequest.get(candidate.requestId) as { status: string; receipt_json: string | null } | undefined;
+        if (!row || row.status !== candidate.status || (row.status !== "done" && row.status !== "cancelled") || !row.receipt_json) continue;
+        const terminalAt = receiptDeliveredAt(row.receipt_json);
+        if (terminalAt === undefined || terminalAt !== candidate.terminalAt || terminalAt > cutoff) continue;
+        removedRequests += Number(deleteRequest.run(candidate.requestId, row.status, row.receipt_json).changes);
+      }
+      let removedWorkflows = 0;
+      const loadWorkflow = this.db.prepare("SELECT revision, record_json, updated_at FROM workflows WHERE id = ?");
+      const deleteWorkflow = this.db.prepare("DELETE FROM workflows WHERE id = ? AND revision = ? AND updated_at = ?");
+      for (const candidate of workflows) {
+        const row = loadWorkflow.get(candidate.id) as { revision: number; record_json: string; updated_at: number } | undefined;
+        if (!row || Number(row.revision) !== candidate.revision || Number(row.updated_at) !== candidate.updatedAt || Number(row.updated_at) > cutoff) continue;
+        const state = workflowPruneState(row.record_json);
+        if (!state || state.phase !== candidate.phase || state.submissionActive) continue;
+        if (state.phase !== "passed" && state.phase !== "cancelled") continue;
+        removedWorkflows += Number(deleteWorkflow.run(candidate.id, candidate.revision, candidate.updatedAt).changes);
+      }
+      this.db.exec("COMMIT");
+      return { removedRequests, removedWorkflows };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   // -------------------------------------------------------------- workflows
 
   loadWorkflow(id: string): WorkflowRow | undefined {
@@ -699,6 +855,34 @@ export class CoordinationStore {
   }
 }
 
+function receiptDeliveredAt(receiptJson: string): number | undefined {
+  try {
+    const receipt = JSON.parse(receiptJson) as { deliveredAt?: unknown };
+    if (typeof receipt.deliveredAt !== "string") return undefined;
+    const parsed = Date.parse(receipt.deliveredAt);
+    return Number.isNaN(parsed) ? undefined : parsed;
+  } catch {
+    return undefined;
+  }
+}
+
+function workflowPruneState(recordJson: string): { phase: string; submissionActive: boolean } | undefined {
+  try {
+    const record = JSON.parse(recordJson) as { phase?: string; submissionState?: string };
+    return {
+      phase: record.phase ?? "",
+      submissionActive: record.submissionState === "queued"
+        || record.submissionState === "sending"
+        || record.submissionState === "retrying"
+        || record.submissionState === "verdict_ready"
+        || record.submissionState === "received"
+        || record.submissionState === "applied",
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 function mapQueueRow(row: Record<string, unknown>): QueueRow {
   const result: QueueRow = {
     requestId: String(row.request_id),
@@ -709,6 +893,7 @@ function mapQueueRow(row: Record<string, unknown>): QueueRow {
     claimEpoch: Number(row.claim_epoch),
     claimOwner: String(row.claim_owner),
     claimUntil: Number(row.claim_until),
+    createdAt: Number(row.created_at ?? 0),
   };
   if (row.last_error !== null && row.last_error !== undefined) result.lastError = String(row.last_error);
   if (row.next_attempt_at !== null && row.next_attempt_at !== undefined) result.nextAttemptAt = Number(row.next_attempt_at);

@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master, 'feature/**']
+  pull_request:
+
+jobs:
+  test:
+    name: node ${{ matrix.node }} / windows
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node:
+          - "22.19.x"
+          - "24.x"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node with Corepack-pinned pnpm
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Enable Corepack + locked pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.33.2 --activate
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Tests (full suite incl. process-level fault/recovery)
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
+      - name: Offline doctor (no Codex login, no real DSH_HOME)
+        run: pnpm doctor:offline -- --json
+
+      - name: Release check (verify + offline doctor + pack audit, tgz cleaned)
+        run: pnpm release:check
+
+      - name: No packaging leftovers
+        shell: pwsh
+        run: |
+          if (Get-ChildItem -Recurse -Filter *.tgz -ErrorAction SilentlyContinue) { throw "stray .tgz after release:check" }
+          if (Get-ChildItem -Recurse -Directory -Filter .codex-pack-review -ErrorAction SilentlyContinue) { throw "stray review dir after release:check" }

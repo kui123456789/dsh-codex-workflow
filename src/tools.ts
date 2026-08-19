@@ -13,7 +13,7 @@ const jsonOutput = {
  *  - start/continue run ONE Codex turn bounded by turnTimeoutMs;
  *  - review/review_only run TWO serial turns (the review turn, then the
  *    normalize turn), each of which can independently exhaust turnTimeoutMs;
- *  - submit runs up to `callbackMaxAttempts` exact-thread callbacks (each up to
+ *  - submit runs up to `callbackMaxAttempts` Reviewer callbacks (each up to
  *    callbackTimeoutMs) separated by exponential backoff
  *    `callbackRetryBaseMs * 2^(attempt-1)`.
  * Budgets are computed overflow-safely (saturated at MAX_SAFE_INTEGER) with a

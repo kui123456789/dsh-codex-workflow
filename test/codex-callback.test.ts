@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import crossSpawn from "cross-spawn";
 import {
   CodexCallbackDispatcher,
+  CodexCallbackProcessError,
   CodexInvalidThreadError,
   CodexNoVerdictError,
   extractVerdict,
@@ -92,6 +93,7 @@ test("the read-only child gets --json --output-schema and never writes the queue
       "--json",
       "--output-schema", schemaFile,
       "-C", request.cwd,
+      "--skip-git-repo-check",
       "--sandbox", "read-only",
       "-c", "approval_policy=never",
       "resume", request.codexThreadId, "-",
@@ -143,7 +145,7 @@ test("a child that succeeds without any verdict message is an explicit failure",
   }
 });
 
-test("an invalid thread id is terminal; rate-limit and unknown exits are retryable", async () => {
+test("invalid threads and process failures are terminal; rate limits are retryable", async () => {
   const schemaFile = await makeSchema();
   const invalid = dispatcher(schemaFile, 10_000, {
     FAKE_CALLBACK_EXIT: "1",
@@ -156,6 +158,22 @@ test("an invalid thread id is terminal; rate-limit and unknown exits are retryab
     FAKE_CALLBACK_STDERR: "exceeded retry limit, last status: 429 Too Many Requests",
   });
   assert.deepEqual(await busy.send(request), { kind: "retryable_busy" });
+
+  const activeWriter = dispatcher(schemaFile, 10_000, {
+    FAKE_CALLBACK_EXIT: "1",
+    FAKE_CALLBACK_STDERR: `thread-store conflict: thread ${request.codexThreadId} already has an active writer`,
+  });
+  assert.deepEqual(await activeWriter.send(request), { kind: "retryable_busy" });
+
+  const failed = dispatcher(schemaFile, 10_000, {
+    FAKE_CALLBACK_EXIT: "1",
+    FAKE_CALLBACK_STDERR: "invalid CLI configuration",
+  });
+  await assert.rejects(
+    failed.send(request),
+    (error: unknown) => error instanceof CodexCallbackProcessError
+      && /exited with code 1: invalid CLI configuration/.test(error.message),
+  );
 });
 
 test("timeout and cancellation terminate the child", async () => {

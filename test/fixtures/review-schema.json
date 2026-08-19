@@ -1,0 +1,25 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "verdict": { "type": "string", "enum": ["pass", "changes_requested"] },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "severity": { "type": "string" },
+          "blocking": { "type": "boolean" },
+          "title": { "type": "string" },
+          "body": { "type": "string" },
+          "file": { "type": ["string", "null"] },
+          "line": { "type": ["number", "null"] }
+        },
+        "required": ["severity", "blocking", "title", "body"]
+      }
+    },
+    "testGaps": { "type": "array", "items": { "type": "string" } },
+    "summary": { "type": "string" }
+  },
+  "required": ["verdict", "findings", "testGaps", "summary"]
+}
