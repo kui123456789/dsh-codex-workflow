@@ -1693,6 +1693,38 @@ test("concurrent BridgeRuntime.stop() share one settle promise", async () => {
   }
 });
 
+test("stop waits for the active pump finalizer before releasing storage", async () => {
+  const h = await harness(5);
+  const gate = deferredGate();
+  let enteredResolve!: () => void;
+  const entered = new Promise<void>((resolve) => { enteredResolve = resolve; });
+  const originalRefresh = h.runtime.refreshSessions.bind(h.runtime);
+  let blockFinalizer = true;
+  h.runtime.refreshSessions = async (force = false) => {
+    await originalRefresh(force);
+    if (!force && blockFinalizer) {
+      enteredResolve();
+      await gate.promise;
+    }
+  };
+
+  h.runtime.start();
+  let stopping: Promise<void> | undefined;
+  try {
+    await entered;
+    let stopped = false;
+    stopping = h.runtime.stop();
+    stopping.then(() => { stopped = true; });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(stopped, false, "stop must await the full pump finalizer");
+  } finally {
+    blockFinalizer = false;
+    gate.release();
+    await (stopping ?? h.runtime.stop());
+    await rmClosed(h.directory);
+  }
+});
+
 test("the normal bridge pump continuously retries due Codex callbacks", async () => {
   const h = await harness(20);
   try {

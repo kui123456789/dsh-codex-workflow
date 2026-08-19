@@ -264,12 +264,17 @@ export class BridgeRuntime {
         }
       }
     } finally {
-      this.polling = false;
       // Keep the live-session registry aligned with the current agent list
       // promptly (agent created/disposed are reflected on the next pump); the
       // independent heartbeat covers long pump stretches. A refresh after
-      // stop() writes nothing (doRefreshSessions is gated on stopped).
-      await this.refreshSessions(false).catch(() => undefined);
+      // stop() writes nothing (doRefreshSessions is gated on stopped). Keep
+      // `polling` true through this finalizer so another timer tick cannot
+      // overlap a new pump and teardown cannot return before the pump settles.
+      try {
+        await this.refreshSessions(false).catch(() => undefined);
+      } finally {
+        this.polling = false;
+      }
     }
   }
 
