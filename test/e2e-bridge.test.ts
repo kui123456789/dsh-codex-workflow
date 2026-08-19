@@ -57,6 +57,7 @@ const config: WorkflowConfig = {
   callbackRetryBaseMs: 200,
   turnTimeoutMs: 10_000,
   idleProcessMs: 0,
+  terminalRelayTimeoutMs: 60_000,
   storageDir: "",
 };
 
@@ -113,7 +114,7 @@ async function waitFor(predicate: () => Promise<boolean> | boolean, timeoutMs = 
   }
 }
 
-test("end-to-end: CLI dispatch -> followup -> submit -> forked Reviewer -> final followup", async () => {
+test("end-to-end: CLI dispatch -> followup -> submit -> fresh Reviewer -> final followup", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-e2e-bridge-"));
   const dshHome = join(directory, "dsh-home");
   const storageDir = join(dshHome, "storages", "dsh-codex-workflow");
@@ -174,9 +175,10 @@ test("end-to-end: CLI dispatch -> followup -> submit -> forked Reviewer -> final
       const workflow = (await workflowStore.byBridgeRequest(dispatched.requestId))!;
       assert.equal(workflow.origin, "codex_bridge");
 
-      // 3) DSH submits implementation; the callback forks the originating task
-      //    into a separately owned read-only Reviewer and starts a schema turn.
-      const submitted = await manager.submit(workflow.id, {
+      // 3) DSH submits implementation; the callback validates the source
+      //    read-only (thread/read) and starts a fresh, separately owned
+      //    read-only Reviewer (thread/start), then runs a schema turn.
+      let submitted = await manager.submit(workflow.id, {
         implementationSummary: "实现完成",
         changedFiles: ["src/search.ts"],
         testResults: "全部通过",
@@ -185,6 +187,9 @@ test("end-to-end: CLI dispatch -> followup -> submit -> forked Reviewer -> final
         signal: new AbortController().signal,
         deferContext: () => undefined,
       } as never);
+      assert.equal(submitted.submissionState, "queued");
+      await waitFor(async () => (await workflowStore.load(workflow.id))?.submissionState === "received");
+      submitted = (await workflowStore.load(workflow.id))!;
       assert.equal(submitted.submissionState, "received", submitted.submissionError);
       assert.ok(submitted.submissionId);
       assert.ok(submitted.reviewerThreadId);
@@ -193,12 +198,16 @@ test("end-to-end: CLI dispatch -> followup -> submit -> forked Reviewer -> final
         method: string;
         params: Record<string, any>;
       });
-      const fork = calls.find((call) => call.method === "thread/fork");
+      const read = calls.find((call) => call.method === "thread/read");
+      const start = calls.find((call) => call.method === "thread/start");
       const settings = calls.find((call) => call.method === "thread/settings/update");
       const turn = calls.find((call) => call.method === "turn/start");
-      assert.equal(fork?.params.threadId, codexThreadId);
-      assert.equal(fork?.params.cwd, cwd);
-      assert.equal(fork?.params.sandbox, "read-only");
+      assert.equal(read?.params.threadId, codexThreadId);
+      assert.equal(read?.params.includeTurns, false, "source validation must not load turns");
+      assert.ok(!calls.some((call) => call.method === "thread/fork"), "reviewers are started fresh, never forked");
+      assert.ok(!calls.some((call) => call.method === "thread/resume" && call.params.threadId === codexThreadId), "the source task is never resumed");
+      assert.equal(start?.params.cwd, cwd);
+      assert.equal(start?.params.sandbox, "read-only");
       assert.equal(settings?.params.threadId, submitted.reviewerThreadId);
       assert.deepEqual(settings?.params.sandboxPolicy, { type: "readOnly", networkAccess: false });
       assert.equal(turn?.params.threadId, submitted.reviewerThreadId);
