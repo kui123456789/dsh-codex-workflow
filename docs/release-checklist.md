@@ -1,6 +1,6 @@
-# Release checklist — dsh-codex-workflow 1.0.1
+# Release checklist — dsh-codex-workflow 1.0.5
 
-This is the operator checklist for shipping 1.0.1. It assumes the automated gates
+This is the operator checklist for shipping 1.0.5. It assumes the automated gates
 succeeded; this page is about the things automation cannot cover, plus the
 rollback story. It never authorizes touching user credentials or configuration
 outside `$DSH_HOME/storages/dsh-codex-workflow/`.
@@ -28,9 +28,23 @@ Run `pnpm release:check` twice in a row and confirm:
 2. In a throwaway workspace with a scratch `CODEX_THREAD_ID`:
    - `dsh-codex-workflow sessions --cwd $PWD --json` lists the live session;
    - `dispatch` a plan and `codex_workflow_submit` it exactly once;
-   - the source Codex task stays unchanged while a durable Reviewer task is
-     forked from it; `show --workflow <id>` reports both ids and version `1.0.1`;
-   - a second review reuses that Reviewer task instead of creating another fork;
+   - the source Codex task stays unchanged while a fresh, durably owned
+     Reviewer task is started; `show --workflow <id>` reports both ids and
+     version `1.0.5`;
+   - delay the Reviewer for more than 30 seconds: `codex_workflow_submit`
+     returns within 5 seconds, concludes that DSH turn without another model
+     step, the DSH session becomes idle, and status remains
+     `sending`/`retrying` until the background verdict arrives;
+   - abort the originating tool signal after submit returns: the background
+     Reviewer continues and the verdict still wakes the same session;
+   - force invalid-task/no-verdict/process failures: one durable terminal notice
+     is relayed, including across restart, with no duplicate submit steer;
+   - the Reviewer inherits no source history and starts even when the source
+     task has an active writer;
+   - a second review reuses that Reviewer task instead of starting another;
+   - while a Reviewer turn runs longer than `idleProcessMs`, its App Server stays alive; after the final verdict, the process exits after the idle grace period and Codex Desktop can open the Reviewer task;
+   - after a passing verdict, DSH reports once without invoking `memory` or any other tool and returns to idle; force a hanging terminal relay and confirm it is cancelled once after `terminalRelayTimeoutMs` with its inbox preserved;
+   - let a terminal relay reach idle normally, then start a new user turn and confirm the old guard never cancels it; stop the plugin with a guard pending and confirm no late cancellation occurs;
    - a blocking `changes_requested` returns DSH to `fixing`; re-submit works;
    - only non-blocking findings stop at `waiting_review_decision`;
    - a workspace change between submit and verdict produces a VOID relay
@@ -53,10 +67,10 @@ Run `pnpm release:check` twice in a row and confirm:
 
 ## Rollback
 
-- The previous stable version `1.0.0` is a normal `pnpm` package; downgrading is
-  just reinstalling it. Its legacy file-queue data is still imported by 1.0.1, and the
+- The previous stable version `1.0.4` is a normal `pnpm` package; downgrading is
+  just reinstalling it. Its legacy file-queue data is still imported by 1.0.5, and the
   import is one-way (the SQLite queue is authoritative once written).
-- If 1.0.1 must be pulled: stop the plugin/dispatch traffic first, restore the
+- If 1.0.5 must be pulled: stop the plugin/dispatch traffic first, restore the
   package, and verify with `pnpm doctor` before resuming. Record database and
   log state are not modified by a version change (only by `prune --commit`).
 
