@@ -90,6 +90,7 @@ export class BridgeRuntime {
   private timer?: NodeJS.Timeout;
   private sessionHeartbeat?: NodeJS.Timeout;
   private sessionsChain: Promise<void> = Promise.resolve();
+  private sessionSnapshot?: string;
   private polling = false;
   private stopped = false;
   private stopPromise?: Promise<void>;
@@ -123,14 +124,14 @@ export class BridgeRuntime {
     void this.store.recoverOrphans().catch(() => undefined);
     // Resume callbacks that were durably persisted but never finished.
     void this.options.manager.recoverCallbacks().catch(() => undefined);
-    void this.refreshSessions();
+    void this.refreshSessions(true);
     // Session heartbeat is INDEPENDENT of the pump: a long Codex callback must
     // never let this runtime's live sessions expire, and agent churn (created /
     // disposed) is reflected promptly. Period is a third of the lease TTL; the
     // refresh chain is serialized and gated on `stopped`.
     const sessionPeriod = Math.max(100, Math.floor(this.store.leaseMs / 3));
     this.sessionHeartbeat = setInterval(() => {
-      void this.refreshSessions().catch(() => undefined);
+      void this.refreshSessions(true).catch(() => undefined);
     }, sessionPeriod);
     this.sessionHeartbeat.unref();
     this.timer = setInterval(() => void this.pump(), this.options.pollMs);
@@ -178,22 +179,27 @@ export class BridgeRuntime {
    * start, pump) never interleave or reorder; once stopped, a refresh writes
    * nothing. Returns the chain's current tail.
    */
-  refreshSessions(): Promise<void> {
+  refreshSessions(force = false): Promise<void> {
     const task = this.sessionsChain
       .then(() => undefined, () => undefined)
-      .then(() => this.doRefreshSessions());
+      .then(() => this.doRefreshSessions(force));
     this.sessionsChain = task.then(() => undefined, () => undefined);
     return task;
   }
 
-  private async doRefreshSessions(): Promise<void> {
+  private async doRefreshSessions(force: boolean): Promise<void> {
     if (this.stopped) return; // teardown gate: never resurrect live_sessions
     const now = Date.now();
-    const rows = this.agents.list().map((agent) => ({
-      sessionId: agent.id,
-      cwd: agent.session.header.cwd ?? process.cwd(),
-    }));
+    const rows = this.agents.list()
+      .map((agent) => ({
+        sessionId: agent.id,
+        cwd: agent.session.header.cwd ?? process.cwd(),
+      }))
+      .sort((left, right) => left.sessionId.localeCompare(right.sessionId));
+    const snapshot = JSON.stringify(rows);
+    if (!force && snapshot === this.sessionSnapshot) return;
     this.store.coordinationHandle.refreshOwnerSessions(this.claimOwner, rows, this.store.leaseMs, now);
+    this.sessionSnapshot = snapshot;
   }
 
   /**
@@ -263,7 +269,7 @@ export class BridgeRuntime {
       // promptly (agent created/disposed are reflected on the next pump); the
       // independent heartbeat covers long pump stretches. A refresh after
       // stop() writes nothing (doRefreshSessions is gated on stopped).
-      await this.refreshSessions().catch(() => undefined);
+      await this.refreshSessions(false).catch(() => undefined);
     }
   }
 

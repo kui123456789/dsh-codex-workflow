@@ -866,6 +866,28 @@ test("refreshSessions publishes the live registry for the CLI", async () => {
   }
 });
 
+test("idle pumps do not rewrite an unchanged live-session registry", async () => {
+  const h = await harness(5);
+  try {
+    h.registry.register(makeAgent("session-stable", "C:\\work"));
+    const coordination = h.store.coordinationHandle;
+    const refresh = coordination.refreshOwnerSessions.bind(coordination);
+    let writes = 0;
+    coordination.refreshOwnerSessions = (...args) => {
+      writes += 1;
+      return refresh(...args);
+    };
+
+    h.runtime.start();
+    await waitFor(async () => writes >= 1);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(writes, 1, "unchanged idle polls must not reacquire the SQLite write lock");
+  } finally {
+    await h.runtime.stop();
+    await rmClosed(h.directory);
+  }
+});
+
 test("crash after workflow persist, before followup: replay delivers without duplicating the workflow", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-bridge-runtime-crashA-"));
   try {

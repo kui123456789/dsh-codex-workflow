@@ -6,7 +6,7 @@ import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { newRequestId, parseBridgeCommand, type DispatchPlanCommand } from "../src/bridge-protocol.js";
 import { BridgeStore, type ClaimedBridgeCommand } from "../src/bridge-store.js";
-import { closeCoordinationStoresForDirectory, coordinationPath } from "../src/coordination.js";
+import { CoordinationStore, closeCoordinationStoresForDirectory, coordinationPath } from "../src/coordination.js";
 
 async function rmClosed(path: string): Promise<void> {
   // Close only this directory's coordination connections first (Windows locks
@@ -96,6 +96,26 @@ test("two consumers racing for one file: exactly one wins", async () => {
     assert.equal(winners[0]!.command.requestId, command.requestId);
     assert.ok(["consumer-a", "consumer-b"].includes(winners[0]!.claimOwner));
   } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("an empty claim scan stays read-only while another connection owns the write lock", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-bridge-store-empty-read-"));
+  const path = coordinationPath(directory);
+  let contender: CoordinationStore | undefined;
+  let locker: DatabaseSync | undefined;
+  try {
+    contender = new CoordinationStore(path, { busyTimeoutMs: 50 });
+    locker = new DatabaseSync(path);
+    locker.exec("PRAGMA busy_timeout=50");
+    locker.exec("BEGIN IMMEDIATE");
+
+    assert.equal(contender.claimNext("idle-consumer", 60_000), undefined);
+  } finally {
+    try { locker?.exec("ROLLBACK"); } catch { /* already closed or rolled back */ }
+    locker?.close();
+    contender?.close();
     await rmClosed(directory);
   }
 });

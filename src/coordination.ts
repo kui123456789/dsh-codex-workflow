@@ -373,30 +373,21 @@ export class CoordinationStore {
     now = Date.now(),
   ): QueueRow | undefined {
     this.assertOpen();
+    // An idle queue is the overwhelmingly common case. Probe it read-only so
+    // a polling runtime does not repeatedly acquire SQLite's single writer
+    // slot and starve a CLI process that is trying to enqueue work. The
+    // candidate set is rebuilt under BEGIN IMMEDIATE below before any claim,
+    // so routing and ownership remain atomic when work actually exists.
+    if (this.claimCandidates(now, eligible).length === 0) return undefined;
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const retryCandidates = this.db.prepare(
-        "SELECT request_id FROM queue WHERE status = 'retry' AND next_attempt_at IS NOT NULL AND next_attempt_at <= ? ORDER BY next_attempt_at, request_id",
-      ).all(now) as Array<{ request_id: string }>;
-      const expiredProcessing = this.db.prepare(
-        "SELECT request_id FROM queue WHERE status = 'processing' AND claim_until <= ? ORDER BY claim_until, request_id",
-      ).all(now) as Array<{ request_id: string }>;
-      const inboxCandidates = this.db.prepare(
-        "SELECT request_id FROM queue WHERE status = 'inbox' ORDER BY created_at, request_id",
-      ).all() as Array<{ request_id: string }>;
-      for (const candidate of [...retryCandidates, ...expiredProcessing, ...inboxCandidates]) {
-        if (eligible) {
-          const probe = this.db.prepare("SELECT command_json FROM queue WHERE request_id = ?").get(candidate.request_id) as
-            | { command_json: string }
-            | undefined;
-          if (probe && !eligible(probe.command_json)) continue; // not this runtime's command
-        }
+      for (const candidate of this.claimCandidates(now, eligible)) {
         const result = this.db.prepare(
           `UPDATE queue SET status = 'processing', claim_epoch = claim_epoch + 1, claim_owner = ?, claim_until = ?
            WHERE request_id = ? AND (status IN ('inbox', 'retry') OR (status = 'processing' AND claim_until <= ?))`,
-        ).run(instanceId, now + leaseMs, candidate.request_id, now);
+        ).run(instanceId, now + leaseMs, candidate, now);
         if (Number(result.changes) === 1) {
-          const row = this.readQueueRow(candidate.request_id);
+          const row = this.readQueueRow(candidate);
           this.db.exec("COMMIT");
           return row;
         }
@@ -407,6 +398,26 @@ export class CoordinationStore {
       this.db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  private claimCandidates(now: number, eligible?: (commandJson: string) => boolean): string[] {
+    const retryCandidates = this.db.prepare(
+      "SELECT request_id FROM queue WHERE status = 'retry' AND next_attempt_at IS NOT NULL AND next_attempt_at <= ? ORDER BY next_attempt_at, request_id",
+    ).all(now) as Array<{ request_id: string }>;
+    const expiredProcessing = this.db.prepare(
+      "SELECT request_id FROM queue WHERE status = 'processing' AND claim_until <= ? ORDER BY claim_until, request_id",
+    ).all(now) as Array<{ request_id: string }>;
+    const inboxCandidates = this.db.prepare(
+      "SELECT request_id FROM queue WHERE status = 'inbox' ORDER BY created_at, request_id",
+    ).all() as Array<{ request_id: string }>;
+    const candidates = [...retryCandidates, ...expiredProcessing, ...inboxCandidates];
+    if (!eligible) return candidates.map((candidate) => candidate.request_id);
+    return candidates.flatMap((candidate) => {
+      const probe = this.db.prepare("SELECT command_json FROM queue WHERE request_id = ?").get(candidate.request_id) as
+        | { command_json: string }
+        | undefined;
+      return probe && eligible(probe.command_json) ? [candidate.request_id] : [];
+    });
   }
 
   /** Fenced claim mutations: every ack/retry/dead-letter/renew requires the

@@ -13,6 +13,7 @@ All notable changes to `dsh-codex-workflow`.
 ### Fixed
 
 - A completed workflow no longer remains visually “running” when the DSH model emits its final report and then stalls in an empty trailing tool call. The terminal relay guard disarms on idle, cannot affect a later user turn, and is aborted and awaited during plugin teardown.
+- Idle bridge polling no longer opens write transactions for an empty queue or rewrites an unchanged live-session registry, preventing the CLI from being starved into `database is locked` failures on slower Windows hosts.
 
 ## [1.0.4] - 2026-08-19
 
