@@ -41,6 +41,7 @@ export function apply(ctx: Context, raw: Config): void {
       storageDir: config.storageDir,
       manager,
       workflowStore: store,
+      terminalRelayTimeoutMs: config.terminalRelayTimeoutMs,
     });
     const disposers = createWorkflowTools(manager, config).map((tool) => ctx.tools.register(tool));
     const stopListener = ctx.on("agent/turn-stopping", async ({ agent, turn }) => {
@@ -79,6 +80,7 @@ function resolveConfig(raw: Config): WorkflowConfig {
     reviewDiffMaxBytes: Math.max(1024, Math.min(1024 * 1024, Math.trunc(raw.reviewDiffMaxBytes))),
     turnTimeoutMs: Math.max(10_000, Math.trunc(raw.turnTimeoutMs)),
     idleProcessMs: Math.max(0, Math.trunc(raw.idleProcessMs)),
+    terminalRelayTimeoutMs: Math.max(0, Math.min(10 * 60 * 1000, Math.trunc(raw.terminalRelayTimeoutMs))),
     storageDir: raw.storageDir ? resolve(raw.storageDir) : join(dshHome, "storages", "dsh-codex-workflow"),
     bridgePollMs: Math.max(200, Math.min(60_000, Math.trunc(raw.bridgePollMs))),
     bridgeMaxPayloadBytes: Math.max(64 * 1024, Math.min(16 * 1024 * 1024, Math.trunc(raw.bridgeMaxPayloadBytes))),

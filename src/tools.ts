@@ -13,9 +13,8 @@ const jsonOutput = {
  *  - start/continue run ONE Codex turn bounded by turnTimeoutMs;
  *  - review/review_only run TWO serial turns (the review turn, then the
  *    normalize turn), each of which can independently exhaust turnTimeoutMs;
- *  - submit runs up to `callbackMaxAttempts` Reviewer callbacks (each up to
- *    callbackTimeoutMs) separated by exponential backoff
- *    `callbackRetryBaseMs * 2^(attempt-1)`.
+ *  - submit only validates, captures evidence, persists the submission and
+ *    starts a manager-owned background Reviewer task.
  * Budgets are computed overflow-safely (saturated at MAX_SAFE_INTEGER) with a
  * cleanup margin so the host never pre-empts a legitimate operation.
  */
@@ -41,25 +40,9 @@ function reviewToolTimeout(turnTimeoutMs: number): number {
   return saturatedAdd(turnTimeoutMs, turnTimeoutMs, CLEANUP_MARGIN_MS);
 }
 
-/** submit: ALL callback attempts + their backoff + the verdict-enqueue retry
- * backoff (the callback pipeline can succeed only to have the enqueue stage
- * retry up to `callbackMaxAttempts` times with the same backoff sum) + margin.
- */
-function submitToolTimeout(callbackTimeoutMs: number, callbackMaxAttempts: number, callbackRetryBaseMs: number): number {
-  const attempts = Math.max(1, callbackMaxAttempts);
-  const sends = callbackTimeoutMs * attempts;
-  // Total backoff across attempts 1..attempts-1 = retryBase * (2^(attempts-1) - 1),
-  // incurred once by the callback retries and ONCE MORE by the verdict enqueue
-  // retries.
-  const exponent = Math.max(0, attempts - 1);
-  const backoffSum = exponent > 20 ? Number.MAX_SAFE_INTEGER : callbackRetryBaseMs * (2 ** exponent - 1);
-  return saturatedAdd(sends, backoffSum, backoffSum, CLEANUP_MARGIN_MS);
-}
-
 export function createWorkflowTools(manager: WorkflowManager, config: WorkflowConfig): ToolDefinition[] {
   const startTimeout = singleTurnToolTimeout(config.turnTimeoutMs);
   const reviewTimeout = reviewToolTimeout(config.turnTimeoutMs);
-  const submitTimeout = submitToolTimeout(config.callbackTimeoutMs, config.callbackMaxAttempts, config.callbackRetryBaseMs);
   const instantTimeout = 60_000;
   return [
     defineTool({
@@ -126,7 +109,7 @@ export function createWorkflowTools(manager: WorkflowManager, config: WorkflowCo
     }),
     defineTool({
       name: "codex_workflow_submit",
-      description: "Submit the implementation of a Codex-bridge workflow back to its exact originating Codex task for review. Only the owning DSH session may call it, only for origin codex_bridge workflows in executing/fixing phases.",
+      description: "Queue the implementation of a Codex-bridge workflow for background Codex review. Returns immediately after durable persistence; the verdict or a terminal error will automatically wake this same DSH session.",
       parameters: {
         workflowId: { type: "string", required: true },
         implementationSummary: { type: "string", required: true },
@@ -134,12 +117,20 @@ export function createWorkflowTools(manager: WorkflowManager, config: WorkflowCo
         testResults: { type: "string" },
       },
       output: jsonOutput,
-      timeoutMs: submitTimeout,
-      execute: async (args, exec) => asJson(await manager.submit(args.workflowId, {
-        implementationSummary: args.implementationSummary,
-        ...(args.changedFiles ? { changedFiles: args.changedFiles } : {}),
-        ...(args.testResults ? { testResults: args.testResults } : {}),
-      }, exec)),
+      timeoutMs: instantTimeout,
+      execute: async (args, exec) => {
+        const record = await manager.submit(args.workflowId, {
+          implementationSummary: args.implementationSummary,
+          ...(args.changedFiles ? { changedFiles: args.changedFiles } : {}),
+          ...(args.testResults ? { testResults: args.testResults } : {}),
+        }, exec);
+        exec.concludeTurn();
+        return asJson({
+          ...record,
+          backgroundReview: true,
+          statusMessage: "Codex Reviewer 正在后台运行；当前 DSH turn 已结束，结果会自动回到本会话。",
+        });
+      },
     }),
     defineTool({
       name: "codex_workflow_decide",

@@ -11,7 +11,13 @@ import {
   CodexNoVerdictError,
   type CodexCallbackRequest,
 } from "./codex-callback.js";
-import { newRequestId, type DispatchPlanCommand, type SubmitVerdictCommand } from "./bridge-protocol.js";
+import {
+  newRequestId,
+  type BridgeCommand,
+  type DispatchPlanCommand,
+  type SubmissionNoticeCommand,
+  type SubmitVerdictCommand,
+} from "./bridge-protocol.js";
 import { collectEvidence, isGitRepository } from "./evidence.js";
 import { PLANNER_OUTPUT_SCHEMA, REVIEW_OUTPUT_SCHEMA } from "./schemas.js";
 import { WorkflowStore } from "./store.js";
@@ -79,13 +85,17 @@ export class WorkflowManager {
   private readonly pending = new Map<string, TurnNeedsInputResult>();
   private readonly nudgedTurns = new Set<string>();
   private readonly recovering = new Set<string>();
-  /** Recovery-derived background tasks that must settle before teardown. */
+  private readonly recoveringNotices = new Set<string>();
+  /** Manager-owned background tasks that must settle before teardown. */
   private readonly backgroundTasks = new Set<Promise<unknown>>();
+  /** Per-submission lifecycle signals. Tool-call signals are deliberately not
+   * used once a durable submission has been queued. */
+  private readonly submissionControllers = new Map<string, AbortController>();
   /** Teardown gate: once set, no new callback send may start and in-flight
    * recovery is aborted so no child can be (re)spawned after stop(). */
   private stopped = false;
   private stopPromise?: Promise<void>;
-  private recoveryController?: AbortController;
+  private readonly lifecycleController = new AbortController();
   private recoveryChain?: Promise<void>;
   private activeRecovery = false;
   /** Submission lease lifetime; heartbeats renew at ttl/3 while a callback
@@ -97,7 +107,7 @@ export class WorkflowManager {
     private readonly codex: CodexGateway,
     private readonly config: WorkflowConfig,
     private readonly callback?: CodexCallback,
-    private readonly bridgeQueue?: { enqueue(command: SubmitVerdictCommand): Promise<string> },
+    private readonly bridgeQueue?: { enqueue(command: BridgeCommand): Promise<string> },
   ) {
     this.leaseTtlMs = config.leaseTtlMs ?? 60_000;
   }
@@ -125,19 +135,20 @@ export class WorkflowManager {
   private async doStop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
-    this.recoveryController?.abort();
-    this.recoveryController = undefined;
+    this.lifecycleController.abort();
+    for (const controller of this.submissionControllers.values()) controller.abort();
+    const callbackStop = this.callback?.stop();
     const chain = this.recoveryChain;
     this.recoveryChain = undefined;
     if (chain) await chain.catch(() => undefined);
-    // Wait for every recovery-derived task to settle (they observe the abort
+    // Wait for every manager-owned task to settle (they observe the abort
     // and stop writing/enqueueing/spawning).
     const tasks = [...this.backgroundTasks];
     await Promise.allSettled(tasks);
-    await this.callback?.stop();
+    await callbackStop;
   }
 
-  /** Track every recovery-derived background task so teardown can await them
+  /** Track every manager-owned background task so teardown can await them
    * before closing the stores; late store/enqueue writes are impossible after
    * stop() returns. */
   private trackBackground(task: Promise<unknown>): void {
@@ -145,6 +156,39 @@ export class WorkflowManager {
     void task.finally(() => {
       this.backgroundTasks.delete(task);
     }).catch(() => undefined);
+  }
+
+  private submissionTaskKey(workflowId: string, submissionId: string): string {
+    return `${workflowId}:${submissionId}`;
+  }
+
+  private startSubmissionTask(
+    workflowId: string,
+    submissionId: string,
+    prompt: string,
+    seed: WorkflowRecord,
+    lease: ManagerLease,
+  ): void {
+    const key = this.submissionTaskKey(workflowId, submissionId);
+    const controller = new AbortController();
+    this.submissionControllers.set(key, controller);
+    const task = this.runSubmissionCallback(workflowId, submissionId, prompt, seed, controller.signal, lease)
+      .catch(() => undefined)
+      .finally(async () => {
+        lease.stopHeartbeat();
+        await lease.release().catch(() => undefined);
+        await this.store.update(workflowId, (r) => {
+          if (r.submissionId !== submissionId) return;
+          if (r.submissionLeaseToken !== lease.owner) return;
+          r.submissionLeaseToken = undefined;
+          r.submissionLeaseEpoch = undefined;
+          r.submissionLeaseUntil = undefined;
+        }, { ignoreCancelled: true }).catch(() => undefined);
+        if (this.submissionControllers.get(key) === controller) {
+          this.submissionControllers.delete(key);
+        }
+      });
+    this.trackBackground(task);
   }
 
   async start(
@@ -299,6 +343,7 @@ export class WorkflowManager {
         r.appliedVerdictSubmissionId = command.submissionId ?? r.submissionId;
         r.appliedVerdictEvidenceFingerprint = undefined;
         r.stagedVerdict = undefined;
+        r.submissionNotice = undefined;
         r.callbackState = "idle";
         return r;
       }
@@ -421,6 +466,21 @@ export class WorkflowManager {
       r.callbackState = "idle";
       changed = true;
     }, { ignoreCancelled: false });
+    return { committed: !outcome.suppressed && changed, record: outcome.record };
+  }
+
+  async commitSubmissionNoticeDelivery(
+    command: SubmissionNoticeCommand,
+  ): Promise<{ committed: boolean; record: WorkflowRecord }> {
+    let changed = false;
+    const outcome = await this.store.update(command.workflowId, (r) => {
+      if (r.dshSessionId !== command.dshSessionId) return;
+      if (r.codexThreadId !== command.codexThreadId) return;
+      if (r.submissionId !== command.submissionId) return;
+      if (r.submissionNotice?.command.requestId !== command.requestId) return;
+      if (r.submissionNotice.state !== "delivered") r.submissionNotice.state = "delivered";
+      changed = true;
+    }, { ignoreCancelled: true });
     return { committed: !outcome.suppressed && changed, record: outcome.record };
   }
 
@@ -570,6 +630,7 @@ export class WorkflowManager {
     if (!submitLease) throw new Error(`workflow ${workflowId} is being submitted by another process`);
     let submissionId: string | undefined;
     let lease: ManagerLease | undefined;
+    let leaseTransferred = false;
     let submitReleased = false;
     try {
       submissionId = randomUUID();
@@ -590,6 +651,7 @@ export class WorkflowManager {
         r.submissionAttempts = 0;
         r.submissionError = undefined;
         r.submissionRetryAt = undefined;
+        r.submissionNotice = undefined;
         r.submissionLeaseToken = lease!.owner;
         r.submissionLeaseEpoch = lease!.epoch;
         r.submissionLeaseUntil = Date.now() + this.leaseTtlMs;
@@ -602,11 +664,13 @@ export class WorkflowManager {
       await submitLease.release();
       submitReleased = true;
       const prompt = callbackPrompt(prepared.record, input, evidence);
-      return await this.runSubmissionCallback(workflowId, submissionId, prompt, prepared.record, exec.signal, lease);
+      this.startSubmissionTask(workflowId, submissionId, prompt, prepared.record, lease);
+      leaseTransferred = true;
+      return prepared.record;
     } finally {
-      lease?.stopHeartbeat();
-      await lease?.release().catch(() => undefined);
-      if (lease && submissionId) {
+      if (lease && submissionId && !leaseTransferred) {
+        lease.stopHeartbeat();
+        await lease.release().catch(() => undefined);
         const leaseOwner = lease.owner;
         const sid = submissionId;
         // Clear the record-level lease fence so a later recovery round can
@@ -657,7 +721,7 @@ export class WorkflowManager {
   }
 
   /**
-   * One callback run for a submission: fork/resume the Reviewer task, apply
+   * One callback run for a submission: create/resume the Reviewer task, apply
    * the structured verdict or classify the failure, with bounded retry on
    * busy conditions. Verdict handling is a durable two-phase pipeline so a
    * crash can never lose the only valid verdict:
@@ -739,7 +803,7 @@ export class WorkflowManager {
                 r.reviewerThreadId = threadId;
               });
               if (registered.reviewerThreadId !== threadId) {
-                throw new Error("submission no longer owns the forked reviewer thread");
+                throw new Error("submission no longer owns the reviewer thread");
               }
             },
             onStarted: async ({ threadId, turnId }) => {
@@ -759,12 +823,8 @@ export class WorkflowManager {
             || error instanceof CodexNoVerdictError
             || error instanceof CodexCallbackProcessError
           ) {
-            await updateCurrent((r) => {
-              r.submissionState = "failed";
-              r.submissionError = error.message;
-              r.submissionRetryAt = undefined;
-              r.callbackState = "failed";
-            });
+            const failed = await this.stageSubmissionFailure(updateCurrent, workflowId, submissionId, error.message);
+            await this.enqueueSubmissionNotice(workflowId, submissionId, failed, signal);
             return current;
           }
           if (signal?.aborted) throw error;
@@ -841,15 +901,60 @@ export class WorkflowManager {
       }
     } catch (error) {
       if (signal?.aborted || this.stopped) throw error;
-      await updateCurrent((r) => {
-        r.submissionState = "failed";
-        r.submissionError = errorMessage(error);
-        r.submissionRetryAt = undefined;
-        r.callbackState = "failed";
-      });
+      const failed = await this.stageSubmissionFailure(updateCurrent, workflowId, submissionId, errorMessage(error));
+      await this.enqueueSubmissionNotice(workflowId, submissionId, failed, signal);
       return current;
     } finally {
       lease?.stopHeartbeat();
+    }
+  }
+
+  private async stageSubmissionFailure(
+    updateCurrent: (fn: (record: WorkflowRecord) => void) => Promise<WorkflowRecord>,
+    workflowId: string,
+    submissionId: string,
+    message: string,
+  ): Promise<WorkflowRecord> {
+    return updateCurrent((r) => {
+      r.submissionState = "failed";
+      r.submissionError = message;
+      r.submissionRetryAt = undefined;
+      r.callbackState = "failed";
+      if (!r.submissionNotice || r.submissionNotice.command.submissionId !== submissionId) {
+        const command: SubmissionNoticeCommand = {
+          version: 1,
+          kind: "submission_notice",
+          requestId: newRequestId(),
+          createdAt: new Date().toISOString(),
+          workflowId,
+          submissionId,
+          codexThreadId: r.codexThreadId!,
+          dshSessionId: r.dshSessionId,
+          level: "error",
+          message: `Codex Reviewer 后台审查失败：${message}`,
+        };
+        r.submissionNotice = { command, state: "prepared" };
+      }
+    });
+  }
+
+  private async enqueueSubmissionNotice(
+    workflowId: string,
+    submissionId: string,
+    record: WorkflowRecord,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const notice = record.submissionNotice;
+    if (!notice || notice.state === "delivered" || !this.bridgeQueue || this.stopped || signal?.aborted) return;
+    try {
+      await this.bridgeQueue.enqueue(notice.command);
+      await this.store.update(workflowId, (r) => {
+        if (r.submissionId !== submissionId) return;
+        if (r.submissionNotice?.command.requestId !== notice.command.requestId) return;
+        if (r.submissionNotice.state !== "delivered") r.submissionNotice.state = "enqueued";
+      }, { ignoreCancelled: true });
+    } catch {
+      // The exact command remains prepared and is replayed by recovery.
     }
   }
 
@@ -912,7 +1017,7 @@ export class WorkflowManager {
    * atomic state claim deduplicate within one process. Attempts are only
    * incremented by an actual callback send, never by a recovery claim.
    *
-   * Recovery is SINGLE-FLIGHT: there is exactly one active controller/chain.
+   * Recovery is SINGLE-FLIGHT: there is exactly one active scheduling chain.
    * A concurrent second call while the first is still running returns 0
    * without touching the references, so a caller can never overwrite the
    * active run that stop() is about to abort/await (which would otherwise let
@@ -923,9 +1028,7 @@ export class WorkflowManager {
     if (this.stopped) return Promise.resolve(0); // teardown gate: nothing to recover, never touch a closing store
     if (this.activeRecovery) return Promise.resolve(0);
     this.activeRecovery = true;
-    const controller = new AbortController();
-    this.recoveryController = controller;
-    const chain = this.runRecovery(controller.signal);
+    const chain = this.runRecovery(this.lifecycleController.signal);
     // Keep the chain for teardown without letting a failure escape start().
     this.recoveryChain = Promise.resolve(chain).then(() => undefined, () => undefined);
     return chain.finally(() => {
@@ -941,6 +1044,20 @@ export class WorkflowManager {
       if (record.origin !== "codex_bridge") continue;
       const submissionId = record.submissionId;
       if (!submissionId) continue;
+
+      const notice = record.submissionNotice;
+      if (notice && notice.state !== "delivered") {
+        const noticeId = notice.command.requestId;
+        if (!this.recoveringNotices.has(noticeId)) {
+          this.recoveringNotices.add(noticeId);
+          recovered += 1;
+          this.trackBackground(
+            this.enqueueSubmissionNotice(record.id, submissionId, record, signal)
+              .finally(() => this.recoveringNotices.delete(noticeId)),
+          );
+        }
+        if (record.submissionState === "failed") continue;
+      }
 
       // 1.0.0 migration: early builds treated ordinary task contention as a
       // terminal submission, either after exhausting a bounded retry round or
@@ -1206,6 +1323,11 @@ export class WorkflowManager {
       await this.codex.interrupt(target.threadId, target.turnId, exec.signal).catch(() => undefined);
     }
     // Cancel the active Reviewer operation, if any; cancelled is terminal for it too.
+    if (outcome.record.submissionId) {
+      this.submissionControllers
+        .get(this.submissionTaskKey(workflowId, outcome.record.submissionId))
+        ?.abort();
+    }
     this.callback?.cancel(workflowId);
     return outcome.record;
   }
@@ -1215,6 +1337,7 @@ export class WorkflowManager {
     // waiting_review_decision must not be steered: the user (not the agent)
     // decides whether non-blocking findings get fixed.
     if (!record || (record.phase !== "executing" && record.phase !== "fixing")) return;
+    if (submissionActive(record.submissionState)) return;
     const key = `${record.id}:${turn}`;
     if (this.nudgedTurns.has(key)) return;
     this.nudgedTurns.add(key);
@@ -1517,10 +1640,11 @@ function normalizeReviewPrompt(
   return `Convert the code review you just completed into the required JSON schema. For every finding set blocking to true only when it must be fixed before delivery: critical and high findings block by default; medium and low findings block only when they create an actual correctness, regression, security, or delivery-required test gap. Every entry in testGaps counts as blocking. verdict is pass only when there are no actionable correctness, regression, security, or material test findings. Preserve concrete file and line references.\n\nWorkflow: ${record.id}\nImplementation: ${input.implementationSummary}\nRaw review:\n${rawReview}`;
 }
 
-/** Prompt used by the forked Reviewer task: it inherits the originating task's
- * history, stays read-only and returns the verdict as its final structured message. The
- * verdict is captured by the plugin from stdout and applied outside the
- * sandbox; the reviewer never writes the bridge queue itself.
+/** Prompt used by the fresh Reviewer task: it carries none of the originating
+ * task's history, stays read-only and returns the verdict as its final
+ * structured message. The verdict is captured by the plugin from stdout and
+ * applied outside the sandbox; the reviewer never writes the bridge queue
+ * itself.
  *
  * The full bounded evidence diff is embedded verbatim (already capped at
  * `reviewDiffMaxBytes` by evidence collection), and a truncation notice is

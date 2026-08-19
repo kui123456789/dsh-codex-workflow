@@ -25,7 +25,8 @@ export const Config = z.object({
   callbackRetryBaseMs: z.number().default(2000),
   leaseTtlMs: z.number().default(60_000),
   turnTimeoutMs: z.number().default(10 * 60 * 1000),
-  idleProcessMs: z.number().default(15 * 60 * 1000),
+  idleProcessMs: z.number().default(5_000),
+  terminalRelayTimeoutMs: z.number().default(60_000),
   storageDir: z.string().default(""),
 });
 

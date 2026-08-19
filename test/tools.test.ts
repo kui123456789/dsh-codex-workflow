@@ -20,6 +20,7 @@ const base: WorkflowConfig = {
   leaseTtlMs: 60_000,
   turnTimeoutMs: 60_000,
   idleProcessMs: 0,
+  terminalRelayTimeoutMs: 60_000,
   storageDir: "",
 };
 
@@ -27,19 +28,52 @@ function timeoutOf(config: WorkflowConfig, name: string): number {
   return createWorkflowTools({} as never, config).find((tool) => tool.name === name)!.timeoutMs ?? 0;
 }
 
-test("submit timeout covers ALL callback attempts plus both backoff rounds", () => {
-  // 30-minute callback with 3 attempts and meaningful backoff.
+test("submit timeout only covers synchronous validation and persistence", () => {
   const config = { ...base, callbackTimeoutMs: 30 * 60 * 1000, callbackMaxAttempts: 3, callbackRetryBaseMs: 5 * 60 * 1000 };
   const toolTimeout = timeoutOf(config, "codex_workflow_submit");
-  const backoffSum = config.callbackRetryBaseMs * (2 ** (config.callbackMaxAttempts - 1) - 1); // 1 + 2 = 3 * base
-  // Callback retries incur the backoff sum AND the post-verdict enqueue stage
-  // can retry with the SAME backoff sum again.
-  const fullBudget = config.callbackTimeoutMs * config.callbackMaxAttempts + backoffSum + backoffSum;
-  assert.ok(
-    toolTimeout >= fullBudget,
-    `submit timeout ${toolTimeout} must cover all attempts + BOTH backoff rounds (${fullBudget})`,
+  assert.equal(toolTimeout, 60_000);
+});
+
+test("submit output tells DSH that review continues in the background", async () => {
+  const record = {
+    schemaVersion: 1,
+    id: "workflow-1",
+    dshSessionId: "session-1",
+    cwd: "C:\\work",
+    task: "task",
+    phase: "executing",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    assumptions: [],
+    questions: [],
+    reviewCycles: 0,
+    submissionState: "queued",
+  };
+  const manager = { submit: async () => record };
+  const tool = createWorkflowTools(manager as never, base).find((candidate) => candidate.name === "codex_workflow_submit")!;
+  let concluded = 0;
+  const output = await (tool.execute as never as (args: unknown, exec: unknown) => Promise<Record<string, unknown>>)(
+    { workflowId: "workflow-1", implementationSummary: "done" },
+    { concludeTurn: () => { concluded += 1; } },
   );
-  assert.ok(toolTimeout >= config.callbackTimeoutMs * 2, "must at least cover the second attempt");
+  assert.equal(output.backgroundReview, true);
+  assert.match(String(output.statusMessage), /后台运行/);
+  assert.equal(output.submissionState, "queued");
+  assert.equal(concluded, 1);
+});
+
+test("submit concludes the DSH turn only after durable submission succeeds", async () => {
+  const manager = { submit: async () => { throw new Error("persistence failed"); } };
+  const tool = createWorkflowTools(manager as never, base).find((candidate) => candidate.name === "codex_workflow_submit")!;
+  let concluded = 0;
+  await assert.rejects(
+    (tool.execute as never as (args: unknown, exec: unknown) => Promise<unknown>)(
+      { workflowId: "workflow-1", implementationSummary: "done" },
+      { concludeTurn: () => { concluded += 1; } },
+    ),
+    /persistence failed/,
+  );
+  assert.equal(concluded, 0);
 });
 
 test("review timeout covers two serial turns (review + normalize)", () => {
@@ -56,11 +90,12 @@ test("start/continue timeouts cover one turn", () => {
   assert.ok(timeoutOf(config, "codex_workflow_continue") >= config.turnTimeoutMs);
 });
 
-test("timeouts stay finite and override the old fixed 10-minute cap", () => {
+test("long-running Codex tools keep extended timeouts while submit stays immediate", () => {
   const config = { ...base, callbackTimeoutMs: 30 * 60 * 1000, turnTimeoutMs: 30 * 60 * 1000 };
-  for (const name of ["codex_workflow_submit", "codex_workflow_review", "codex_workflow_start"]) {
+  for (const name of ["codex_workflow_review", "codex_workflow_start"]) {
     const value = timeoutOf(config, name);
     assert.ok(Number.isFinite(value) && value > 0, `${name} timeout is finite positive`);
     assert.ok(value >= 10 * 60 * 1000, `${name} is no longer capped at 10 minutes`);
   }
+  assert.equal(timeoutOf(config, "codex_workflow_submit"), 60_000);
 });

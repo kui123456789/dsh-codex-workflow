@@ -1,4 +1,4 @@
-import type { SubmitVerdictCommand } from "./bridge-protocol.js";
+import type { SubmissionNoticeCommand, SubmitVerdictCommand } from "./bridge-protocol.js";
 
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
@@ -8,7 +8,7 @@ export type WorkflowMode = "planned" | "review_only";
  * Codex-led bridge. Old records default to "dsh". */
 export type WorkflowOrigin = "dsh" | "codex_bridge";
 
-/** Durable state of the callback that forks/resumes the independent Reviewer. */
+/** Durable state of the callback that validates/creates/resumes the independent Reviewer. */
 export type CallbackState = "idle" | "queued" | "sending" | "waiting_verdict" | "retrying" | "failed";
 
 /** Per-submission lifecycle inside a bridge workflow. */
@@ -187,6 +187,13 @@ export interface WorkflowRecord {
     command: SubmitVerdictCommand;
     createdAt: string;
   };
+  /** Durable terminal callback notification. The exact command identity is
+   * persisted before enqueueing and retained through delivery so restart
+   * recovery can safely replay it without minting a second message. */
+  submissionNotice?: {
+    command: SubmissionNoticeCommand;
+    state: "prepared" | "enqueued" | "delivered";
+  };
   /** Fenced submission callback lease: the random owner token/epoch and
    * expiry of the process currently running (or last running) the Reviewer
    * callback. Recovery and re-claims verify these, so an old owner
@@ -216,6 +223,7 @@ export interface WorkflowConfig {
   leaseTtlMs?: number;
   turnTimeoutMs: number;
   idleProcessMs: number;
+  terminalRelayTimeoutMs: number;
   storageDir: string;
 }
 
