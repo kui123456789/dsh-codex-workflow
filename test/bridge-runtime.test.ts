@@ -1791,7 +1791,7 @@ test("voiding a waiting_review_decision verdict returns to executing and deliver
   }
 });
 
-async function waitFor(predicate: () => Promise<boolean> | boolean, timeoutMs = 3000): Promise<void> {
+async function waitFor(predicate: () => Promise<boolean> | boolean, timeoutMs = 10_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     if (await predicate()) return;

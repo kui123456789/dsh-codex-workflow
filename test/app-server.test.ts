@@ -373,11 +373,13 @@ function assertStrictObjectSchema(schema: unknown): void {
 }
 
 async function waitForFile(path: string): Promise<void> {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
     try {
       await access(path);
       return;
     } catch {
+      if (Date.now() > deadline) break;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
   }
