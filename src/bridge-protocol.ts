@@ -4,7 +4,7 @@ import type { ReviewResult } from "./types.js";
 export const BRIDGE_PROTOCOL_VERSION = 1;
 export const BRIDGE_MAX_PAYLOAD_BYTES = 1024 * 1024;
 
-export type BridgeCommand = DispatchPlanCommand | SubmitVerdictCommand;
+export type BridgeCommand = DispatchPlanCommand | SubmitVerdictCommand | SubmissionNoticeCommand;
 
 export interface DispatchPlanCommand {
   version: 1;
@@ -33,6 +33,19 @@ export interface SubmitVerdictCommand {
    * right runtime routes/claims the verdict). Optional for legacy commands. */
   dshSessionId?: string;
   verdict: ReviewResult;
+}
+
+export interface SubmissionNoticeCommand {
+  version: 1;
+  kind: "submission_notice";
+  requestId: string;
+  createdAt: string;
+  workflowId: string;
+  submissionId: string;
+  codexThreadId: string;
+  dshSessionId: string;
+  level: "error";
+  message: string;
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -177,11 +190,37 @@ export function parseSubmitVerdictCommand(value: unknown): SubmitVerdictCommand 
   return command;
 }
 
+export function parseSubmissionNoticeCommand(value: unknown): SubmissionNoticeCommand {
+  if (!isPlainObject(value)) fail("submission_notice must be an object");
+  if (value.version !== BRIDGE_PROTOCOL_VERSION) fail("unsupported version");
+  if (value.kind !== "submission_notice") fail("kind must be submission_notice");
+  if (value.level !== "error") fail("level must be error");
+  const command: SubmissionNoticeCommand = {
+    version: 1,
+    kind: "submission_notice",
+    requestId: requireUuid(value.requestId, "requestId"),
+    createdAt: requireIsoDate(value.createdAt, "createdAt"),
+    workflowId: requireString(value.workflowId, "workflowId", true),
+    submissionId: requireUuid(value.submissionId, "submissionId"),
+    codexThreadId: requireUuid(value.codexThreadId, "codexThreadId"),
+    dshSessionId: requireString(value.dshSessionId, "dshSessionId", true),
+    level: "error",
+    message: requireString(value.message, "message", true),
+  };
+  for (const key of Object.keys(value)) {
+    if (!["version", "kind", "requestId", "createdAt", "workflowId", "submissionId", "codexThreadId", "dshSessionId", "level", "message"].includes(key)) {
+      fail(`unknown submission_notice field ${key}`);
+    }
+  }
+  return command;
+}
+
 export function parseBridgeCommand(value: unknown): BridgeCommand {
   if (!isPlainObject(value)) fail("command must be an object");
   if (value.version !== BRIDGE_PROTOCOL_VERSION) fail("unsupported version");
   if (value.kind === "dispatch_plan") return parseDispatchPlanCommand(value);
   if (value.kind === "submit_verdict") return parseSubmitVerdictCommand(value);
+  if (value.kind === "submission_notice") return parseSubmissionNoticeCommand(value);
   fail(`unknown kind ${String(value.kind)}`);
 }
 

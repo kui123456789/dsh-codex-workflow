@@ -6,8 +6,10 @@ import {
   newRequestId,
   parseBridgeCommand,
   parseDispatchPlanCommand,
+  parseSubmissionNoticeCommand,
   parseSubmitVerdictCommand,
   type DispatchPlanCommand,
+  type SubmissionNoticeCommand,
   type SubmitVerdictCommand,
 } from "../src/bridge-protocol.js";
 
@@ -53,6 +55,22 @@ function submitVerdict(overrides: Record<string, unknown> = {}): Record<string, 
   };
 }
 
+function submissionNotice(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    version: 1,
+    kind: "submission_notice",
+    requestId: uuid(),
+    createdAt: "2026-08-19T09:00:00.000Z",
+    workflowId: "wf-abc-123",
+    submissionId: uuid(),
+    codexThreadId: uuid(),
+    dshSessionId: "session-1",
+    level: "error",
+    message: "Codex Reviewer failed: source task is invalid",
+    ...overrides,
+  };
+}
+
 test("parses a valid Chinese dispatch plan with a Windows cwd", () => {
   const command = parseBridgeCommand(dispatchPlan()) as DispatchPlanCommand;
   assert.equal(command.kind, "dispatch_plan");
@@ -76,9 +94,18 @@ test("parses a valid verdict with an explicit dshSessionId target", () => {
   assert.equal(command.verdict.findings[1]?.line, undefined);
 });
 
+test("parses a durable terminal submission notice", () => {
+  const command = parseBridgeCommand(submissionNotice()) as SubmissionNoticeCommand;
+  assert.equal(command.kind, "submission_notice");
+  assert.equal(command.level, "error");
+  assert.match(command.message, /Reviewer failed/);
+  assert.deepEqual(parseSubmissionNoticeCommand(command), command);
+});
+
 test("rejects unknown top-level and nested fields", () => {
   assert.throws(() => parseBridgeCommand(dispatchPlan({ extra: 1 })), /unknown dispatch_plan field extra/);
   assert.throws(() => parseBridgeCommand(submitVerdict({ extra: 1 })), /unknown submit_verdict field extra/);
+  assert.throws(() => parseBridgeCommand(submissionNotice({ extra: 1 })), /unknown submission_notice field extra/);
   assert.throws(() => parseBridgeCommand(dispatchPlan({ target: { cwd: "C:\\x", bogus: true } })), /unknown target field bogus/);
   assert.throws(() => parseBridgeCommand(submitVerdict({ verdict: { ...verdict(), extra: 1 } })), /unknown verdict field extra/);
 });
@@ -139,4 +166,8 @@ test("encode and parse round-trip a plan and a verdict", () => {
   const submit = parseSubmitVerdictCommand(submitVerdict());
   const submitJson = encodeBridgeCommand(submit);
   assert.deepEqual(parseBridgeCommand(JSON.parse(submitJson)), submit);
+
+  const notice = parseSubmissionNoticeCommand(submissionNotice());
+  const noticeJson = encodeBridgeCommand(notice);
+  assert.deepEqual(parseBridgeCommand(JSON.parse(noticeJson)), notice);
 });

@@ -53,6 +53,7 @@ const baseConfig = {
   leaseTtlMs: 60_000,
   turnTimeoutMs: 60_000,
   idleProcessMs: 0,
+  terminalRelayTimeoutMs: 60_000,
   storageDir: "",
 } as const;
 

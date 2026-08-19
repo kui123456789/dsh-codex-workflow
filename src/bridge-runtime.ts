@@ -4,7 +4,7 @@ import { join, resolve } from "node:path";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import { MessageId, createUserMessage, freezeMessage, type UserMessage } from "@deepseek-ai/dsh-llm";
 import { cwdKey } from "./coordination.js";
-import type { DispatchPlanCommand, SubmitVerdictCommand, BridgeCommand } from "./bridge-protocol.js";
+import type { DispatchPlanCommand, SubmissionNoticeCommand, SubmitVerdictCommand, BridgeCommand } from "./bridge-protocol.js";
 import type { BridgeStore, ClaimedBridgeCommand } from "./bridge-store.js";
 import { WorkflowStore } from "./store.js";
 import type { WorkflowRecord } from "./types.js";
@@ -17,6 +17,9 @@ export interface AgentRegistryLike {
 
 export interface BridgeRuntimeOptions {
   pollMs: number;
+  /** Maximum time a terminal pass relay may keep the DSH agent running before
+   * only that active turn is cancelled. Zero disables the guard. */
+  terminalRelayTimeoutMs?: number;
   /** Plugin storage directory; the session registry lives under `bridge/`. */
   storageDir: string;
   manager: WorkflowManager;
@@ -90,9 +93,15 @@ export class BridgeRuntime {
   private polling = false;
   private stopped = false;
   private stopPromise?: Promise<void>;
+  private readonly terminalRelayGuardControllers = new Set<AbortController>();
+  private readonly terminalRelayGuards = new Set<Promise<void>>();
   private readonly store: BridgeStore;
   private readonly agents: AgentRegistryLike;
-  private readonly options: BridgeRuntimeOptions & { retryBaseMs: number; maxRetryAttempts: number };
+  private readonly options: BridgeRuntimeOptions & {
+    retryBaseMs: number;
+    maxRetryAttempts: number;
+    terminalRelayTimeoutMs: number;
+  };
   /** Per-instance random claim owner: stable for this process's lifetime, so
    * queue claim generations never collide across two overlapping runtimes. */
   private readonly claimOwner: string;
@@ -104,6 +113,7 @@ export class BridgeRuntime {
       ...options,
       retryBaseMs: options.retryBaseMs ?? 1_000,
       maxRetryAttempts: options.maxRetryAttempts ?? 5,
+      terminalRelayTimeoutMs: options.terminalRelayTimeoutMs ?? 60_000,
     };
     this.claimOwner = randomUUID();
   }
@@ -140,6 +150,7 @@ export class BridgeRuntime {
 
   private async doStop(): Promise<void> {
     this.stopped = true;
+    for (const controller of this.terminalRelayGuardControllers) controller.abort();
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
     if (this.sessionHeartbeat) clearInterval(this.sessionHeartbeat);
@@ -147,6 +158,11 @@ export class BridgeRuntime {
     while (this.polling) {
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
     }
+    // A relay finishing concurrently with stop() sees `stopped` and cannot arm
+    // a new guard. Abort once more after the pump drains, then await every
+    // existing guard so no late timer can cancel a future user turn.
+    for (const controller of this.terminalRelayGuardControllers) controller.abort();
+    await Promise.allSettled([...this.terminalRelayGuards]);
     // Await the WHOLE serialized refresh chain: any refresh that started before
     // stop() may still write this owner's rows, so it must settle BEFORE we
     // release them. A refresh queued after stop() sees `this.stopped` and
@@ -204,7 +220,7 @@ export class BridgeRuntime {
       const owner = [...live].sort((a, b) => a.sessionId.localeCompare(b.sessionId))[0]!.runtimeOwner;
       return owner === this.claimOwner;
     }
-    const verdict = command as SubmitVerdictCommand;
+    const verdict = command as SubmitVerdictCommand | SubmissionNoticeCommand;
     // Resolve the REAL session from the shared workflow record; never trust
     // the command's own dshSessionId (a forged/stale target must not let a
     // wrong runtime apply first).
@@ -294,6 +310,10 @@ export class BridgeRuntime {
   private async handle(claim: ClaimedBridgeCommand, isLost: () => boolean = () => false): Promise<void> {
     if (claim.command.kind === "dispatch_plan") {
       await this.handleDispatch(claim, claim.command, isLost);
+      return;
+    }
+    if (claim.command.kind === "submission_notice") {
+      await this.handleSubmissionNotice(claim, claim.command, isLost);
       return;
     }
     await this.handleVerdict(claim, isLost);
@@ -457,6 +477,77 @@ export class BridgeRuntime {
     await this.store.retry(claim, error, new Date(Date.now() + delayMs).toISOString());
   }
 
+  private async handleSubmissionNotice(
+    claim: ClaimedBridgeCommand,
+    command: SubmissionNoticeCommand,
+    isLost: () => boolean,
+  ): Promise<void> {
+    const record = await this.options.workflowStore.load(command.workflowId);
+    if (!record
+      || record.dshSessionId !== command.dshSessionId
+      || record.codexThreadId !== command.codexThreadId
+      || record.submissionId !== command.submissionId
+      || record.submissionNotice?.command.requestId !== command.requestId) {
+      if (!isLost()) {
+        await this.store.ack(claim, {
+          requestId: claim.requestId,
+          status: "no_such_workflow",
+          workflowId: command.workflowId,
+          error: "submission notice identity no longer matches the workflow",
+          deliveredAt: new Date().toISOString(),
+        });
+      }
+      return;
+    }
+    if (record.phase === "cancelled") {
+      if (!isLost()) {
+        await this.store.ack(claim, {
+          requestId: claim.requestId,
+          status: "cancelled",
+          workflowId: command.workflowId,
+          error: "workflow is cancelled",
+          deliveredAt: new Date().toISOString(),
+        });
+      }
+      return;
+    }
+    const agent = this.agents.get(record.dshSessionId);
+    if (!agent) {
+      if (!isLost()) await this.retryPersistent(claim, `no live DSH session ${record.dshSessionId}`);
+      return;
+    }
+    const messageId = MessageId(`dsh-codex-workflow:submission-notice:${command.requestId}`);
+    try {
+      if (isLost()) return;
+      if (!this.hasDeliveredMessage(agent, messageId)) {
+        agent.followup(this.submissionNoticeMessage(command, messageId));
+      }
+      if (this.options.afterFollowupHook) await this.options.afterFollowupHook();
+    } catch (error) {
+      if (error instanceof BridgeCrashSimulationError) return;
+      if (!isLost()) await this.retryPersistent(claim, `followup failed: ${errorMessage(error)}`);
+      return;
+    }
+    if (isLost()) return;
+    const committed = await this.options.manager.commitSubmissionNoticeDelivery(command);
+    if (!committed.committed) {
+      await this.store.ack(claim, {
+        requestId: claim.requestId,
+        status: committed.record.phase === "cancelled" ? "cancelled" : "no_such_workflow",
+        workflowId: command.workflowId,
+        error: "submission notice was superseded before delivery commit",
+        deliveredAt: new Date().toISOString(),
+      });
+      return;
+    }
+    await this.store.ack(claim, {
+      requestId: claim.requestId,
+      status: "delivered",
+      workflowId: command.workflowId,
+      deliveredAt: new Date().toISOString(),
+    });
+  }
+
   /**
    * Apply a verdict from the exact originating Codex thread and deliver the
    * outcome to the original DSH session. Delivery is deduplicated through the
@@ -601,10 +692,12 @@ export class BridgeRuntime {
       await this.retryPersistent(claim, `no live DSH session ${record.dshSessionId}`);
       return;
     }
+    let relayed = false;
     try {
       if (isLost()) return;
       if (!this.hasDeliveredMessage(agent, messageId)) {
         agent.followup(this.verdictRelayMessage(record, messageId));
+        relayed = true;
       }
       if (this.options.afterFollowupHook) await this.options.afterFollowupHook();
     } catch (error) {
@@ -625,6 +718,9 @@ export class BridgeRuntime {
         workflowId: record.id,
         deliveredAt: new Date().toISOString(),
       });
+      if (relayed && record.phase === "passed") {
+        this.startTerminalRelayGuard(agent, record.id);
+      }
       return;
     }
     // The relay landed but the exact commit lost to a cancel/new submission:
@@ -649,6 +745,65 @@ export class BridgeRuntime {
     await this.store.retry(claim, error, new Date(Date.now() + delayMs).toISOString());
   }
 
+  private startTerminalRelayGuard(agent: Agent, workflowId: string): void {
+    if (this.stopped || this.options.terminalRelayTimeoutMs <= 0) return;
+    const controller = new AbortController();
+    this.terminalRelayGuardControllers.add(controller);
+    let task: Promise<void>;
+    task = this.guardTerminalRelay(agent, workflowId, controller.signal)
+      .catch(() => undefined)
+      .finally(() => {
+        this.terminalRelayGuardControllers.delete(controller);
+        this.terminalRelayGuards.delete(task);
+      });
+    this.terminalRelayGuards.add(task);
+  }
+
+  private async guardTerminalRelay(agent: Agent, workflowId: string, signal: AbortSignal): Promise<void> {
+    let reachedIdle = false;
+    const idle = agent.whenIdle().then(
+      () => { reachedIdle = true; },
+      () => { reachedIdle = true; },
+    );
+    let timer: NodeJS.Timeout | undefined;
+    let onAbort: (() => void) | undefined;
+    const deadline = new Promise<"timeout" | "aborted">((resolvePromise) => {
+      timer = setTimeout(() => resolvePromise("timeout"), this.options.terminalRelayTimeoutMs);
+      timer.unref();
+      onAbort = () => resolvePromise("aborted");
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    const outcome = await Promise.race([
+      idle.then(() => "idle" as const),
+      deadline,
+    ]);
+    if (timer) clearTimeout(timer);
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+    if (outcome !== "timeout") return;
+
+    // Let an idle resolution already queued for this exact observed activity
+    // win before consulting the mutable status. Once `whenIdle()` resolves,
+    // this guard is permanently disarmed and cannot affect a later user turn.
+    await Promise.resolve();
+    if (reachedIdle || signal.aborted || this.stopped || agent.status !== "running") return;
+    agent.cancel(
+      {
+        kind: "hook",
+        reason: `dsh-codex-workflow terminal relay exceeded ${this.options.terminalRelayTimeoutMs}ms for workflow ${workflowId}`,
+      },
+      { keepInbox: true },
+    );
+    if (signal.aborted) return;
+    await Promise.race([
+      idle,
+      new Promise<void>((resolvePromise) => {
+        const abort = () => resolvePromise();
+        signal.addEventListener("abort", abort, { once: true });
+        void idle.finally(() => signal.removeEventListener("abort", abort));
+      }),
+    ]);
+  }
+
   private verdictRelayMessage(record: WorkflowRecord, messageId: MessageId): UserMessage {
     const review = record.latestReview;
     let text: string;
@@ -657,7 +812,7 @@ export class BridgeRuntime {
     } else if (record.error && /was not applied/.test(record.error)) {
       text = `Codex review for workflow ${record.id} was NOT applied: ${record.error}`;
     } else if (record.phase === "passed") {
-      text = `Codex review passed workflow ${record.id}. Report the verified implementation and tests to the user.`;
+      text = `Codex review passed workflow ${record.id}. Report the verified implementation and tests once, then end this turn immediately. Do not call any tool, including memory, status, todo, shell, or codex_workflow_status.`;
     } else if (record.phase === "waiting_review_decision" && review) {
       text = `Codex Reviewer found only non-blocking improvements for workflow ${record.id}. Present each item below to the user and wait for their choice, then call codex_workflow_decide with workflowId ${record.id} and decision "accept" (ship as-is) or "fix" (repair first).\n${formatFindings(review)}`;
     } else if (record.phase === "blocked") {
@@ -668,6 +823,19 @@ export class BridgeRuntime {
     return freezeMessage({
       ...createUserMessage({
         content: [{ type: "text", text }],
+        source: { kind: "plugin", plugin: "dsh-codex-workflow", form: "relay" },
+      }),
+      id: messageId,
+    });
+  }
+
+  private submissionNoticeMessage(command: SubmissionNoticeCommand, messageId: MessageId): UserMessage {
+    return freezeMessage({
+      ...createUserMessage({
+        content: [{
+          type: "text",
+          text: `${command.message}\nWorkflow: ${command.workflowId}\nSubmission: ${command.submissionId}\n请检查 codex_workflow_status；修复环境或任务问题后重新提交。`,
+        }],
         source: { kind: "plugin", plugin: "dsh-codex-workflow", form: "relay" },
       }),
       id: messageId,

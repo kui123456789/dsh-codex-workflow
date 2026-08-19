@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import { closeCoordinationStoresForDirectory } from "../src/coordination.js";
-import { newRequestId, type DispatchPlanCommand, type SubmitVerdictCommand } from "../src/bridge-protocol.js";
+import { newRequestId, type DispatchPlanCommand, type SubmissionNoticeCommand, type SubmitVerdictCommand } from "../src/bridge-protocol.js";
 import { BridgeStore } from "../src/bridge-store.js";
 import { BridgeRuntime, BridgeCrashSimulationError, type AgentRegistryLike } from "../src/bridge-runtime.js";
 import { collectEvidence } from "../src/evidence.js";
@@ -49,6 +49,7 @@ const config: WorkflowConfig = {
   callbackRetryBaseMs: 200,
   turnTimeoutMs: 10_000,
   idleProcessMs: 0,
+  terminalRelayTimeoutMs: 60_000,
   storageDir: "",
 };
 
@@ -65,14 +66,26 @@ interface FakeAgent {
   id: string;
   cwd: string;
   followups: Array<{ text: string; source?: unknown }>;
+  cancels: Array<{ cause: unknown; options?: { keepInbox?: boolean } }>;
+  status: "idle" | "running";
+  startActivity(): void;
+  finishActivity(): void;
   agent: Agent;
 }
 
-function makeAgent(id: string, cwd: string, followupThrows = 0): FakeAgent {
+function makeAgent(id: string, cwd: string, followupThrows = 0, hangAfterFollowup = false): FakeAgent {
+  const idleWaiters: Array<() => void> = [];
   const fake: FakeAgent = {
     id,
     cwd,
     followups: [],
+    cancels: [],
+    status: "idle",
+    startActivity: () => { fake.status = "running"; },
+    finishActivity: () => {
+      fake.status = "idle";
+      for (const resolvePromise of idleWaiters.splice(0)) resolvePromise();
+    },
     agent: undefined as never,
   };
   // The durable session event log: inbox insertions persist as
@@ -83,6 +96,14 @@ function makeAgent(id: string, cwd: string, followupThrows = 0): FakeAgent {
     session: {
       header: { cwd },
       events,
+    },
+    get status() { return fake.status; },
+    whenIdle: () => fake.status === "idle"
+      ? Promise.resolve()
+      : new Promise<void>((resolvePromise) => idleWaiters.push(resolvePromise)),
+    cancel: (cause: unknown, options?: { keepInbox?: boolean }) => {
+      fake.cancels.push({ cause, options });
+      fake.finishActivity();
     },
     followup: (message: { id: string; content: Array<{ type: string; text?: string }> }) => {
       if (followupThrows > 0) {
@@ -96,6 +117,7 @@ function makeAgent(id: string, cwd: string, followupThrows = 0): FakeAgent {
         time: Date.now(),
         data: { target: "next-turn", start: 0, deleteCount: 0, inserted: [message] },
       });
+      if (hangAfterFollowup) fake.startActivity();
     },
   } as unknown as Agent;
   return fake;
@@ -126,7 +148,13 @@ interface Harness {
   registry: FakeRegistry;
 }
 
-async function harness(pollMs = 5, retryBaseMs = 1_000, maxRetryAttempts = 5, leaseMs = 60_000): Promise<Harness> {
+async function harness(
+  pollMs = 5,
+  retryBaseMs = 1_000,
+  maxRetryAttempts = 5,
+  leaseMs = 60_000,
+  terminalRelayTimeoutMs = 60_000,
+): Promise<Harness> {
   const directory = await mkdtemp(join(tmpdir(), "dsh-bridge-runtime-"));
   const store = new BridgeStore(join(directory, "storage"), 1024 * 1024, leaseMs);
   await store.init();
@@ -140,6 +168,7 @@ async function harness(pollMs = 5, retryBaseMs = 1_000, maxRetryAttempts = 5, le
     workflowStore,
     retryBaseMs,
     maxRetryAttempts,
+    terminalRelayTimeoutMs,
   });
   return { directory, store, workflowStore, manager, runtime, registry };
 }
@@ -193,6 +222,22 @@ function verdict(overrides: Partial<SubmitVerdictCommand> = {}): SubmitVerdictCo
     codexThreadId: newRequestId(),
     submissionId: newRequestId(),
     verdict: { verdict: "pass", findings: [], testGaps: [], summary: "ok" },
+    ...overrides,
+  };
+}
+
+function notice(overrides: Partial<SubmissionNoticeCommand> = {}): SubmissionNoticeCommand {
+  return {
+    version: 1,
+    kind: "submission_notice",
+    requestId: newRequestId(),
+    createdAt: new Date().toISOString(),
+    workflowId: "wf-missing",
+    submissionId: newRequestId(),
+    codexThreadId: newRequestId(),
+    dshSessionId: "session-notice",
+    level: "error",
+    message: "Codex Reviewer 后台审查失败：source task is invalid",
     ...overrides,
   };
 }
@@ -452,6 +497,9 @@ test("a passing verdict delivers to the original DSH session exactly once", asyn
     assert.equal(receipt.workflowId, bridge.workflowId);
     assert.equal(target.followups.length, 1);
     assert.match(target.followups[0]!.text, /Codex review passed workflow/);
+    assert.match(target.followups[0]!.text, /end this turn immediately/);
+    assert.match(target.followups[0]!.text, /Do not call any tool/);
+    assert.match(target.followups[0]!.text, /memory/);
     const record = await h.workflowStore.load(bridge.workflowId);
     assert.equal(record?.phase, "passed");
     assert.equal(record?.submissionState, "delivered");
@@ -459,6 +507,147 @@ test("a passing verdict delivers to the original DSH session exactly once", asyn
     await h.store.enqueue(command);
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(target.followups.length, 1);
+  } finally {
+    await h.runtime.stop();
+    await rmClosed(h.directory);
+  }
+});
+
+test("a hanging terminal relay is cancelled once without clearing pending inbox work", async () => {
+  const h = await harness(5, 1_000, 5, 60_000, 20);
+  try {
+    const workspace = await makeWorkspace(h.directory);
+    const target = makeAgent("session-terminal-hang", "C:\\work", 0, true);
+    h.registry.register(target);
+    h.runtime.start();
+    const bridge = await makeBridgeWorkflow(h, target.id, workspace);
+    const command = verdict({ workflowId: bridge.workflowId, codexThreadId: bridge.codexThreadId, submissionId: bridge.submissionId });
+    await h.store.enqueue(command);
+    await waitForReceipt(h.store, command.requestId);
+    await waitFor(() => target.cancels.length === 1);
+    assert.deepEqual(target.cancels[0]?.options, { keepInbox: true });
+    assert.deepEqual(target.cancels[0]?.cause, {
+      kind: "hook",
+      reason: `dsh-codex-workflow terminal relay exceeded 20ms for workflow ${bridge.workflowId}`,
+    });
+    assert.equal(target.status, "idle");
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+    assert.equal(target.cancels.length, 1);
+  } finally {
+    await h.runtime.stop();
+    await rmClosed(h.directory);
+  }
+});
+
+test("a terminal relay that reaches idle before the deadline is never cancelled", async () => {
+  const h = await harness(5, 1_000, 5, 60_000, 20);
+  try {
+    const workspace = await makeWorkspace(h.directory);
+    const target = makeAgent("session-terminal-idle", "C:\\work");
+    h.registry.register(target);
+    h.runtime.start();
+    const bridge = await makeBridgeWorkflow(h, target.id, workspace);
+    const command = verdict({ workflowId: bridge.workflowId, codexThreadId: bridge.codexThreadId, submissionId: bridge.submissionId });
+    await h.store.enqueue(command);
+    await waitForReceipt(h.store, command.requestId);
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 60));
+    assert.equal(target.cancels.length, 0);
+  } finally {
+    await h.runtime.stop();
+    await rmClosed(h.directory);
+  }
+});
+
+test("stopping the runtime disarms a pending terminal relay guard", async () => {
+  const h = await harness(5, 1_000, 5, 60_000, 80);
+  try {
+    const workspace = await makeWorkspace(h.directory);
+    const target = makeAgent("session-terminal-stop", "C:\\work", 0, true);
+    h.registry.register(target);
+    h.runtime.start();
+    const bridge = await makeBridgeWorkflow(h, target.id, workspace);
+    const command = verdict({ workflowId: bridge.workflowId, codexThreadId: bridge.codexThreadId, submissionId: bridge.submissionId });
+    await h.store.enqueue(command);
+    await waitForReceipt(h.store, command.requestId);
+    await h.runtime.stop();
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 120));
+    assert.equal(target.cancels.length, 0);
+  } finally {
+    await h.runtime.stop();
+    await rmClosed(h.directory);
+  }
+});
+
+test("a completed relay guard never cancels a later agent activity", async () => {
+  const h = await harness(5, 1_000, 5, 60_000, 30);
+  try {
+    const workspace = await makeWorkspace(h.directory);
+    const target = makeAgent("session-terminal-next", "C:\\work");
+    h.registry.register(target);
+    h.runtime.start();
+    const bridge = await makeBridgeWorkflow(h, target.id, workspace);
+    const command = verdict({ workflowId: bridge.workflowId, codexThreadId: bridge.codexThreadId, submissionId: bridge.submissionId });
+    await h.store.enqueue(command);
+    await waitForReceipt(h.store, command.requestId);
+    target.startActivity();
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 80));
+    assert.equal(target.cancels.length, 0);
+    target.finishActivity();
+  } finally {
+    await h.runtime.stop();
+    await rmClosed(h.directory);
+  }
+});
+
+test("a terminal submission notice survives a relay crash and wakes the original session exactly once", async () => {
+  const h = await harness(5);
+  try {
+    const workspace = await makeWorkspace(h.directory);
+    const target = makeAgent("session-notice", workspace);
+    h.registry.register(target);
+    const record = await h.manager.startExternalPlan({
+      version: 1,
+      kind: "dispatch_plan",
+      requestId: newRequestId(),
+      createdAt: new Date().toISOString(),
+      codexThreadId: newRequestId(),
+      target: { cwd: workspace, dshSessionId: target.id },
+      task: "Bridge task",
+      planMarkdown: "<proposed_plan>\nDo it\n</proposed_plan>",
+      assumptions: [],
+    }, target.agent);
+    const command = notice({
+      workflowId: record.id,
+      codexThreadId: record.codexThreadId!,
+      dshSessionId: target.id,
+    });
+    await h.workflowStore.update(record.id, (r) => {
+      r.submissionId = command.submissionId;
+      r.submissionState = "failed";
+      r.submissionError = command.message;
+      r.submissionNotice = { command, state: "prepared" };
+    });
+    await h.store.enqueue(command);
+
+    const crashed = new BridgeRuntime(h.store, h.registry, {
+      pollMs: 5,
+      storageDir: join(h.directory, "storage"),
+      manager: h.manager,
+      workflowStore: h.workflowStore,
+      afterFollowupHook: async () => { throw new BridgeCrashSimulationError(); },
+    });
+    crashed.start();
+    await waitFor(() => target.followups.length === 1);
+    await crashed.stop();
+    assert.equal(await h.store.receipt(command.requestId), undefined);
+    expireClaimLease(h.store, command.requestId);
+
+    h.runtime.start();
+    const receipt = await waitForReceipt(h.store, command.requestId);
+    assert.equal(receipt.status, "delivered");
+    assert.equal(target.followups.length, 1, "restart replay must not show the notice twice");
+    assert.match(target.followups[0]!.text, /后台审查失败/);
+    assert.equal((await h.workflowStore.load(record.id))?.submissionNotice?.state, "delivered");
   } finally {
     await h.runtime.stop();
     await rmClosed(h.directory);
