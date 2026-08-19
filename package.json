@@ -1,7 +1,26 @@
 {
   "name": "dsh-codex-workflow",
-  "version": "1.0.1",
+  "version": "1.0.5",
   "description": "DeepSeek Harness plugin that uses Codex to plan and review while DSH executes.",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "codex",
+    "workflow",
+    "code-review"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kui123456789/dsh-codex-workflow.git"
+  },
+  "homepage": "https://github.com/kui123456789/dsh-codex-workflow#readme",
+  "bugs": {
+    "url": "https://github.com/kui123456789/dsh-codex-workflow/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "packageManager": "pnpm@10.33.2",
   "type": "module",
   "main": "./lib/index.js",

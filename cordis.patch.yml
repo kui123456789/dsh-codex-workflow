@@ -15,4 +15,5 @@
         callbackMaxAttempts: 3
         callbackRetryBaseMs: 2000
         turnTimeoutMs: 600000
-        idleProcessMs: 900000
+        idleProcessMs: 5000
+        terminalRelayTimeoutMs: 60000

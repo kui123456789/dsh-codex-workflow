@@ -3,4 +3,5 @@ lib/
 coverage/
 *.tgz
 *.log
-
+docs/research/codex-thread-resume-feasibility-2026-08-18.md
+docs/superpowers/
