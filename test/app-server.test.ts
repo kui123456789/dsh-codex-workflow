@@ -235,10 +235,13 @@ test("idle shutdown releases an interrupted turn even without a completion event
   try {
     const threadId = await codex.startThread({ cwd: process.cwd(), name: "Idle interrupted" });
     const controller = new AbortController();
-    const turn = codex.startTurn(threadId, { prompt: "HANG" }, controller.signal);
+    const turn = codex.startTurn(threadId, {
+      prompt: "HANG",
+      onStarted: () => controller.abort(new Error("cancelled")),
+    }, controller.signal);
+    const rejected = assert.rejects(turn, /cancelled/);
     const pid = Number(await readFile(processMarker, "utf8"));
-    controller.abort(new Error("cancelled"));
-    await assert.rejects(turn, /cancelled/);
+    await rejected;
     await waitForFile(interruptMarker);
     await waitForProcessExit(pid);
   } finally {

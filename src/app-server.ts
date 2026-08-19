@@ -371,6 +371,9 @@ export class CodexAppServerClient {
     this.turnWaiters += 1;
     return new Promise((resolve, reject) => {
       if (signal?.aborted) {
+        // The turn may have started while the abort raced with the hand-off
+        // from turn/start to this waiter. It still needs an explicit interrupt.
+        void this.abandonTurn(threadId, turnId);
         this.turnWaiters -= 1;
         this.scheduleIdle();
         reject(abortError(signal));
