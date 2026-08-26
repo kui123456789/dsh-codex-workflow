@@ -6,7 +6,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { CodexAppServerClient } from "../src/app-server.js";
 import { AppServerCodexCallbackDispatcher } from "../src/app-server-callback.js";
-import { CodexInvalidThreadError, CodexNoVerdictError } from "../src/codex-callback.js";
+import { CodexCallbackProcessError, CodexInvalidThreadError, CodexNoVerdictError } from "../src/codex-callback.js";
 
 const fixture = join(fileURLToPath(new URL(".", import.meta.url)), "fixtures", "fake-codex-app-server.mjs");
 
@@ -89,6 +89,7 @@ test("validates the source read-only and creates one fresh Reviewer, then reuses
     const turns = calls.filter((call) => call.method === "turn/start");
     const settings = calls.find((call) => call.method === "thread/settings/update");
     const name = calls.find((call) => call.method === "thread/name/set");
+    const unsubs = calls.filter((call) => call.method === "thread/unsubscribe");
 
     // First review: exactly one read-only source validation + one fresh start,
     // and NOT a single fork anywhere in the whole run.
@@ -121,6 +122,23 @@ test("validates the source read-only and creates one fresh Reviewer, then reuses
     assert.ok(turns.every((call) => call.params.threadId === reviewerThreadId));
     assert.ok(turns.every((call) => call.params.outputSchema?.properties?.verdict));
     assert.ok(turns.every((call) => call.params.sandboxPolicy.type === "readOnly" && call.params.sandboxPolicy.networkAccess === false));
+
+    // Every Reviewer turn is pinned to the non-collaborative "default" mode
+    // with the silent single-verdict developer instructions, both on the first
+    // review and on the resumed re-review.
+    for (const call of turns) {
+      assert.equal(call.params.collaborationMode?.mode, "default");
+      const instructions = call.params.collaborationMode?.settings?.developer_instructions;
+      assert.equal(typeof instructions, "string");
+      assert.match(instructions, /ONLY one final message|no commentary/i);
+      assert.match(instructions, /do NOT/i);
+    }
+
+    // The Reviewer thread is released exactly once per review cycle (one per
+    // send) and the source task is never unsubscribed.
+    assert.equal(unsubs.length, 2);
+    assert.ok(unsubs.every((call) => call.params.threadId === reviewerThreadId));
+    assert.ok(!unsubs.some((call) => call.params.threadId === request.codexThreadId));
   } finally {
     await callback.stop();
     await codex.stop();
@@ -246,12 +264,17 @@ test("an existing reviewerThreadId resumes only that Reviewer (old-record compat
 test("cancel interrupts only the Reviewer turn, never the source", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-app-server-callback-cancel-"));
   const marker = join(directory, "interrupt.txt");
+  const callsFile = join(directory, "calls.jsonl");
   const codex = new CodexAppServerClient({
     command: process.execPath,
     args: [fixture],
     requestTimeoutMs: 5_000,
     idleProcessMs: 0,
-    env: { ...process.env, FAKE_CODEX_INTERRUPT_MARKER: marker },
+    env: {
+      ...process.env,
+      FAKE_CODEX_INTERRUPT_MARKER: marker,
+      FAKE_CODEX_THREAD_PARAMS_MARKER: callsFile,
+    },
   });
   const callback = new AppServerCodexCallbackDispatcher(codex);
   const controller = new AbortController();
@@ -277,6 +300,16 @@ test("cancel interrupts only the Reviewer turn, never the source", async () => {
     assert.equal(thread, started!.threadId, "interrupt must target the Reviewer turn");
     assert.ok(turn);
     assert.notEqual(thread, request.codexThreadId, "the source task must never be interrupted");
+    // Cancellation still releases the Reviewer thread exactly once, and the
+    // source task is never unsubscribed.
+    const calls = (await readFile(callsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
+      method: string;
+      params: Record<string, any>;
+    });
+    const unsubs = calls.filter((call) => call.method === "thread/unsubscribe");
+    assert.equal(unsubs.length, 1, "a cancelled review releases its thread exactly once");
+    assert.equal(unsubs[0]?.params.threadId, started!.threadId);
+    assert.ok(!unsubs.some((call) => call.params.threadId === request.codexThreadId));
   } finally {
     await callback.stop();
     await codex.stop();
@@ -285,12 +318,18 @@ test("cancel interrupts only the Reviewer turn, never the source", async () => {
 });
 
 test("an invalid Reviewer verdict is terminal", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-app-server-callback-invalid-"));
+  const marker = join(directory, "calls.jsonl");
   const codex = new CodexAppServerClient({
     command: process.execPath,
     args: [fixture],
     requestTimeoutMs: 5_000,
     idleProcessMs: 0,
-    env: { ...process.env, FAKE_CODEX_REVIEW_VERDICT: "not-json" },
+    env: {
+      ...process.env,
+      FAKE_CODEX_THREAD_PARAMS_MARKER: marker,
+      FAKE_CODEX_REVIEW_VERDICT: "not-json",
+    },
   });
   const callback = new AppServerCodexCallbackDispatcher(codex);
   try {
@@ -301,8 +340,377 @@ test("an invalid Reviewer verdict is terminal", async () => {
       cwd: process.cwd(),
       prompt: "Review it.",
     }), CodexNoVerdictError);
+    // Terminal failure still releases the Reviewer thread exactly once and
+    // never touches the source task.
+    const calls = (await readFile(marker, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
+      method: string;
+      params: Record<string, any>;
+    });
+    const unsubs = calls.filter((call) => call.method === "thread/unsubscribe");
+    assert.equal(unsubs.length, 1, "terminal failure must unsubscribe exactly once");
+    assert.ok(!unsubs.some((call) => call.params.threadId === "origin-invalid"), "the source task is never unsubscribed");
   } finally {
     await callback.stop();
     await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("provisional pass messages are never applied; only the final changes_requested verdict wins", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-callback-provisional-"));
+  const marker = join(directory, "calls.jsonl");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: {
+      ...process.env,
+      FAKE_CODEX_THREAD_PARAMS_MARKER: marker,
+      FAKE_CODEX_PROVISIONAL_SEQ: JSON.stringify([
+        JSON.stringify({ verdict: "pass", findings: [], testGaps: [], summary: "provisional 1" }),
+        JSON.stringify({ verdict: "pass", findings: [], testGaps: [], summary: "provisional 2" }),
+      ]),
+      FAKE_CODEX_REVIEW_VERDICT: JSON.stringify({
+        verdict: "changes_requested",
+        findings: [{ severity: "high", blocking: true, title: "final", body: "b", file: null, line: null }],
+        testGaps: [],
+        summary: "final changes_requested",
+      }),
+    },
+  });
+  const callback = new AppServerCodexCallbackDispatcher(codex);
+  try {
+    const result = await callback.send({
+      workflowId: "workflow-prov",
+      submissionId: "submission-prov",
+      codexThreadId: "origin-prov",
+      cwd: directory,
+      prompt: "Review.",
+    });
+    assert.deepEqual(result, {
+      kind: "verdict",
+      verdict: {
+        verdict: "changes_requested",
+        findings: [{ severity: "high", blocking: true, title: "final", body: "b" }],
+        testGaps: [],
+        summary: "final changes_requested",
+      },
+    });
+    // The changes_requested path still releases the Reviewer thread exactly once.
+    const calls = (await readFile(marker, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
+      method: string;
+      params: Record<string, any>;
+    });
+    const unsubs = calls.filter((call) => call.method === "thread/unsubscribe");
+    assert.equal(unsubs.length, 1, "a changes_requested verdict releases its thread exactly once");
+    assert.ok(!unsubs.some((call) => call.params.threadId === "origin-prov"));
+  } finally {
+    await callback.stop();
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("provisional changes_requested is ignored when the final verdict is pass", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-callback-provisional-reverse-"));
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: {
+      ...process.env,
+      FAKE_CODEX_PROVISIONAL_SEQ: JSON.stringify([
+        JSON.stringify({
+          verdict: "changes_requested",
+          findings: [{ severity: "high", blocking: true, title: "early", body: "b", file: null, line: null }],
+          testGaps: [],
+          summary: "provisional changes",
+        }),
+      ]),
+      FAKE_CODEX_REVIEW_VERDICT: JSON.stringify({ verdict: "pass", findings: [], testGaps: [], summary: "final pass" }),
+    },
+  });
+  const callback = new AppServerCodexCallbackDispatcher(codex);
+  try {
+    const result = await callback.send({
+      workflowId: "workflow-prov2",
+      submissionId: "submission-prov2",
+      codexThreadId: "origin-prov2",
+      cwd: directory,
+      prompt: "Review.",
+    });
+    assert.deepEqual(result, { kind: "verdict", verdict: { verdict: "pass", findings: [], testGaps: [], summary: "final pass" } });
+  } finally {
+    await callback.stop();
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("an interrupted turn that already streamed a complete pass JSON never produces a verdict", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-callback-interrupted-"));
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: {
+      ...process.env,
+      FAKE_CODEX_PROVISIONAL_SEQ: JSON.stringify([
+        JSON.stringify({ verdict: "pass", findings: [], testGaps: [], summary: "streamed before interrupt" }),
+      ]),
+      FAKE_CODEX_TURN_STATUS: "interrupted",
+    },
+  });
+  const callback = new AppServerCodexCallbackDispatcher(codex);
+  try {
+    const result = await callback.send({
+      workflowId: "workflow-int",
+      submissionId: "submission-int",
+      codexThreadId: "origin-int",
+      cwd: directory,
+      prompt: "Review.",
+    });
+    assert.equal(result.kind, "retryable_busy");
+    assert.match(result.reason, /interrupted/, "the interrupt cause must be attributed, not lumped as generic busy");
+  } finally {
+    await callback.stop();
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a failed turn that already streamed a complete pass JSON never produces a verdict", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-callback-failed-"));
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: {
+      ...process.env,
+      FAKE_CODEX_PROVISIONAL_SEQ: JSON.stringify([
+        JSON.stringify({ verdict: "pass", findings: [], testGaps: [], summary: "streamed before failure" }),
+      ]),
+      FAKE_CODEX_TURN_STATUS: "failed",
+    },
+  });
+  const callback = new AppServerCodexCallbackDispatcher(codex);
+  try {
+    await assert.rejects(callback.send({
+      workflowId: "workflow-failed",
+      submissionId: "submission-failed",
+      codexThreadId: "origin-failed",
+      cwd: directory,
+      prompt: "Review.",
+    }), CodexCallbackProcessError);
+  } finally {
+    await callback.stop();
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("fresh Reviewer setup failures after thread/start still unsubscribe the new thread once", async () => {
+  for (const mode of ["settings", "name", "onThread"] as const) {
+    const directory = await mkdtemp(join(tmpdir(), `dsh-callback-setup-${mode}-`));
+    const marker = join(directory, "calls.jsonl");
+    const env: Record<string, string> = {
+      ...process.env,
+      FAKE_CODEX_THREAD_PARAMS_MARKER: marker,
+    };
+    if (mode === "settings") env.FAKE_CODEX_FAIL_SETTINGS = "1";
+    if (mode === "name") env.FAKE_CODEX_FAIL_NAME = "1";
+    const codex = new CodexAppServerClient({
+      command: process.execPath,
+      args: [fixture],
+      requestTimeoutMs: 5_000,
+      idleProcessMs: 0,
+      env,
+    });
+    const callback = new AppServerCodexCallbackDispatcher(codex);
+    try {
+      const base = {
+        workflowId: `workflow-${mode}`,
+        submissionId: `submission-${mode}`,
+        codexThreadId: `origin-${mode}`,
+        cwd: directory,
+        prompt: "Review.",
+      };
+      if (mode === "onThread") {
+        await assert.rejects(callback.send({
+          ...base,
+          onThread: async () => { throw new Error("ownership persistence failed"); },
+        }), /ownership persistence failed/);
+      } else {
+        await assert.rejects(callback.send(base), CodexCallbackProcessError);
+      }
+      const calls = (await readFile(marker, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
+        method: string;
+        params: Record<string, any>;
+      });
+      assert.equal(calls.filter((call) => call.method === "thread/start").length, 1, `${mode}: one fresh thread was created`);
+      const unsubs = calls.filter((call) => call.method === "thread/unsubscribe");
+      assert.equal(unsubs.length, 1, `${mode}: the half-configured fresh Reviewer must be unsubscribed exactly once`);
+      assert.ok(!unsubs.some((call) => call.params.threadId === `origin-${mode}`), `${mode}: the source task is never unsubscribed`);
+    } finally {
+      await callback.stop();
+      await codex.stop();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("two concurrent reviewers on separate threads release each thread independently", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-callback-concurrent-"));
+  const marker = join(directory, "calls.jsonl");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: {
+      ...process.env,
+      FAKE_CODEX_THREAD_PARAMS_MARKER: marker,
+      FAKE_CODEX_REVIEW_VERDICT: JSON.stringify({ verdict: "pass", findings: [], testGaps: [], summary: "ok" }),
+    },
+  });
+  const callback = new AppServerCodexCallbackDispatcher(codex);
+  try {
+    const sendFor = (workflowId: string, submissionId: string, codexThreadId: string, cwd: string) =>
+      callback.send({ workflowId, submissionId, codexThreadId, cwd, prompt: "Review." });
+    const [a, b] = await Promise.all([
+      sendFor("wf-a", "sub-a", "origin-a", directory),
+      sendFor("wf-b", "sub-b", "origin-b", directory),
+    ]);
+    assert.equal(a.kind, "verdict");
+    assert.equal(b.kind, "verdict");
+
+    const calls = (await readFile(marker, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
+      method: string;
+      params: Record<string, any>;
+    });
+    const starts = calls.filter((call) => call.method === "thread/start");
+    const unsubs = calls.filter((call) => call.method === "thread/unsubscribe");
+    // Two fresh Reviewer threads, each released exactly once; the source tasks
+    // are never subscribed or unsubscribed.
+    assert.equal(starts.length, 2);
+    assert.equal(unsubs.length, 2);
+    const unsubThreads = new Set(unsubs.map((call) => call.params.threadId));
+    assert.equal(unsubThreads.size, 2);
+    assert.ok(!unsubs.some((call) => call.params.threadId.startsWith("origin-")));
+  } finally {
+    await callback.stop();
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("the silent Reviewer pins the App Server's isDefault model and its defaultReasoningEffort", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-callback-default-model-"));
+  const marker = join(directory, "calls.jsonl");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: {
+      ...process.env,
+      FAKE_CODEX_THREAD_PARAMS_MARKER: marker,
+      FAKE_CODEX_DEFAULT_MODEL: "default-model",
+      FAKE_CODEX_DEFAULT_EFFORT: "medium",
+      FAKE_CODEX_REVIEW_VERDICT: JSON.stringify({ verdict: "pass", findings: [], testGaps: [], summary: "ok" }),
+    },
+  });
+  const callback = new AppServerCodexCallbackDispatcher(codex);
+  try {
+    // No reviewerModel and no effort: the server's isDefault model wins over the
+    // list-first entry, and the model's defaultReasoningEffort is used instead
+    // of a fixed null.
+    await callback.send({ workflowId: "wf-default", submissionId: "s-default", codexThreadId: "origin-default", cwd: directory, prompt: "Review." });
+    // A second workflow with an explicit effort: the explicit effort wins.
+    await callback.send({ workflowId: "wf-eff", submissionId: "s-eff", codexThreadId: "origin-eff", cwd: directory, prompt: "Review.", effort: "ultra" });
+
+    const calls = (await readFile(marker, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
+      method: string;
+      params: Record<string, any>;
+    });
+    const turns = calls.filter((call) => call.method === "turn/start");
+    assert.equal(turns.length, 2);
+    const [first, second] = turns.map((call) => call.params.collaborationMode);
+    // isDefault selection: "default-model" (marked isDefault), NOT "first-model".
+    assert.equal(first.settings.model, "default-model");
+    assert.equal(first.settings.reasoning_effort, "medium");
+    assert.match(first.settings.developer_instructions, /no commentary/i);
+    // Explicit effort overrides the model default; the model stays the default.
+    assert.equal(second.settings.model, "default-model");
+    assert.equal(second.settings.reasoning_effort, "ultra");
+  } finally {
+    await callback.stop();
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a failed operation on a shared Reviewer never releases another active review", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-callback-refcount-"));
+  const marker = join(directory, "calls.jsonl");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: {
+      ...process.env,
+      FAKE_CODEX_THREAD_PARAMS_MARKER: marker,
+      FAKE_CODEX_REVIEW_VERDICT: JSON.stringify({ verdict: "pass", findings: [], testGaps: [], summary: "ok" }),
+    },
+  });
+  const callback = new AppServerCodexCallbackDispatcher(codex);
+  try {
+    // A holds the ONLY reference on the shared Reviewer thread and runs a turn.
+    const senderA = callback.send({
+      workflowId: "wf-a",
+      submissionId: "sub-a",
+      codexThreadId: "origin-a",
+      reviewerThreadId: "shared-reviewer",
+      cwd: directory,
+      prompt: "Review.",
+    });
+    // B targets the SAME thread but aborts before it ever acquires a reference.
+    const abortB = new AbortController();
+    abortB.abort(new Error("aborted before its turn"));
+    const senderB = callback.send({
+      workflowId: "wf-b",
+      submissionId: "sub-b",
+      codexThreadId: "origin-b",
+      reviewerThreadId: "shared-reviewer",
+      cwd: directory,
+      prompt: "Review.",
+    }, abortB.signal);
+
+    const [a, b] = await Promise.allSettled([senderA, senderB]);
+    assert.equal(a.status, "fulfilled", "the active review must complete");
+    assert.equal((a as PromiseFulfilledResult<any>).value.kind, "verdict");
+    assert.equal(b.status, "rejected", "the aborted operation must fail");
+    assert.match(String((b as PromiseRejectedResult).reason), /aborted/);
+
+    // Exactly ONE unsubscribe, from A's turn completing. B never decremented
+    // A's live reference, so the shared thread was not released under the
+    // active turn.
+    const calls = (await readFile(marker, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
+      method: string;
+      params: Record<string, any>;
+    });
+    const unsubs = calls.filter((call) => call.method === "thread/unsubscribe");
+    assert.equal(unsubs.length, 1, "a failed pre-turn operation must not release another thread's live turn");
+    assert.equal(unsubs[0]?.params.threadId, "shared-reviewer");
+    assert.ok(!unsubs.some((call) => call.params.threadId === "origin-a" || call.params.threadId === "origin-b"));
+  } finally {
+    await callback.stop();
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
   }
 });

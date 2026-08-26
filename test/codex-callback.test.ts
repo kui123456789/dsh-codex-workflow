@@ -157,13 +157,13 @@ test("invalid threads and process failures are terminal; rate limits are retryab
     FAKE_CALLBACK_EXIT: "1",
     FAKE_CALLBACK_STDERR: "exceeded retry limit, last status: 429 Too Many Requests",
   });
-  assert.deepEqual(await busy.send(request), { kind: "retryable_busy" });
+  assert.equal((await busy.send(request)).kind, "retryable_busy");
 
   const activeWriter = dispatcher(schemaFile, 10_000, {
     FAKE_CALLBACK_EXIT: "1",
     FAKE_CALLBACK_STDERR: `thread-store conflict: thread ${request.codexThreadId} already has an active writer`,
   });
-  assert.deepEqual(await activeWriter.send(request), { kind: "retryable_busy" });
+  assert.equal((await activeWriter.send(request)).kind, "retryable_busy");
 
   const failed = dispatcher(schemaFile, 10_000, {
     FAKE_CALLBACK_EXIT: "1",
@@ -180,7 +180,7 @@ test("timeout and cancellation terminate the child", async () => {
   const schemaFile = await makeSchema();
   const timeout = dispatcher(schemaFile, 200, { FAKE_CALLBACK_HANG: "1" });
   const started = Date.now();
-  assert.deepEqual(await timeout.send(request), { kind: "retryable_busy" });
+  assert.equal((await timeout.send(request)).kind, "retryable_busy");
   assert.ok(Date.now() - started >= 150);
 
   const cancelled = dispatcher(schemaFile, 60_000, { FAKE_CALLBACK_HANG: "1" });
@@ -199,7 +199,7 @@ test("cancel(workflowId) and stop() kill active children and wait for them", asy
     await new Promise((resolve) => setTimeout(resolve, 100));
     callback.cancel("wf-1");
     const outcome = await pending;
-    assert.deepEqual(outcome, { kind: "retryable_busy" }); // killed child -> close(0? no, kill) -> close with null code
+    assert.equal(outcome?.kind, "retryable_busy"); // killed child -> close(0? no, kill) -> close with null code
     void outcome;
 
     const pending2 = callback.send({ ...request, submissionId: "01a01411-0000-4000-8000-000000000002" });
@@ -239,7 +239,7 @@ test("a timeout waits for the child to fully exit before returning retryable", a
   let exitObserved = child.exitCode !== null || child.signalCode !== null;
   child.once("exit", () => { exitObserved = true; });
   const result = await pending;
-  assert.deepEqual(result, { kind: "retryable_busy" });
+  assert.equal(result?.kind, "retryable_busy");
   assert.ok(Date.now() - started >= 120);
   assert.equal(exitObserved, true, "the timed-out child must be fully exited before send resolves");
 });
@@ -465,5 +465,5 @@ test("stderr over the byte bound still classifies busy from the retained head", 
   const schemaFile = await makeSchema();
   const longStderr = "exceeded retry limit, last status: 429 Too Many Requests\n" + "x".repeat(5000);
   const overflow = dispatcher(schemaFile, 10_000, { FAKE_CALLBACK_EXIT: "1", FAKE_CALLBACK_STDERR: longStderr }, 1024);
-  assert.deepEqual(await overflow.send(request), { kind: "retryable_busy" });
+  assert.equal((await overflow.send(request)).kind, "retryable_busy");
 });

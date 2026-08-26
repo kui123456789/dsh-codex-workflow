@@ -30,6 +30,8 @@ pnpm verify
 pnpm doctor
 ```
 
+`pnpm run lifecycle:accept` runs the real review-persistence acceptance against your Codex App Server (needs a login): a durable Reviewer completes a structured-verdict turn, the managed App Server is closed, and a fresh App Server re-reads the turn and verifies it was persisted as `completed` with its final assistant message — then the same Reviewer is resumed for a second completed turn. (In the backing compare experiment the tested kill and EOF close sequences both read back a completed turn with its final message, so this regression verifies the tested sequence rather than proving a root cause.) The plugin shuts the App Server down gracefully (stdin EOF, then escalate to SIGTERM/SIGKILL only on timeout) as defensive lifecycle hardening to lower the risk of an abrupt shutdown racing the app-server's final rollout write.
+
 ## Codex-led flow (preferred)
 
 From the Codex task that owns the plan, dispatch it to the live DSH session:
@@ -51,6 +53,12 @@ then thread/start --> dedicated Reviewer task --turn/start(outputSchema)--> verd
 ```
 
 The source task is never resumed or written by the plugin, so Codex Desktop may keep it open — and may even be its active writer — without causing a thread-store writer conflict. The first review persists the fresh Reviewer task id; every later repair review resumes that same Reviewer task. The Reviewer is forced to the workflow cwd with `read-only`, network disabled, and `approvalPolicy: never` at creation and on every review turn.
+
+The Reviewer reviews **silently and single-verdict**: every review turn is pinned to Codex's non-collaborative "default" mode and receives protocol-level developer instructions (plus a prompt block) that forbid commentary/progress messages, sub-agents, delegation and task creation. Only the **final** completed agent message is ever consumed as the verdict — provisional or multi-JSON output streamed during the turn is never applied, and interrupted/failed turns produce no verdict. When no `reviewerModel` is configured, the plugin uses the App Server's **default model** (`model/list` entry with `isDefault: true`, with a deterministic fallback to the first non-hidden model only when the server marks no default) and, when no review effort is configured, that model's `defaultReasoningEffort`.
+
+### Reviewer writer-lock semantics
+
+While a Reviewer turn is active, the Reviewer task's writer belongs to the managed App Server, so Codex Desktop shows the task as “opened in another app” and you can only view it — do **not** click “Retry”/“Take over”, as that would steal the writer and abort the review. This is expected and temporary: as soon as the review reaches its verdict — pass, changes_requested, a terminal error, or a cancel — the plugin calls `thread/unsubscribe` on that Reviewer thread (idempotently, once per cycle, never on the source task). The App Server answers `unsubscribed` (we released the writer), `notSubscribed` (loaded but we were not the writer), or `notLoaded` (not currently loaded — nothing to release); all three are success outcomes and the Review is never deleted or archived. The completed App Server then exits after the short idle grace period, after which Desktop can open the Reviewer again.
 
 ### How the verdict comes back (automatic path)
 
@@ -117,7 +125,7 @@ cancelled: terminal — no queue retry, no late verdict, no message may resurrec
 - A missing live session retries forever with capped backoff (never a dead letter) for verdicts, and the fingerprint re-check runs on every retry so a stale pass is invalidated even after a long offline stretch.
 - Reviewer App Server calls bind the exact DSH workspace cwd directly, so it may be a Git repository, a non-Git directory, or a workspace containing nested repositories. The Reviewer remains `read-only`, network-disabled, and approval-free.
 - The originating Codex task may remain open in Desktop — even as its active writer: `thread/read` metadata validation of the source is never blocked by it, and the fresh Reviewer never competes for its writer lock. Busy/rate-limited App Server operations stay durably `retrying`; each recovery round makes up to `callbackMaxAttempts` attempts with exponential backoff, then yields until `submissionRetryAt`, including across DSH restarts. Invalid task ids, missing/invalid verdicts, and explicit App Server failures remain terminal with their diagnostic preserved.
-- Cancellation interrupts the exact persisted Reviewer turn. Submission leases and task/turn ids prevent a stale owner from interrupting or applying a newer review; the DSH workflow and its evidence always remain visible via `codex_workflow_status`.
+- Cancellation interrupts the exact persisted Reviewer turn. Submission leases and task/turn ids prevent a stale owner from interrupting or applying a newer review; the DSH workflow and its evidence always remain visible via `codex_workflow_status`, which reports `reviewerActive: true|false` and never surfaces provisional JSON as `latestReview`.
 
 ## Storage
 

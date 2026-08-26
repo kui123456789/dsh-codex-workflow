@@ -1,6 +1,6 @@
-# Release checklist — dsh-codex-workflow 1.0.5
+# Release checklist — dsh-codex-workflow 1.0.6
 
-This is the operator checklist for shipping 1.0.5. It assumes the automated gates
+This is the operator checklist for shipping 1.0.6. It assumes the automated gates
 succeeded; this page is about the things automation cannot cover, plus the
 rollback story. It never authorizes touching user credentials or configuration
 outside `$DSH_HOME/storages/dsh-codex-workflow/`.
@@ -30,7 +30,17 @@ Run `pnpm release:check` twice in a row and confirm:
    - `dispatch` a plan and `codex_workflow_submit` it exactly once;
    - the source Codex task stays unchanged while a fresh, durably owned
      Reviewer task is started; `show --workflow <id>` reports both ids and
-     version `1.0.5`;
+     version `1.0.6`;
+   - while the Reviewer turn runs, Codex Desktop legitimately shows “opened in
+     another app” (writer-lock); during the turn the task shows NO provisional
+     `pass`/`changes_requested` JSON and no sub-agent activity;
+   - after the Review verdict settles (pass, changes_requested, terminal error,
+     or cancel), the plugin releases the Reviewer thread via `thread/unsubscribe`
+     exactly once; the persisted Reviewer remains visible and can be re-opened
+     in Desktop within the idle grace period;
+   - a re-review resumes the SAME Reviewer task id (never a second Reviewer);
+   - `codex_workflow_status` reports `reviewerActive: true` during the turn and
+     `false` afterwards; `latestReview` never contains provisional JSON;
    - delay the Reviewer for more than 30 seconds: `codex_workflow_submit`
      returns within 5 seconds, concludes that DSH turn without another model
      step, the DSH session becomes idle, and status remains
@@ -67,10 +77,10 @@ Run `pnpm release:check` twice in a row and confirm:
 
 ## Rollback
 
-- The previous stable version `1.0.4` is a normal `pnpm` package; downgrading is
-  just reinstalling it. Its legacy file-queue data is still imported by 1.0.5, and the
+- The previous stable version `1.0.5` is a normal `pnpm` package; downgrading is
+  just reinstalling it. Its legacy file-queue data is still imported by 1.0.6, and the
   import is one-way (the SQLite queue is authoritative once written).
-- If 1.0.5 must be pulled: stop the plugin/dispatch traffic first, restore the
+- If 1.0.6 must be pulled: stop the plugin/dispatch traffic first, restore the
   package, and verify with `pnpm doctor` before resuming. Record database and
   log state are not modified by a version change (only by `prune --commit`).
 

@@ -10,6 +10,7 @@ import {
   CodexCallbackProcessError,
   CodexInvalidThreadError,
   CodexNoVerdictError,
+  type CodexCallbackResult,
 } from "../src/codex-callback.js";
 import { WorkflowStore } from "../src/store.js";
 import type { ReviewResult, TurnWaitResult, WorkflowConfig, WorkflowRecord } from "../src/types.js";
@@ -156,13 +157,15 @@ function manager(directory: string, gateway = new FakeGateway(), overrides: Part
 
 /** Deterministic callback double: queue results; record every resume request. */
 class FakeCallback implements CodexCallback {
-  results: Array<{ kind: "verdict"; verdict: ReviewResult } | { kind: "retryable_busy" } | Error> = [];
+  results: Array<CodexCallbackResult | Error> = [];
   requests: Array<{ workflowId: string; submissionId: string; codexThreadId: string; cwd: string; prompt: string }> = [];
   cancelledWorkflows: string[] = [];
   cancelledSubmissions: string[] = [];
   stopped = false;
+  /** Controls what activeReview() reports (the dispatcher's live-turn signal). */
+  activeReviewTurns = false;
 
-  async send(request: { workflowId: string; submissionId: string; codexThreadId: string; cwd: string; prompt: string }): Promise<{ kind: "verdict"; verdict: ReviewResult } | { kind: "retryable_busy" }> {
+  async send(request: { workflowId: string; submissionId: string; codexThreadId: string; cwd: string; prompt: string }): Promise<CodexCallbackResult> {
     this.requests.push(request);
     const next = this.results.shift();
     if (next instanceof Error) throw next;
@@ -177,6 +180,10 @@ class FakeCallback implements CodexCallback {
     this.cancelledSubmissions.push(`${workflowId}:${submissionId}`);
   }
 
+  activeReview(): boolean {
+    return this.activeReviewTurns;
+  }
+
   async stop(): Promise<void> {
     this.stopped = true;
   }
@@ -189,7 +196,7 @@ class GatedCallback extends FakeCallback {
   override async send(
     request: { workflowId: string; submissionId: string; codexThreadId: string; cwd: string; prompt: string },
     signal?: AbortSignal,
-  ): Promise<{ kind: "verdict"; verdict: ReviewResult } | { kind: "retryable_busy" }> {
+  ): Promise<CodexCallbackResult> {
     this.requests.push(request);
     this.observedSignal = signal;
     await this.gate.promise;
@@ -221,6 +228,69 @@ test("runs plan, repair, and detached review in the original DSH session", async
     assert.deepEqual(gateway.reviewStarts[0], { threadId: "planner-thread", detached: true });
     assert.deepEqual(gateway.reviewStarts[1], { threadId: "reviewer-thread", detached: false });
     assert.ok(deferred.length >= 3);
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("status reports reviewerActive from a live Reviewer turn, not persisted states", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-status-"));
+  try {
+    const gateway = new FakeGateway();
+    const callback = new FakeCallback();
+    const managerInstance = manager(directory, gateway, {}, callback);
+    const exec = fakeExec("session-status", directory, []);
+    const planned = await managerInstance.start({ task: "Build it" }, exec);
+    const idle = await managerInstance.status(planned.id, exec);
+    assert.equal(idle.reviewerActive, false, "no Reviewer turn is running before any review");
+
+    // Even with a persisted reviewerTurnId and a "delivering" submission state,
+    // no LIVE turn exists: reviewerActive must stay false (a historical turn
+    // that already completed and was unsubscribed is NOT active).
+    const store = new WorkflowStore(directory);
+    await store.update(planned.id, (r) => {
+      r.origin = "codex_bridge";
+      r.codexThreadId = "source-task";
+      r.submissionId = "sub-delivery";
+      r.submissionState = "verdict_ready";
+      r.reviewerThreadId = "reviewer-thread";
+      r.reviewerTurnId = "reviewer-turn-old";
+    });
+    const delivering = await managerInstance.status(planned.id, exec);
+    assert.equal(delivering.reviewerActive, false, "a finished callback in verdict_ready is not an active Reviewer");
+
+    // The dispatcher reports a live turn -> reviewerActive true.
+    callback.activeReviewTurns = true;
+    const inFlight = await managerInstance.status(planned.id, exec);
+    assert.equal(inFlight.reviewerActive, true);
+
+    // The turn settles -> false again.
+    callback.activeReviewTurns = false;
+    const terminal = await managerInstance.status(planned.id, exec);
+    assert.equal(terminal.reviewerActive, false);
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("status reports reviewerActive during a DSH-led reviewing phase", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-status2-"));
+  try {
+    const gateway = new FakeGateway();
+    const managerInstance = manager(directory, gateway); // no callback injected
+    const exec = fakeExec("session-status2", directory, []);
+    const planned = await managerInstance.start({ task: "Build it" }, exec);
+    const store = new WorkflowStore(directory);
+    await store.update(planned.id, (r) => {
+      r.phase = "reviewing";
+      r.reviewerThreadId = "reviewer-thread";
+      r.reviewerTurnId = "reviewer-turn-x";
+    });
+    const during = await managerInstance.status(planned.id, exec);
+    assert.equal(during.reviewerActive, true);
+    await store.update(planned.id, (r) => { r.phase = "passed"; });
+    const after = await managerInstance.status(planned.id, exec);
+    assert.equal(after.reviewerActive, false);
   } finally {
     await rmClosed(directory);
   }
@@ -1173,9 +1243,9 @@ test("submit keeps a busy Codex task durably retryable after each bounded attemp
   try {
     const callback = new FakeCallback();
     callback.results = [
-      { kind: "retryable_busy" },
-      { kind: "retryable_busy" },
-      { kind: "retryable_busy" },
+      { kind: "retryable_busy", reason: "test busy" },
+      { kind: "retryable_busy", reason: "test busy" },
+      { kind: "retryable_busy", reason: "test busy" },
     ];
     const instance = manager(
       directory,
@@ -1193,10 +1263,61 @@ test("submit keeps a busy Codex task durably retryable after each bounded attemp
     const submitted = (await new WorkflowStore(directory).load(bridge.id))!;
     assert.equal(submitted.submissionState, "retrying");
     assert.equal(submitted.submissionAttempts, 3);
-    assert.match(submitted.submissionError ?? "", /busy after 3 attempts in this round; recovery will retry/);
+    assert.match(submitted.submissionError ?? "", /busy after 3 attempts in this round/);
     assert.ok((submitted.submissionRetryAt ?? 0) > Date.now(), "a future recovery round is scheduled");
     assert.equal(callback.requests.length, 3);
     assert.equal(submitted.phase, "executing", "the DSH workflow stays intact");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("an interrupted turn persists retrying + retryAt with its reason, and recovery auto-continues to the verdict", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-interrupted-recover-"));
+  try {
+    const callback = new FakeCallback();
+    callback.results = [
+      { kind: "retryable_busy", reason: "interrupted turn" },
+      { kind: "verdict", verdict: { verdict: "pass", findings: [], testGaps: [], summary: "recovered pass" } },
+    ];
+    const instance = manager(
+      directory,
+      new FakeGateway(),
+      { callbackMaxAttempts: 1, callbackRetryBaseMs: 200 },
+      callback,
+      { enqueue: async () => "committed" },
+    );
+    const exec = fakeExec("session-interrupted-recover", directory, []);
+    const bridge = await bridgeWorkflow(instance, "session-interrupted-recover", directory, newRequestId());
+    await instance.submit(bridge.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
+
+    // The interrupted turn must be persisted as retrying with a future retryAt
+    // and an attributed reason — NEVER left stuck at sending/queued.
+    await waitFor(async () => {
+      const record = await new WorkflowStore(directory).load(bridge.id);
+      return record?.submissionState === "retrying"
+        && (record.submissionRetryAt ?? 0) > Date.now()
+        && record.submissionCallbackReason === "interrupted turn";
+    });
+    const retrying = (await new WorkflowStore(directory).load(bridge.id))!;
+    assert.match(retrying.submissionError ?? "", /interrupted turn/);
+    assert.equal(callback.requests.length, 1);
+
+    // Let the persisted backoff window elapse: recovery must then re-claim the
+    // submission and run it to a verdict on its own.
+    await waitFor(async () => {
+      const record = await new WorkflowStore(directory).load(bridge.id);
+      return (record?.submissionRetryAt ?? 0) <= Date.now();
+    });
+    const recovered = await instance.recoverCallbacks();
+    assert.ok(recovered >= 1);
+    await waitFor(async () => (await new WorkflowStore(directory).load(bridge.id))?.submissionState === "received");
+    const done = (await new WorkflowStore(directory).load(bridge.id))!;
+    assert.equal(done.submissionState, "received");
+    assert.equal(done.submissionCallbackReason, "interrupted turn");
+    assert.equal(callback.requests.length, 2, "recovery spawns the next attempt on the same submission");
+    assert.equal(callback.requests[0]?.codexThreadId, callback.requests[1]?.codexThreadId, "the same source task id is reused");
+    assert.deepEqual(done.stagedVerdict?.command.verdict?.verdict, "pass");
   } finally {
     await rmClosed(directory);
   }
@@ -1534,9 +1655,9 @@ test("callback infrastructure failures do not consume a review cycle; first appl
   try {
     // Bridge submit path: three busy failures, then a real pass applies.
     const callback = new FakeCallback();
-    callback.results.push({ kind: "retryable_busy" });
-    callback.results.push({ kind: "retryable_busy" });
-    callback.results.push({ kind: "retryable_busy" });
+    callback.results.push({ kind: "retryable_busy", reason: "test busy" });
+    callback.results.push({ kind: "retryable_busy", reason: "test busy" });
+    callback.results.push({ kind: "retryable_busy", reason: "test busy" });
     const queue = fakeBridgeQueue();
     const instance = manager(directory, new FakeGateway(), { callbackMaxAttempts: 3, callbackRetryBaseMs: 30 }, callback, queue);
     const exec = fakeExec("session-cycles", directory, []);
@@ -2273,7 +2394,7 @@ test("callback tells the reviewer the diff was truncated and still allows read-o
 
 /** Accessible callback whose send blocks until released; rejects on abort. */
 class AbortableCallback implements CodexCallback {
-  results: Array<{ kind: "verdict"; verdict: ReviewResult } | { kind: "retryable_busy" } | Error> = [];
+  results: Array<CodexCallbackResult | Error> = [];
   requests: Array<{ workflowId: string; submissionId: string }> = [];
   sendCalls = 0;
   cancelledWorkflows: string[] = [];
@@ -2281,7 +2402,7 @@ class AbortableCallback implements CodexCallback {
   stopped = false;
   private releaseFn?: () => void;
 
-  async send(request: { workflowId: string; submissionId: string; codexThreadId: string; cwd: string; prompt: string }, signal?: AbortSignal): Promise<{ kind: "verdict"; verdict: ReviewResult } | { kind: "retryable_busy" }> {
+  async send(request: { workflowId: string; submissionId: string; codexThreadId: string; cwd: string; prompt: string }, signal?: AbortSignal): Promise<CodexCallbackResult> {
     this.requests.push(request);
     this.sendCalls += 1;
     await new Promise<void>((resolve, reject) => {
@@ -2569,7 +2690,7 @@ class DeferredCallback implements CodexCallback {
   stopped = false;
   private releaseFn?: () => void;
 
-  async send(request: { workflowId: string; submissionId: string; codexThreadId: string; cwd: string; prompt: string }): Promise<{ kind: "verdict"; verdict: ReviewResult } | { kind: "retryable_busy" }> {
+  async send(request: { workflowId: string; submissionId: string; codexThreadId: string; cwd: string; prompt: string }): Promise<CodexCallbackResult> {
     this.sentRequests.push(request);
     await new Promise<void>((resolve) => { this.releaseFn = resolve; });
     return { kind: "verdict", verdict: this.deferredVerdict! };

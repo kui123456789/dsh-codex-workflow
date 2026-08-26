@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -264,6 +264,125 @@ test("end-to-end: CLI dispatch -> followup -> submit -> fresh Reviewer -> final 
     await rmClosed(directory);
   }
 });
+
+test("codex_workflow_submit returns promptly; DSH turn-end never aborts the still-running Reviewer and no idle shutdown fires mid-turn", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-e2e-livecycle-"));
+  const dshHome = join(directory, "dsh-home");
+  const storageDir = join(dshHome, "storages", "dsh-codex-workflow");
+  await mkdir(join(storageDir, "bridge"), { recursive: true });
+  try {
+    const cwd = join(directory, "ws");
+    await mkdir(cwd, { recursive: true });
+    await writeFile(join(cwd, "a.txt"), "v1", "utf8");
+
+    const store = new BridgeStore(storageDir);
+    const workflowStore = new WorkflowStore(join(directory, "workflows"));
+    const codexThreadId = newRequestId();
+    const callsFile = join(directory, "app-server-calls.jsonl");
+    const interruptFile = join(directory, "interrupt.txt");
+    const codex = new CodexAppServerClient({
+      command: process.execPath,
+      args: [fakeCodexAppServer],
+      requestTimeoutMs: 10_000,
+      // Small idle: a wrongly-armed idle shutdown during the active turn would
+      // kill the App Server and fail the review.
+      idleProcessMs: 100,
+      env: {
+        ...process.env,
+        FAKE_CODEX_THREAD_PARAMS_MARKER: callsFile,
+        FAKE_CODEX_INTERRUPT_MARKER: interruptFile,
+        FAKE_CODEX_TURN_DELAY_MS: "350",
+        FAKE_CODEX_REVIEW_VERDICT: JSON.stringify({ verdict: "pass", findings: [], testGaps: [], summary: "通过" }),
+      },
+    });
+    const callback = new AppServerCodexCallbackDispatcher(codex);
+    const managerInstance = new WorkflowManager(
+      workflowStore,
+      codex,
+      { ...config, storageDir, callbackMaxAttempts: 3, callbackRetryBaseMs: 200 },
+      callback,
+      store,
+    );
+    const { agent, followups } = makeAgent("session-livecycle", cwd);
+    const registry: AgentRegistryLike = { get: () => agent, list: () => [agent] };
+    const runtime = new BridgeRuntime(store, registry, {
+      pollMs: 20,
+      storageDir,
+      manager: managerInstance,
+      workflowStore,
+    });
+    runtime.start();
+
+    try {
+      const payload = JSON.stringify({
+        task: "实现搜索",
+        planMarkdown: "<proposed_plan>\n改 a.txt\n</proposed_plan>",
+        assumptions: [],
+      });
+      const dispatch = await runCli(
+        ["dispatch", "--cwd", cwd, "--codex-thread", codexThreadId, "--stdin", "--json"],
+        payload,
+        dshHome,
+      );
+      assert.equal(dispatch.code, 0, dispatch.stderr);
+      const dispatched = JSON.parse(dispatch.stdout) as { requestId: string };
+      await waitFor(async () => (await workflowStore.byBridgeRequest(dispatched.requestId)) !== undefined);
+      const workflow = (await workflowStore.byBridgeRequest(dispatched.requestId))!;
+
+      // codex_workflow_submit must return promptly (< 5s) while the Reviewer
+      // turn is still running in the background.
+      const started = Date.now();
+      const submitted = await managerInstance.submit(workflow.id, {
+        implementationSummary: "done",
+        changedFiles: ["a.txt"],
+        testResults: "pass",
+      }, {
+        agent,
+        signal: new AbortController().signal,
+        deferContext: () => undefined,
+      } as never);
+      const submitMs = Date.now() - started;
+      assert.ok(submitMs < 5_000, `submit must return in under 5s, took ${submitMs}ms`);
+      assert.ok(["queued", "sending", "retrying"].includes(submitted.submissionState ?? ""), String(submitted.submissionState));
+
+      // The DSH turn "ends" right here (the exact handler the plugin runs on
+      // agent/turn-stopping). It must only steer — never abort the Reviewer or
+      // stop the callback/controller.
+      await managerInstance.onTurnStopping(agent, 1);
+
+      // The Reviewer keeps running to completion despite submit returning and
+      // the turn-stopping handler firing.
+      await waitFor(async () => (await workflowStore.load(workflow.id))?.submissionState === "delivered", 15_000);
+      const final = (await workflowStore.load(workflow.id))!;
+      assert.equal(final.phase, "passed");
+      assert.equal(final.submissionState, "delivered");
+
+      // Nothing ever interrupted the Reviewer: no turn/interrupt was issued by
+      // tool-return or turn-end, and the one durable Reviewer was released once.
+      assert.ok(!(await exists(interruptFile)), "no turn was interrupted by tool-return or turn-end");
+      const calls = (await readFile(callsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { method: string; params: Record<string, any> });
+      assert.ok(!calls.some((call) => call.method === "turn/interrupt"), "no turn/interrupt was issued");
+      assert.equal(calls.filter((call) => call.method === "thread/start").length, 1, "one durable Reviewer was created");
+      assert.equal(calls.filter((call) => call.method === "thread/unsubscribe").length, 1, "the Reviewer thread was released once after completion");
+      void followups;
+    } finally {
+      await runtime.stop();
+      await managerInstance.stop();
+      await codex.stop();
+    }
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /** Manual/compat success: without an automatic staged expected command, a
  * manual `respond` is the legitimate path. The workflow is left in

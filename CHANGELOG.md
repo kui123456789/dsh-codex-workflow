@@ -2,6 +2,34 @@
 
 All notable changes to `dsh-codex-workflow`.
 
+## [1.0.6] - 2026-08-19
+
+### Changed
+
+- **Final-verdict semantics**: an agent message is only accepted as the verdict after a SUCCESSFUL `turn/completed` for that exact thread/turn. Every message streamed during the turn is treated as provisional, and when a finished turn contains several JSON messages only the LAST completed assistant output wins — a "provisional pass then changes_requested" sequence can never be applied early. Interrupted/failed/cancelled turns never produce a verdict.
+- **Silent, non-collaborative Reviewer**: every Reviewer turn (first review and resumed re-review) is pinned to the App Server "default" (non-collaborative) collaboration mode and receives protocol-level `developer_instructions` (plus a prompt block) requiring silent review — no commentary/progress, no sub-agent, delegation or task creation, exactly one final JSON verdict. Verified against the real app-server's `collaborationMode/list` contract.
+- **Writer-lock release**: the App Server client now supports `thread/unsubscribe` (idempotent; the persisted Reviewer is never deleted or archived). The server answers one of three statuses — `unsubscribed`, `notSubscribed` or `notLoaded` — all treated as success; the client no longer misclassifies `notLoaded` as `unsubscribed`. After every review cycle — pass, changes_requested, terminal error, or interrupt/cancel — the plugin releases its hold on the Reviewer thread exactly once, guarded by a per-thread active-turn refcount so concurrent reviewers are never released under each other. Source tasks are never subscribed or unsubscribed. The existing idle countdown still closes the managed App Server only when no planner/reviewer turn or request is active globally.
+- **Default Reviewer model**: when no `reviewerModel` is configured, the silent Reviewer uses the App Server's default model (`model/list` `isDefault: true`, deterministic first-non-hidden fallback) and that model's `defaultReasoningEffort` when no review effort is configured — it no longer silently picks the list-first entry.
+- `codex_workflow_status` now reports `reviewerActive: true|false` from the live Reviewer dispatcher (only a turn actually executing), so persisted-but-finished states like retry backoff or verdict delivery never read as active; `latestReview` still only ever holds an applied verdict (never provisional JSON).
+- Package and runtime version are now `1.0.6`.
+
+### Fixed
+
+- Codex Desktop no longer shows two `pass` and one `changes_requested` verdicts for one review: intermediate commentary/progress JSON is no longer surfaced, and the plugin no longer depends on the last streamed message of an unfinished turn.
+- A half-configured fresh Reviewer no longer holds a writer lock when its setup fails: `startReviewerThread` unsubscribes the thread if settings/naming fails after `thread/start`, and the callback announcer releases a newly created thread even when `onThread` ownership persistence fails.
+- `reviewerActive` reflects only a Reviewer turn that is genuinely executing (queried from the live dispatcher), so retry backoff, verdict delivery and terminal states never read as an active writer lock.
+
+### Fixed (background lifecycle)
+
+- **A DSH tool-return or `agent/turn-stopping` never aborts the Reviewer.** `codex_workflow_submit` returns promptly (<5s) while the Reviewer keeps running to completion in the background; the `agent/turn-stopping` handler only steers the executor and can never stop the callback or abort the submission controller. Covered by an end-to-end regression that also asserts no `turn/interrupt` is issued and no idle shutdown fires while a turn is active.
+- **Every non-verdict outcome now carries a distinguishable cause** instead of a generic busy: `turnResult`/dispatcher report and persist `submissionCallbackReason` (`interrupted turn`, `cancelled by user`, `lease lost (callback taken over)`, `plugin teardown`, `turn timeout`, `rate limit`, `active writer`, `callback aborted (cancel/restart)`).
+- **No stuck `sending`/`queued` states.** An interrupted/failed/timeout turn persists `retrying` with a future `submissionRetryAt` and its reason; a callback aborted before a verdict leaves a recoverable `retrying` record. The persistent recovery loop re-claims and auto-continues such submissions to their verdict (tested end-to-end).
+
+### Fixed (review persistence)
+
+- **Defensive shutdown hardening.** `CodexAppServerClient.stop()` now shuts the managed App Server down gracefully — it sends EOF on stdin and waits for the app-server to flush its rollout and exit before escalating to SIGTERM/SIGKILL. This lowers the risk of an abrupt shutdown racing the app-server's final rollout write after `turn/completed` (an abrupt TerminateProcess on Windows could in principle cut an in-flight write and leave a completed turn short of its final message). The root cause has not been isolated: in the real compare experiment both the kill sequence and the stdin-EOF sequence read the completed turn back with its final message intact. Explicit cancel/teardown still interrupt active turns first; when the client is idle there is no active turn, so EOF is never sent to abort a live review. `thread/unsubscribe` remains but is no longer relied on as the only writer-lock release.
+- **Real persistence acceptance**: `pnpm run lifecycle:accept` runs a genuine two-round review against the real Codex App Server — create a durable Reviewer, complete a structured-verdict turn, unsubscribe, close the client, then a FRESH App Server `thread/read(includeTurns:true)` verifies the tested sequence persisted the turn as `completed` with the final assistant JSON, then resume the SAME Reviewer for a second completed turn and re-verify persistence. This is a regression against the tested sequence, not a proof of a root cause. The fake-server unit tests cannot substitute for this acceptance. The client gains a public `readThread(threadId, includeTurns)` diagnostic.
+
 ## [1.0.5] - 2026-08-19
 
 ### Changed

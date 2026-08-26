@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Release check for dsh-codex-workflow 1.0.5.
+// Release check for dsh-codex-workflow 1.0.6.
 //
 // A repeatable, OFFLINE gate (no Codex login, no real DSH_HOME):
 //   1. verify      : typecheck + full test suite + build

@@ -165,6 +165,11 @@ export interface WorkflowRecord {
   submissionState?: SubmissionState;
   submissionAttempts?: number;
   submissionError?: string;
+  /** Machine-readable reason for the last non-verdict callback outcome
+   * (interrupted turn, turn timeout, rate limit, active writer, teardown/cancel
+   * abort, lease loss, ...). Persisted so a stuck submission is diagnosable
+   * and the persistent recovery loop can classify it instead of guessing. */
+  submissionCallbackReason?: string;
   /** Earliest wall-clock time at which the persistent callback recovery loop
    * may start another bounded retry round after the Codex task was busy. */
   submissionRetryAt?: number;
@@ -242,6 +247,10 @@ export interface TurnCompleteResult {
   status: "completed" | "interrupted" | "failed";
   text: string;
   error?: string;
+  /** Why the turn ended the way it did, when it did not complete normally:
+   * `interrupted` (some actor interrupted it), `failed`, or `timed_out` (our
+   * own waitForTurn timeout, never a verdict). `completed` turns never set it. */
+  reason?: string;
 }
 
 export interface TurnNeedsInputResult {

@@ -275,6 +275,69 @@ test("starts a detached review and normalizes its result", async () => {
   }
 });
 
+test("idle shutdown waits for BOTH concurrent turns; the App Server stops only after the last", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-idle-two-"));
+  const marker = join(directory, "process.txt");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 80,
+    env: { ...process.env, FAKE_CODEX_PROCESS_MARKER: marker, FAKE_CODEX_SLOW_DELAY_MS: "700" },
+  });
+  try {
+    const ta = await codex.startThread({ cwd: process.cwd(), name: "Slow reviewer" });
+    const tb = await codex.startThread({ cwd: process.cwd(), name: "Fast reviewer" });
+    const pid = Number(await readFile(marker, "utf8"));
+    // The slow turn is still running while the fast one completes.
+    const slow = codex.startTurn(ta, { prompt: "SLOW Plan it" });
+    const fast = await codex.startTurn(tb, { prompt: "Plan it" });
+    assert.equal(fast.kind, "completed");
+    // The fast review completed but the slow one is still active: the shared
+    // App Server must NOT be stopped in the meantime.
+    await sleep(250);
+    assert.equal(processAlive(pid), true, "completing one review must not stop the App Server while another runs");
+    await slow;
+    await waitForProcessExit(pid);
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("resumes a persisted Reviewer thread id after the App Server restarts", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-restart-"));
+  try {
+    const first = new CodexAppServerClient({
+      command: process.execPath,
+      args: [fixture],
+      requestTimeoutMs: 5_000,
+      idleProcessMs: 0,
+    });
+    const reviewerId = await first.startReviewerThread({ cwd: process.cwd(), name: "Durable Reviewer" });
+    await first.stop(); // the managed App Server "restarts"
+
+    const second = new CodexAppServerClient({
+      command: process.execPath,
+      args: [fixture],
+      requestTimeoutMs: 5_000,
+      idleProcessMs: 0,
+    });
+    try {
+      // Re-review resumes the EXACT persisted Reviewer id after restart.
+      await second.resumeThread(reviewerId, process.cwd());
+      const result = await second.startTurn(reviewerId, { prompt: "Plan it" });
+      assert.equal(result.kind, "completed");
+      assert.equal(await second.unsubscribeThread(reviewerId), "unsubscribed");
+      assert.equal(await second.unsubscribeThread(reviewerId), "notSubscribed");
+    } finally {
+      await second.stop();
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("uses strict Codex-compatible object schemas", () => {
   assertStrictObjectSchema(PLANNER_OUTPUT_SCHEMA);
   assertStrictObjectSchema(REVIEW_OUTPUT_SCHEMA);
@@ -356,6 +419,48 @@ test("binds planner and reviewer threads to the DSH workspace", async () => {
     assert.deepEqual(start?.params.runtimeWorkspaceRoots, [directory]);
     assert.equal(settings?.params.cwd, directory);
     assert.deepEqual(resume?.params.runtimeWorkspaceRoots, [directory]);
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("unsubscribeThread is idempotent, never deletes the thread, and distinguishes notLoaded", async () => {
+  const codex = client();
+  try {
+    const threadId = await codex.startThread({ cwd: process.cwd(), name: "Unsubscribe probe" });
+    // First release: we were the subscribed writer -> unsubscribed.
+    assert.equal(await codex.unsubscribeThread(threadId), "unsubscribed");
+    // Idempotent duplicate on a loaded-but-not-subscribed thread -> notSubscribed.
+    assert.equal(await codex.unsubscribeThread(threadId), "notSubscribed");
+    // A thread the App Server has never loaded -> notLoaded (still success, no
+    // writer hold to release), matching the real `ThreadUnsubscribeResponse`.
+    assert.equal(await codex.unsubscribeThread("00000000-0000-0000-0000-000000000000"), "notLoaded");
+    // The persisted thread is not deleted or archived: a later turn still runs.
+    const result = await codex.startTurn(threadId, { prompt: "Plan it" });
+    assert.equal(result.kind, "completed");
+  } finally {
+    await codex.stop();
+  }
+});
+
+test("stop() drains the app-server stdin gracefully and the process exits", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-graceful-stop-"));
+  const marker = join(directory, "process.txt");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    quitGraceMs: 3_000,
+    killGraceMs: 1_000,
+    env: { ...process.env, FAKE_CODEX_PROCESS_MARKER: marker },
+  });
+  try {
+    await codex.startThread({ cwd: process.cwd(), name: "Graceful stop" });
+    const pid = Number(await readFile(marker, "utf8"));
+    await codex.stop();
+    assert.equal(processAlive(pid), false, "graceful stop must let the app-server exit on stdin EOF");
   } finally {
     await codex.stop();
     await rm(directory, { recursive: true, force: true });

@@ -10,6 +10,7 @@ import {
   CodexInvalidThreadError,
   CodexNoVerdictError,
   type CodexCallbackRequest,
+  type CodexCallbackResult,
 } from "./codex-callback.js";
 import {
   newRequestId,
@@ -19,6 +20,7 @@ import {
   type SubmitVerdictCommand,
 } from "./bridge-protocol.js";
 import { collectEvidence, isGitRepository } from "./evidence.js";
+import { SILENT_REVIEW_PROMPT_BLOCK } from "./review-contract.js";
 import { PLANNER_OUTPUT_SCHEMA, REVIEW_OUTPUT_SCHEMA } from "./schemas.js";
 import { WorkflowStore } from "./store.js";
 import type {
@@ -69,15 +71,16 @@ export interface CodexCallback {
   send(
     request: CodexCallbackRequest,
     signal?: AbortSignal,
-  ): Promise<
-    | { kind: "verdict"; verdict: ReviewResult }
-    | { kind: "retryable_busy" }
-  >;
+  ): Promise<CodexCallbackResult>;
   cancel(workflowId: string): void;
   /** Cancel the exact Reviewer operation for one submission (lease-loss
    * fencing: an owner that lost its lease must cancel its own operation, never the new
    * owner's). */
   cancelSubmission(workflowId: string, submissionId: string): void;
+  /** Whether a Reviewer turn is currently running for this workflow (live
+   * execution only). Optional: when absent, status falls back to the DSH-led
+   * reviewing phase. */
+  activeReview?(workflowId: string): boolean;
   stop(): Promise<void>;
 }
 
@@ -784,7 +787,9 @@ export class WorkflowManager {
         if (sending.submissionId !== submissionId || submissionTerminal(sending.submissionState)) {
           return sending; // cancelled or re-claimed by another restarter
         }
-        let outcome: { kind: "verdict"; verdict: ReviewResult } | { kind: "retryable_busy" };
+        let outcome:
+          | { kind: "verdict"; verdict: ReviewResult }
+          | { kind: "retryable_busy"; reason?: string };
         try {
           outcome = await this.callback!.send({
             workflowId,
@@ -827,8 +832,31 @@ export class WorkflowManager {
             await this.enqueueSubmissionNotice(workflowId, submissionId, failed, signal);
             return current;
           }
-          if (signal?.aborted) throw error;
-          outcome = { kind: "retryable_busy" };
+          if (signal?.aborted || this.stopped) {
+            // A cancelled/teardown abort must never leave the submission stuck
+            // at `sending` with no backoff: persist a recoverable `retrying`
+            // state (skip only during teardown, when the store is closing — a
+            // restart reclaims the recoverable `sending` record anyway).
+            if (!this.stopped && !leaseLost) {
+              await updateCurrent((r) => {
+                r.submissionState = "retrying";
+                r.submissionError = "interrupted: callback aborted before a verdict";
+                r.submissionCallbackReason = "callback aborted (cancel/restart)";
+                r.submissionRetryAt = Date.now() + this.config.callbackRetryBaseMs;
+                r.callbackState = "retrying";
+              }).catch(() => undefined);
+            }
+            throw error;
+          }
+          const message = errorMessage(error);
+          const busyReason = /Codex turn timed out|timed out/i.test(message)
+            ? "turn timeout"
+            : /429 Too Many Requests|exceeded retry limit|rate limit/i.test(message)
+              ? "rate limit"
+              : /already in use|already has an active writer/i.test(message)
+                ? "active writer"
+                : "unknown callback failure";
+          outcome = { kind: "retryable_busy", reason: busyReason };
         }
         if (leaseLost) return current; // never write or enqueue after losing the lease
         if (outcome.kind === "verdict") {
@@ -881,7 +909,8 @@ export class WorkflowManager {
         }
         const busy = await updateCurrent((r) => {
           r.submissionState = "retrying";
-          r.submissionError = "codex thread busy or rate limited";
+          r.submissionError = `codex thread busy or rate limited${outcome.reason ? ` (${outcome.reason})` : ""}`;
+          r.submissionCallbackReason = outcome.reason ?? "busy";
           r.callbackState = "retrying";
         });
         if (busy.submissionId !== submissionId || submissionTerminal(busy.submissionState)) return busy;
@@ -890,7 +919,8 @@ export class WorkflowManager {
           const retryDelayMs = callbackRecoveryDelay(this.config.callbackRetryBaseMs, attemptsThisRound);
           await updateCurrent((r) => {
             r.submissionState = "retrying";
-            r.submissionError = `codex thread busy after ${attemptsThisRound} attempts in this round; recovery will retry`;
+            r.submissionError = `codex thread busy after ${attemptsThisRound} attempts in this round (${outcome.reason ?? "busy"}); recovery will retry`;
+            r.submissionCallbackReason = outcome.reason ?? "busy";
             r.submissionRetryAt = Date.now() + retryDelayMs;
             r.callbackState = "retrying";
           });
@@ -1288,12 +1318,20 @@ export class WorkflowManager {
     return commit.record;
   }
 
-  async status(workflowId: string | undefined, exec: ToolRunContext): Promise<WorkflowRecord> {
+  async status(workflowId: string | undefined, exec: ToolRunContext): Promise<WorkflowRecord & { reviewerActive: boolean }> {
     const agent = requireAgent(exec);
     const record = workflowId ? await this.store.load(workflowId) : await this.store.activeForSession(agent.id);
     if (!record) throw new Error(workflowId ? `unknown workflow ${workflowId}` : "no active Codex workflow for this session");
     if (record.dshSessionId !== agent.id) throw new Error("workflow belongs to another DSH session");
-    return record;
+    // Whether a Reviewer turn is currently executing. Provsional per-message
+    // JSON is never surfaced; `latestReview` only ever holds an applied verdict.
+    // A live Reviewer turn is reported by the callback dispatcher (accurate even
+    // during retry backoff / verdict delivery / terminal states); the DSH-led
+    // reviewing phase is the fallback when no dispatcher is injected.
+    const reviewerActive =
+      this.callback?.activeReview?.(record.id) === true
+      || (record.phase === "reviewing" && Boolean(record.reviewerTurnId));
+    return { ...record, reviewerActive };
   }
 
   /**
@@ -1629,7 +1667,7 @@ function reviewInstructions(record: WorkflowRecord, input: ReviewInput): string 
   const task = record.mode === "review_only"
     ? `\n\nREVIEW TASK:\n${record.task || "(no explicit task — review the current changes)"}`
     : "";
-  return `Review the current workspace read-only. Focus on correctness, regressions, security, and missing tests. Do not edit files.${plan}${task}\n\nIMPLEMENTATION SUMMARY:\n${input.implementationSummary}\n\nCHANGED FILES:\n${(input.changedFiles ?? []).join("\n") || "not supplied"}\n\nTEST RESULTS:\n${input.testResults ?? "not supplied"}`;
+  return `Review the current workspace read-only. Focus on correctness, regressions, security, and missing tests. Do not edit files. ${SILENT_REVIEW_PROMPT_BLOCK}${plan}${task}\n\nIMPLEMENTATION SUMMARY:\n${input.implementationSummary}\n\nCHANGED FILES:\n${(input.changedFiles ?? []).join("\n") || "not supplied"}\n\nTEST RESULTS:\n${input.testResults ?? "not supplied"}`;
 }
 
 function normalizeReviewPrompt(
@@ -1653,7 +1691,7 @@ function normalizeReviewPrompt(
  * the embedded evidence — but never to write/modify anything, create threads,
  * call DSH tools or the bridge CLI. */
 function callbackPrompt(record: WorkflowRecord, input: ReviewInput, evidence: ReviewEvidence): string {
-  return `You are the independent reviewer for a DSH-executed coding workflow. Review the implementation below against the original plan. Stay read-only: do not edit files, do not create replacement threads, and do not call any dsh tools.
+  return `You are the independent reviewer for a DSH-executed coding workflow. Review the implementation below against the original plan. Stay read-only: do not edit files, do not create replacement threads, and do not call any dsh tools. ${SILENT_REVIEW_PROMPT_BLOCK}
 
 WORKFLOW: ${record.id}
 SUBMISSION: ${record.submissionId ?? "(unknown)"}

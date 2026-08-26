@@ -39,7 +39,7 @@ export interface CodexCallbackOptions {
 
 export type CodexCallbackResult =
   | { kind: "verdict"; verdict: ReviewResult }
-  | { kind: "retryable_busy" };
+  | { kind: "retryable_busy"; reason: string };
 
 /** Terminal failure: the thread id does not exist and will never become
  * valid; retrying is pointless and replacing the thread is forbidden. */
@@ -215,7 +215,7 @@ export class CodexCallbackDispatcher {
         timedOut = true;
         const exitWaiter = waitExit(child);
         kill();
-        void exitWaiter.then(() => finish({ kind: "retryable_busy" }));
+        void exitWaiter.then(() => finish({ kind: "retryable_busy", reason: "callback child timed out" }));
       }, this.options.timeoutMs);
       timer.unref();
       signal?.addEventListener("abort", onAbort, { once: true });
@@ -281,7 +281,7 @@ export class CodexCallbackDispatcher {
             return;
           }
           if (BUSY_PATTERNS.some((pattern) => pattern.test(diagnostic))) {
-            finish({ kind: "retryable_busy" });
+            finish({ kind: "retryable_busy", reason: "rate limit / thread busy" });
             return;
           }
           // A signal-only exit can result from an interrupted child whose
@@ -289,7 +289,7 @@ export class CodexCallbackDispatcher {
           // nonzero exit is actionable and terminal; calling it "busy" hides
           // errors such as invalid CLI configuration or authentication.
           if (code === null) {
-            finish({ kind: "retryable_busy" });
+            finish({ kind: "retryable_busy", reason: "callback child interrupted" });
             return;
           }
           const detail = compactProcessDiagnostic(stderr || stdout);

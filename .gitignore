@@ -3,5 +3,6 @@ lib/
 coverage/
 *.tgz
 *.log
+.live-review-acceptance/
 docs/research/codex-thread-resume-feasibility-2026-08-18.md
 docs/superpowers/

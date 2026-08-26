@@ -1,6 +1,6 @@
 {
   "name": "dsh-codex-workflow",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "DeepSeek Harness plugin that uses Codex to plan and review while DSH executes.",
   "keywords": [
     "deepseek-harness",
@@ -51,6 +51,7 @@
     "verify": "pnpm typecheck && pnpm test",
     "doctor": "pnpm build && node scripts/doctor.mjs",
     "doctor:offline": "pnpm build && node scripts/doctor.mjs --offline",
+    "lifecycle:accept": "pnpm build && node scripts/lifecycle-acceptance.mjs",
     "release:check": "node scripts/release-check.mjs"
   },
   "dsh": {

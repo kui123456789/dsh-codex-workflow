@@ -160,7 +160,7 @@ async function main(): Promise<number> {
     const bridgeStore = new BridgeStore(dir, 1024 * 1024, 60_000);
     await bridgeStore.init();
     const store = new WorkflowStore(dir);
-    const callback = { send: async () => ({ kind: "retryable_busy" as const }), cancel: () => undefined, cancelSubmission: () => undefined, stop: () => Promise.resolve() };
+    const callback = { send: async () => ({ kind: "retryable_busy" as const, reason: "test" }), cancel: () => undefined, cancelSubmission: () => undefined, stop: () => Promise.resolve() };
     const manager = new WorkflowManager(store, {} as never, baseConfig as never, callback, bridgeStore);
     const count = await manager.recoverCallbacks();
     await outSink(out)({ kind: "recovered", count });

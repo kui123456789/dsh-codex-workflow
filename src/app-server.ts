@@ -3,6 +3,7 @@ import { createInterface } from "node:readline";
 import crossSpawn from "cross-spawn";
 import type { ChildProcess } from "node:child_process";
 import { CodexInvalidThreadError } from "./codex-callback.js";
+import { SILENT_REVIEW_DEVELOPER_INSTRUCTIONS } from "./review-contract.js";
 import type {
   PlannerQuestion,
   ReasoningEffort,
@@ -41,6 +42,11 @@ export interface CodexAppServerOptions {
   requestTimeoutMs: number;
   idleProcessMs: number;
   env?: NodeJS.ProcessEnv;
+  /** How long graceful shutdown waits for the app-server to flush and exit
+   * after stdin EOF before escalating; default 5000ms. */
+  quitGraceMs?: number;
+  /** How long to wait after SIGTERM/kill before SIGKILL; default 2000ms. */
+  killGraceMs?: number;
 }
 
 export interface StartThreadOptions {
@@ -55,6 +61,11 @@ export interface StartTurnOptions {
   effort?: ReasoningEffort;
   outputSchema?: JsonObject;
   planMode?: boolean;
+  /** Pin the turn to the non-collaborative "default" mode and inject the
+   * silent single-verdict developer instructions at the protocol level. Used
+   * for Reviewer turns so they emit no commentary/progress and can never start
+   * sub-tasks. Takes precedence over `planMode`. */
+  silentReview?: boolean;
   /** Called as soon as turn/start has returned the turn id, before waiting
    * for the turn to finish, so callers can persist the active turn for
    * cancellation while it is still running. */
@@ -78,6 +89,15 @@ export interface ReviewStartOptions {
   onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
 }
 
+/** A single entry of `model/list` trimmed to the fields the plugin uses to pick
+ * the default Reviewer model. */
+interface ModelSelection {
+  id: string;
+  isDefault: boolean;
+  hidden: boolean;
+  defaultReasoningEffort?: string;
+}
+
 export class CodexAppServerClient {
   private readonly events = new EventEmitter();
   private readonly pending = new Map<number, PendingRequest>();
@@ -87,6 +107,7 @@ export class CodexAppServerClient {
   private nextId = 1;
   private idleTimer?: NodeJS.Timeout;
   private turnWaiters = 0;
+  private cachedDefault?: { id: string; defaultReasoningEffort?: string };
   private stderr = "";
 
   constructor(private readonly options: CodexAppServerOptions) {}
@@ -106,11 +127,23 @@ export class CodexAppServerClient {
     this.child = undefined;
     this.turns.clear();
     if (!child || child.exitCode !== null) return;
+    // GRACEFUL shutdown: EOF on stdin gives the app-server the chance to flush
+    // its final rollout write and exit on its own before we escalate. This is
+    // defensive lifecycle hardening — an abrupt TerminateProcess
+    // (child.kill on Windows) could in principle race an in-flight write at
+    // shutdown, but the root cause has NOT been isolated (in the real compare
+    // experiment, both the kill sequence and the EOF sequence read the completed
+    // turn back with its final message intact). Where the client is idle there
+    // is no active turn/request; for teardown the dispatcher interrupts active
+    // turns first, so EOF is never sent to abort a live review.
+    try { child.stdin?.end(); } catch {
+      // stdin may already be closed by the child side.
+    }
+    if (child.exitCode !== null) return;
+    await waitExitOr(child, this.options.quitGraceMs ?? 5_000);
+    if (child.exitCode !== null) return;
     child.kill();
-    await Promise.race([
-      new Promise<void>((resolve) => child.once("exit", () => resolve())),
-      new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
-    ]);
+    await waitExitOr(child, this.options.killGraceMs ?? 2_000);
     if (child.exitCode === null) child.kill("SIGKILL");
   }
 
@@ -137,6 +170,15 @@ export class CodexAppServerClient {
     const threadId = string(thread.id, "thread/start result.thread.id");
     await this.request("thread/name/set", { threadId, name: options.name }, signal);
     return threadId;
+  }
+
+  /** Read-only metadata/rollout read of a thread (the same call used for
+   * source validation with `includeTurns: false`). With `includeTurns: true`
+   * it returns the persisted turns so persistence (turn status + final agent
+   * JSON) can be verified after the client that ran them has closed. */
+  async readThread(threadId: string, includeTurns: boolean, signal?: AbortSignal): Promise<JsonObject> {
+    const response = await this.request<JsonObject>("thread/read", { threadId, includeTurns }, signal);
+    return object(response.thread);
   }
 
   async resumeThread(threadId: string, cwd: string, signal?: AbortSignal): Promise<void> {
@@ -173,7 +215,12 @@ export class CodexAppServerClient {
   /** Create a fresh, durable, independently owned Reviewer thread that carries
    * none of the source task's history or writer state. Read-only, network
    * disabled and approval-free are enforced at thread level here and again per
-   * review turn by `startTurn`. */
+   * review turn by `startTurn`.
+   *
+   * `thread/start` already subscribes the new thread, so if any later setup
+   * step (settings update or naming) fails, the half-configured Reviewer is
+   * unsubscribed here before the error propagates — it must never be left
+   * holding a writer lock, even when `idleProcessMs` is 0. */
   async startReviewerThread(options: ReviewerStartOptions, signal?: AbortSignal): Promise<string> {
     const params: JsonObject = {
       cwd: options.cwd,
@@ -188,13 +235,21 @@ export class CodexAppServerClient {
     const response = await this.request<JsonObject>("thread/start", params, signal);
     const thread = object(response.thread);
     const threadId = string(thread.id, "thread/start result.thread.id");
-    await this.request("thread/settings/update", {
-      threadId,
-      cwd: options.cwd,
-      approvalPolicy: "never",
-      sandboxPolicy: { type: "readOnly", networkAccess: false },
-    }, signal);
-    await this.request("thread/name/set", { threadId, name: options.name }, signal);
+    try {
+      await this.request("thread/settings/update", {
+        threadId,
+        cwd: options.cwd,
+        approvalPolicy: "never",
+        sandboxPolicy: { type: "readOnly", networkAccess: false },
+      }, signal);
+      await this.request("thread/name/set", { threadId, name: options.name }, signal);
+    } catch (error) {
+      // Best-effort release of the orphaned subscription; never mask the
+      // original setup failure. No signal is passed so an aborted caller still
+      // gets the cleanup issued.
+      await this.request("thread/unsubscribe", { threadId }).catch(() => undefined);
+      throw error;
+    }
     return threadId;
   }
 
@@ -208,7 +263,10 @@ export class CodexAppServerClient {
     if (options.model) params.model = options.model;
     if (options.effort) params.effort = options.effort;
     if (options.outputSchema) params.outputSchema = options.outputSchema;
-    if (options.planMode) {
+    if (options.silentReview) {
+      const mode = await this.silentReviewMode(options.model, options.effort, signal);
+      if (mode) params.collaborationMode = mode;
+    } else if (options.planMode) {
       const mode = await this.planMode(options.model, options.effort, signal);
       if (mode) params.collaborationMode = mode;
     }
@@ -276,6 +334,28 @@ export class CodexAppServerClient {
     await this.request("turn/interrupt", { threadId, turnId }, signal);
   }
 
+  /** Tell the App Server this client no longer needs updates for a Reviewer
+   * thread, releasing the plugin's hold so Codex Desktop can edit it again.
+   * Idempotent and never deletes or archives the thread — the persisted
+   * Reviewer stays visible and a later review resumes the same thread.
+   *
+   * The server answers one of three statuses: `unsubscribed` (we were the
+   * subscribed writer and released it), `notSubscribed` (the thread is loaded
+   * but we were not its writer), or `notLoaded` (the thread is not currently
+   * loaded by the App Server, so there is no writer hold to release). All three
+   * are success outcomes for us. */
+  async unsubscribeThread(threadId: string, signal?: AbortSignal): Promise<"unsubscribed" | "notSubscribed" | "notLoaded"> {
+    // Never respawn a stopped App Server just to release a subscription: if
+    // the child is gone there is nothing loaded to unsubscribe from.
+    if (!this.child || this.child.exitCode !== null) return "notLoaded";
+    const response = await this.request<JsonObject>("thread/unsubscribe", { threadId }, signal);
+    const status = response.status;
+    if (status === "unsubscribed" || status === "notSubscribed" || status === "notLoaded") return status;
+    // Any other shape: the server accepted the release request; treat it as
+    // released rather than failing the cleanup.
+    return "unsubscribed";
+  }
+
   private async startProcess(signal?: AbortSignal): Promise<void> {
     this.stderr = "";
     const child = crossSpawn(this.options.command, this.options.args ?? ["app-server", "--stdio"], {
@@ -318,6 +398,84 @@ export class CodexAppServerClient {
         developer_instructions: null,
       },
     };
+  }
+
+  /** Pin a Reviewer turn to the non-collaborative "default" collaboration mode
+   * and inject the silent single-verdict developer instructions at the
+   * protocol level. The mode's `settings` require a concrete model id: the
+   * configured reviewer model when present, otherwise the app-server's default
+   * model. When no explicit effort is configured, the selected model's own
+   * `defaultReasoningEffort` (as reported by `model/list`) is used. */
+  private async silentReviewMode(model?: string, effort?: ReasoningEffort, signal?: AbortSignal): Promise<JsonObject | undefined> {
+    let selected: { id: string; defaultReasoningEffort?: string } | undefined;
+    if (model) {
+      selected = await this.modelSelection(model, signal);
+    } else {
+      selected = await this.defaultModel(signal);
+    }
+    if (!selected) return undefined;
+    return {
+      mode: "default",
+      settings: {
+        model: selected.id,
+        reasoning_effort: effort ?? selected.defaultReasoningEffort ?? null,
+        developer_instructions: SILENT_REVIEW_DEVELOPER_INSTRUCTIONS,
+      },
+    };
+  }
+
+  private cachedModels?: ModelSelection[];
+
+  /** Parse `model/list` into a stable selection list (cached for the life of
+   * the client; the set of models does not change mid-run). */
+  private async modelSelections(signal?: AbortSignal): Promise<ModelSelection[]> {
+    if (this.cachedModels) return this.cachedModels;
+    const response = await this.request<JsonObject>("model/list", {}, signal);
+    const data = Array.isArray(response.data) ? response.data : [];
+    const parsed: ModelSelection[] = [];
+    for (const entry of data) {
+      const value = object(entry);
+      const id = typeof value.id === "string" && value.id.length > 0 ? value.id : undefined;
+      if (!id) continue;
+      const defaultReasoningEffort = typeof value.defaultReasoningEffort === "string" && value.defaultReasoningEffort.length > 0
+        ? value.defaultReasoningEffort
+        : undefined;
+      parsed.push({
+        id,
+        isDefault: value.isDefault === true,
+        hidden: value.hidden === true,
+        ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
+      });
+    }
+    this.cachedModels = parsed;
+    return parsed;
+  }
+
+  /** Select a model entry by exact id (for a configured reviewer model that is
+   * present in `model/list`); models absent from the list still resolve with
+   * their id and no server-provided default effort. */
+  private async modelSelection(id: string, signal?: AbortSignal): Promise<{ id: string; defaultReasoningEffort?: string } | undefined> {
+    const models = await this.modelSelections(signal);
+    const match = models.find((entry) => entry.id === id);
+    return match
+      ? { id: match.id, ...(match.defaultReasoningEffort ? { defaultReasoningEffort: match.defaultReasoningEffort } : {}) }
+      : { id };
+  }
+
+  /** The app-server's default model: the entry marked `isDefault === true`.
+   * Only when the server presents no explicit default do we fall back, and then
+   * deterministically — first non-hidden model, then the first model — so the
+   * Reviewer never silently picks an arbitrary list-first entry. The selection
+   * (and its `defaultReasoningEffort`) is cached. */
+  private async defaultModel(signal?: AbortSignal): Promise<{ id: string; defaultReasoningEffort?: string } | undefined> {
+    if (this.cachedDefault) return this.cachedDefault;
+    const models = await this.modelSelections(signal);
+    const pick = models.find((entry) => entry.isDefault)
+      ?? models.find((entry) => !entry.hidden)
+      ?? models[0];
+    if (!pick) return undefined;
+    this.cachedDefault = { id: pick.id, ...(pick.defaultReasoningEffort ? { defaultReasoningEffort: pick.defaultReasoningEffort } : {}) };
+    return this.cachedDefault;
   }
 
   private async request<T = JsonObject>(method: string, params: JsonObject, signal?: AbortSignal): Promise<T> {
@@ -560,19 +718,31 @@ function turnResult(state: TurnState): TurnWaitResult | undefined {
   if (!state.completed) return undefined;
   const status = state.completed.status;
   const normalized = status === "completed" || status === "interrupted" || status === "failed" ? status : "failed";
-  const items = [...state.items, ...(Array.isArray(state.completed.items) ? state.completed.items.map(object) : [])];
-  const text = items
-    .filter((item) => item.type === "agentMessage" || item.type === "plan" || item.type === "exitedReviewMode")
-    .map((item) => typeof item.text === "string" ? item.text : typeof item.review === "string" ? item.review : "")
-    .filter(Boolean)
-    .at(-1) ?? "";
   const error = state.completed.error ? JSON.stringify(state.completed.error) : undefined;
+  // Only a SUCCESSFUL `turn/completed` for this exact turn yields a verdict
+  // candidate. Interrupted/failed/cancelled turns must never produce one, and
+  // every agent message streamed before completion is provisional. With
+  // multiple final agent messages on a completed turn the LAST assistant
+  // output wins, so a "provisional pass then changes_requested" sequence can
+  // never be applied early.
+  const completedItems = Array.isArray(state.completed.items)
+    ? state.completed.items.map(object)
+    : [];
+  const candidates = completedItems.length > 0 ? completedItems : [...state.items];
+  const text = normalized === "completed"
+    ? (candidates
+      .filter((item) => item.type === "agentMessage" || item.type === "plan" || item.type === "exitedReviewMode")
+      .map((item) => typeof item.text === "string" ? item.text : typeof item.review === "string" ? item.review : "")
+      .filter(Boolean)
+      .at(-1) ?? "")
+    : "";
   return {
     kind: "completed",
     threadId: state.threadId,
     turnId: state.turnId,
     status: normalized,
     text,
+    ...(normalized !== "completed" ? { reason: normalized === "interrupted" ? "interrupted" : "turn failed" } : {}),
     ...(error ? { error } : {}),
   };
 }
@@ -623,4 +793,13 @@ function errorMessage(error: unknown): string {
 
 function abortError(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error("operation aborted");
+}
+
+/** Wait for a child to exit or until the timeout, whichever comes first. */
+function waitExitOr(child: ChildProcess, timeoutMs: number): Promise<void> {
+  if (child.exitCode !== null) return Promise.resolve();
+  return Promise.race([
+    new Promise<void>((resolve) => child.once("exit", () => resolve())),
+    new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+  ]);
 }
