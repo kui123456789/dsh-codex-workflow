@@ -1508,7 +1508,9 @@ test("a forged dshSessionId is rejected terminally without apply/relay/attempt g
  * deletes only its own rows and never resurrects them after stop(); TTL
  * expires crashed owners; a new runtime takes over the same session id. */
 test("live session registry merges, teardown/expiry/takeover semantics", async () => {
-  const h = await harness(50, 10, 5, 400); // short session TTL (400) for expiry
+  // Keep normally heartbeating runtimes well clear of loaded CI scheduling
+  // stalls. Crash expiry is tested below with its own explicit 120 ms lease.
+  const h = await harness(50, 10, 5, 5_000);
   try {
     const coord = h.store.coordinationHandle;
     // Second runtime (same shared DB) with its own session.
