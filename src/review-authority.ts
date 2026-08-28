@@ -88,31 +88,54 @@ export const ALIGN_OUTPUT_SCHEMA = {
   required: ["aligned", "conflicts"],
 } as const;
 
-/** Parse the alignment fork's single JSON output. Invalid entries are
- * dropped; a structurally unusable output throws so the caller treats the
- * round as retryable infrastructure failure (no cycle, no latestReview). */
-export function parseAlignment(text: string): AlignmentOutcome {
+/** Parse and validate the alignment fork's single JSON output against the
+ * ReviewResult it was asked to check. Any contradiction, malformed conflict,
+ * or out-of-range index throws so the caller treats the round as retryable
+ * infrastructure failure (no cycle, no latestReview). */
+export function parseAlignment(text: string, result: ReviewResult): AlignmentOutcome {
   const value = parseJsonObject(text);
   if (typeof value.aligned !== "boolean") {
     throw new Error("invalid authority alignment result: missing aligned");
   }
+  if (!Array.isArray(value.conflicts)) {
+    throw new Error("invalid authority alignment result: conflicts must be an array");
+  }
   const conflicts: ReviewConflictEntry[] = [];
-  if (Array.isArray(value.conflicts)) {
-    for (const entry of value.conflicts) {
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-      const item = entry as Record<string, unknown>;
-      const kind = item.kind;
-      if (kind !== "finding" && kind !== "testGap") continue;
-      if (typeof item.index !== "number" || !Number.isInteger(item.index) || item.index < 0) continue;
-      if (typeof item.reason !== "string" || typeof item.violated !== "string") continue;
-      conflicts.push({
-        kind,
-        index: item.index,
-        reason: item.reason,
-        violated: item.violated,
-        highSeverityException: item.highSeverityException === true,
-      });
+  for (const entry of value.conflicts) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error("invalid authority alignment result: invalid conflict entry");
     }
+    const item = entry as Record<string, unknown>;
+    const kind = item.kind;
+    if (kind !== "finding" && kind !== "testGap") {
+      throw new Error("invalid authority alignment result: invalid conflict kind");
+    }
+    if (typeof item.index !== "number" || !Number.isInteger(item.index) || item.index < 0) {
+      throw new Error("invalid authority alignment result: invalid conflict index");
+    }
+    if (typeof item.reason !== "string" || typeof item.violated !== "string") {
+      throw new Error("invalid authority alignment result: invalid conflict details");
+    }
+    const upperBound = kind === "finding" ? result.findings.length : result.testGaps.length;
+    if (item.index >= upperBound) {
+      throw new Error(`invalid authority alignment result: ${kind} index out of range`);
+    }
+    if (item.highSeverityException !== undefined && typeof item.highSeverityException !== "boolean") {
+      throw new Error("invalid authority alignment result: invalid highSeverityException");
+    }
+    conflicts.push({
+      kind,
+      index: item.index,
+      reason: item.reason,
+      violated: item.violated,
+      highSeverityException: item.highSeverityException === true,
+    });
+  }
+  if (value.aligned && conflicts.length > 0) {
+    throw new Error("invalid authority alignment result: aligned=true cannot include conflicts");
+  }
+  if (!value.aligned && conflicts.length === 0) {
+    throw new Error("invalid authority alignment result: aligned=false requires at least one conflict");
   }
   return { aligned: value.aligned, conflicts };
 }
@@ -175,11 +198,25 @@ export function reviewReconcilePrompt(
   conflicts: ReviewConflictEntry[],
   ctx: AuthorityContext,
 ): string {
+  const conflictedFindings = new Set(conflicts.filter((entry) => entry.kind === "finding").map((entry) => entry.index));
+  const conflictedGaps = new Set(conflicts.filter((entry) => entry.kind === "testGap").map((entry) => entry.index));
   const conflictLines = conflicts.map((conflict, index) => {
     const exception = conflict.highSeverityException
       ? " (high-severity exception satisfied — may remain)"
       : "";
     return `${index + 1}. [${conflict.kind} #${conflict.index}] ${conflict.reason} (violates: ${conflict.violated})${exception}`;
+  });
+  const preservedFindings = result.findings.flatMap((finding, index) => conflictedFindings.has(index)
+    ? []
+    : [`- finding #${index}: ${JSON.stringify(finding)}`]);
+  const preservedGaps = result.testGaps.flatMap((gap, index) => conflictedGaps.has(index)
+    ? []
+    : [`- testGap #${index}: ${JSON.stringify(gap)}`]);
+  const conflictingManifest = conflicts.map((conflict) => {
+    const value = conflict.kind === "finding"
+      ? result.findings[conflict.index]
+      : result.testGaps[conflict.index];
+    return `- ${conflict.kind} #${conflict.index}: ${JSON.stringify(value)}`;
   });
   return `Your previous review conflicts with the authority hierarchy below.
 
@@ -188,19 +225,126 @@ ${AUTHORITY_HIERARCHY}
 CONFLICTING ENTRIES (drop each one from the rewritten review unless its high-severity exception is satisfied):
 ${conflictLines.join("\n") || "(none listed)"}
 
+PRESERVATION MANIFEST — NON-CONFLICTING FINDINGS (copy every field and every duplicate EXACTLY):
+${preservedFindings.join("\n") || "(none)"}
+
+PRESERVATION MANIFEST — NON-CONFLICTING TEST GAPS (copy the complete text and every duplicate EXACTLY):
+${preservedGaps.join("\n") || "(none)"}
+
+AUTHORITY-CONFLICTING SOURCE ENTRIES (only these entries may be removed or corrected as the authority decision permits):
+${conflictingManifest.join("\n") || "(none)"}
+
+The preservation manifest is binding. Copy every non-conflicting entry verbatim: do not summarize, rewrite, merge, split, omit, reorder fields, or change duplicate counts. Do not add any finding or test gap that did not exist in the previous review. A corrected conflicting finding must remain traceable to its source entry; unrelated new findings/test gaps are forbidden. The final response must be the COMPLETE four-section review, not only the corrected fragment.
+
 Rewrite the COMPLETE review as EXACTLY ONE final readable message, in the SAME language as the original task, with these four section lines, each on its own line (the Chinese equivalents 结论/问题/测试缺口/总结 followed by a colon are also accepted):
 VERDICT: pass | changes_requested
 FINDINGS: one entry per finding with severity, blocking (yes/no), title, body and the concrete file:line reference when available; write "none" when empty
 TEST GAPS: one per line, or "none"
 SUMMARY: a short readable summary
 
-Do NOT re-review the code. Keep every non-conflicting finding and test gap EXACTLY as before (severity, blocking flag, file:line). Output exactly ONE final message: the rewritten review. Nothing else.
+Do NOT re-review the code. Keep every non-conflicting finding and test gap EXACTLY as before, including severity, blocking, title, body, file, line, full gap text, and duplicate count. Output exactly ONE final message: the rewritten review. Nothing else.
 
 ORIGINAL TASK:
 ${ctx.task || "(no explicit task)"}
 
 ${ctx.planMarkdown ? `APPROVED PLAN:\n${ctx.planMarkdown}\n\n` : ""}PREVIOUS REVIEW (structured):
 ${JSON.stringify(result, null, 2)}`;
+}
+
+/** Deterministic preservation check of a reconciliation rewrite: EVERY
+ * NON-conflicting finding and test gap of the original review must survive
+ * the rewrite EXACTLY — findings by severity/blocking/title/body/file/line,
+ * test gaps by their full text. A rewrite may only drop (or downgrade) the
+ * entries the authority alignment listed as conflicts; silently losing a
+ * real, aligned review entry would ship a wrong verdict. Returns a
+ * human-readable violation description, or `undefined` when the corrected
+ * review preserves every non-conflicting entry. */
+export function reconciliationPreservationViolation(
+  original: ReviewResult,
+  conflicts: ReviewConflictEntry[],
+  corrected: ReviewResult,
+): string | undefined {
+  const conflictedFinding = new Set(conflicts.filter((c) => c.kind === "finding").map((c) => c.index));
+  const conflictedGap = new Set(conflicts.filter((c) => c.kind === "testGap").map((c) => c.index));
+  const findingMatches = (left: ReviewResult["findings"][number], right: ReviewResult["findings"][number]): boolean =>
+    left.severity === right.severity
+    && left.blocking === right.blocking
+    && left.title === right.title
+    && left.body === right.body
+    && (left.file ?? undefined) === (right.file ?? undefined)
+    && (left.line ?? undefined) === (right.line ?? undefined);
+  const findingKey = (finding: ReviewResult["findings"][number]): string => JSON.stringify([
+    finding.severity,
+    finding.blocking,
+    finding.title,
+    finding.body,
+    finding.file ?? null,
+    finding.line ?? null,
+  ]);
+  const count = <T>(values: T[], key: (value: T) => string): Map<string, number> => {
+    const result = new Map<string, number>();
+    for (const value of values) {
+      const identity = key(value);
+      result.set(identity, (result.get(identity) ?? 0) + 1);
+    }
+    return result;
+  };
+  const requiredFindings = original.findings.filter((_, index) => !conflictedFinding.has(index));
+  const requiredGaps = original.testGaps.filter((_, index) => !conflictedGap.has(index));
+  const correctedFindingCounts = count(corrected.findings, findingKey);
+  const correctedGapCounts = count(corrected.testGaps, (gap) => gap);
+  for (const finding of requiredFindings) {
+    const identity = findingKey(finding);
+    const remaining = correctedFindingCounts.get(identity) ?? 0;
+    if (remaining === 0) {
+      return `reconciliation dropped a non-conflicting finding "${finding.title}" (severity ${finding.severity}, blocking ${finding.blocking}${finding.file ? `, ${finding.file}${finding.line ? `:${finding.line}` : ""}` : ""})`;
+    }
+    correctedFindingCounts.set(identity, remaining - 1);
+  }
+  for (const gap of requiredGaps) {
+    const remaining = correctedGapCounts.get(gap) ?? 0;
+    if (remaining === 0) return `reconciliation dropped a non-conflicting test gap "${gap}"`;
+    correctedGapCounts.set(gap, remaining - 1);
+  }
+
+  const extraFindings = corrected.findings.filter((finding) => {
+    const identity = findingKey(finding);
+    const remaining = correctedFindingCounts.get(identity) ?? 0;
+    if (remaining === 0) return false;
+    correctedFindingCounts.set(identity, remaining - 1);
+    return true;
+  });
+  const extraGaps = corrected.testGaps.filter((gap) => {
+    const remaining = correctedGapCounts.get(gap) ?? 0;
+    if (remaining === 0) return false;
+    correctedGapCounts.set(gap, remaining - 1);
+    return true;
+  });
+  const sourceFindings = original.findings.filter((_, index) => conflictedFinding.has(index));
+  const sourceGaps = original.testGaps.filter((_, index) => conflictedGap.has(index));
+  if (extraFindings.length > sourceFindings.length) {
+    return `reconciliation added ${extraFindings.length - sourceFindings.length} unauthorized finding(s)`;
+  }
+  if (extraGaps.length > sourceGaps.length) {
+    return `reconciliation added ${extraGaps.length - sourceGaps.length} unauthorized test gap(s)`;
+  }
+  const unusedSourceFindings = [...sourceFindings];
+  for (const finding of extraFindings) {
+    const exact = unusedSourceFindings.findIndex((source) => findingMatches(source, finding));
+    const traceable = exact >= 0 ? exact : unusedSourceFindings.findIndex((source) =>
+      source.title === finding.title
+      && (source.file ?? undefined) === (finding.file ?? undefined)
+      && (source.line ?? undefined) === (finding.line ?? undefined));
+    if (traceable < 0) return `reconciliation added an unauthorized finding "${finding.title}"`;
+    unusedSourceFindings.splice(traceable, 1);
+  }
+  const unusedSourceGaps = [...sourceGaps];
+  for (const gap of extraGaps) {
+    const sourceIndex = unusedSourceGaps.indexOf(gap);
+    if (sourceIndex < 0) return `reconciliation added an unauthorized test gap "${gap}"`;
+    unusedSourceGaps.splice(sourceIndex, 1);
+  }
+  return undefined;
 }
 
 function parseJsonObject(text: string): Record<string, unknown> {

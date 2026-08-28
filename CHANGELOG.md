@@ -2,6 +2,16 @@
 
 All notable changes to `dsh-codex-workflow`.
 
+## [1.0.11] - 2026-08-29
+
+- Reviewer execution now uses backend `codex exec` CLI while Planner execution remains on the App Server/Desktop.
+- Visible CLI reviews and reconciliation reuse the existing workflow task without creating another Desktop task.
+- Audit completion no longer opens, refreshes, navigates, or focuses Codex Desktop.
+- Reviewer configuration now reaches every real CLI child: visible review/reconciliation pass optional `-m <model>` plus `model_reasoning_effort="<reviewerEffort>"`; ephemeral normalization/alignment reuse the model and force `low` effort.
+- Legacy records prefer `reviewerThreadId` over `codexThreadId` for CLI resume, writer release, result identity and callback persistence.
+- Reconciliation prompts include a verbatim preservation manifest, and deterministic multiset checks reject dropped/rewritten non-conflicting entries, duplicate-count drift, and unauthorized additions without applying a verdict or consuming a cycle.
+- CLI audit children are tracked through confirmed exit: same-thread resumes serialize, timeout/cancel/lease loss/teardown use SIGTERM-to-SIGKILL escalation, submission cancellation also owns ephemeral normalization/alignment children, and concurrent `stop()` calls wait for every child to close.
+
 ## [1.0.10] - Unreleased
 
 ### Added
@@ -18,6 +28,10 @@ All notable changes to `dsh-codex-workflow`.
 - **Planner contract: no invented count limits.** The planner prompt forbids strengthening "tests must cover A and B" into an exact test-COUNT restriction ("exactly two tests") unless the user explicitly limited the count, and accepts the task's own verification method (automated tests, static checks or real command verification) as formal evidence.
 - **Reviewer contract: the absolute code+test rule is gone.** The item-by-item coverage gate no longer demands BOTH an implementation AND a regression test for every explicit requirement. Verification evidence follows the method the task/plan names (automated tests, static checks, REAL COMMAND verification); missing automated tests alone are blocking only when the task/plan explicitly requires them or a concrete regression risk is demonstrated, and reviewers may no longer demand changes exceeding the task/plan's explicit file count, test count, scope, dependency limits or manual acceptance method.
 - **Turn-stopping no longer nudges fixes after a contract conflict.** `onTurnStopping` skips the "finish the fixes" steer while the record reports an unresolved review-contract conflict.
+- **Alignment output is fail-closed on semantic contradictions.** `parseAlignment` validates against the exact review it was asked to check: `aligned: true` together with conflict entries, `aligned: false` without any conflict, malformed entries and out-of-range indexes all throw, so a contradictory alignment result can never bypass reconciliation — the round stays retryable with no cycle/latestReview/fix prompt (concrete reason preserved on the bridge submission).
+- **Reconciliation must preserve every non-conflicting entry.** A deterministic preservation check (severity/blocking/title/body/file/line per finding, full text per test gap) runs on every corrected verdict: a rewrite may only drop the aligned-conflict entries; silently swallowing a real, aligned review entry is a hardened retryable failure (no cycle, no latestReview, no fix prompt), so a corrupt cross-review can never ship a wrong verdict.
+- **Authority semantic matrix is pinned by tests (M1-M5).** Contract-level assertions encode every plan-mandated judgement rule (real-command CLI verification must not be escalated into automated-test demands; static checks and real command evidence satisfy file-list/package.json style requirements; a plan-mandated regression test that is missing stays aligned/blocking; a REPRODUCIBLE high/critical defect with concrete file:line evidence crosses the plan's ordinary bounds; generic quality suggestions never do) plus flow tests for the M3 and M4 paths.
+- **Real demo-smoke lifecycle acceptance.** `pnpm lifecycle:accept` now drives a REAL Codex segment for the exact demo-smoke contract (three files, exactly two `node:test` cases, CLI verified by REAL command output): the real Planner plans it, DSH creates exactly the three planned files, npm test and both CLI invocations genuinely run, and the real Reviewer runs through the REAL review-authority alignment/reconciliation chain — the acceptance asserts the workspace still contains exactly the three files, the workflow passes, and no JSON envelope ever lands in the persisted task. The formal-DSH-reload runtime probe (pluginVersion, single desktop shell, single DSH, 127.0.0.1:3080) remains an operator-scheduled external step per the project's standing constraint that the agent never restarts DSH itself.
 
 ### Changed
 

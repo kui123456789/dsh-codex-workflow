@@ -10,8 +10,10 @@ import {
   CodexCallbackProcessError,
   CodexInvalidThreadError,
   CodexNoVerdictError,
+  type CodexCallbackRequest,
   type CodexCallbackResult,
 } from "../src/codex-callback.js";
+import type { CodexCliAuditGateway } from "../src/codex-cli-audit.js";
 import { WorkflowStore } from "../src/store.js";
 import { PLANNER_OUTPUT_SCHEMA } from "../src/schemas.js";
 import type { PersistedTurnBaseline, ReviewResult, TurnNeedsInputResult, TurnWaitResult, WorkflowConfig, WorkflowRecord } from "../src/types.js";
@@ -94,6 +96,7 @@ class FakeGateway implements CodexGateway {
   /** Every continueTurn call's answers (all questions of that round). */
   continueAnswers: Array<Record<string, string[]>> = [];
   interrupts: Array<{ threadId: string; turnId: string }> = [];
+  releasedThreads: string[] = [];
   /** Held before onStarted fires for review/start (ids known, not persisted). */
   beforeReviewOnStarted?: DeferredGate;
   /** Held after onStarted for review/start (review pending). */
@@ -115,6 +118,10 @@ class FakeGateway implements CodexGateway {
 
   async resumeThread(threadId: string): Promise<void> {
     this.resumeCalls.push(threadId);
+  }
+
+  async releaseThreadForExternal(threadId: string): Promise<void> {
+    this.releasedThreads.push(threadId);
   }
 
   /** Thread ids resumed by the manager (start/continue/review flows). */
@@ -381,21 +388,21 @@ const config: WorkflowConfig = {
   storageDir: "",
 };
 
-function manager(directory: string, gateway = new FakeGateway(), overrides: Partial<WorkflowConfig> = {}, callback?: CodexCallback, bridgeQueue?: { enqueue(command: BridgeCommand): Promise<string> }) {
-  return new WorkflowManager(new WorkflowStore(directory), gateway, { ...config, ...overrides, storageDir: directory }, callback, bridgeQueue);
+function manager(directory: string, gateway = new FakeGateway(), overrides: Partial<WorkflowConfig> = {}, callback?: CodexCallback, bridgeQueue?: { enqueue(command: BridgeCommand): Promise<string> }, audit?: CodexCliAuditGateway) {
+  return new WorkflowManager(new WorkflowStore(directory), gateway, { ...config, ...overrides, storageDir: directory }, callback, bridgeQueue, audit);
 }
 
 /** Deterministic callback double: queue results; record every resume request. */
 class FakeCallback implements CodexCallback {
   results: Array<CodexCallbackResult | Error> = [];
-  requests: Array<{ workflowId: string; submissionId: string; codexThreadId: string; cwd: string; prompt: string }> = [];
+  requests: CodexCallbackRequest[] = [];
   cancelledWorkflows: string[] = [];
   cancelledSubmissions: string[] = [];
   stopped = false;
   /** Controls what activeReview() reports (the dispatcher's live-turn signal). */
   activeReviewTurns = false;
 
-  async send(request: { workflowId: string; submissionId: string; codexThreadId: string; cwd: string; prompt: string }): Promise<CodexCallbackResult> {
+  async send(request: CodexCallbackRequest): Promise<CodexCallbackResult> {
     this.requests.push(request);
     const next = this.results.shift();
     if (next instanceof Error) throw next;
@@ -424,7 +431,7 @@ class GatedCallback extends FakeCallback {
   observedSignal?: AbortSignal;
 
   override async send(
-    request: { workflowId: string; submissionId: string; codexThreadId: string; cwd: string; prompt: string },
+    request: CodexCallbackRequest,
     signal?: AbortSignal,
   ): Promise<CodexCallbackResult> {
     this.requests.push(request);
@@ -432,6 +439,41 @@ class GatedCallback extends FakeCallback {
     await this.gate.promise;
     return { kind: "verdict", verdict: { verdict: "pass", findings: [], testGaps: [], summary: "pass" } };
   }
+}
+
+class FakeCliAudit implements CodexCliAuditGateway {
+  reviewRequests: CodexCallbackRequest[] = [];
+
+  async review(request: CodexCallbackRequest): Promise<{ kind: "verdict"; verdict: ReviewResult; visibleText: string; threadId: string }> {
+    this.reviewRequests.push(request);
+    const threadId = request.reviewerThreadId ?? request.codexThreadId;
+    await request.onThread?.(threadId);
+    return {
+      kind: "verdict",
+      verdict: { verdict: "pass", findings: [], testGaps: [], summary: "ok" },
+      visibleText: "VERDICT: pass\nFINDINGS: none\nTEST GAPS: none\nSUMMARY: ok",
+      threadId,
+    };
+  }
+
+  async normalize(): Promise<ReviewResult> {
+    return { verdict: "pass", findings: [], testGaps: [], summary: "ok" };
+  }
+
+  async align(): Promise<{ aligned: boolean; conflicts: [] }> {
+    return { aligned: true, conflicts: [] };
+  }
+
+  async reconcile(): Promise<{ visibleText: string; verdict: ReviewResult }> {
+    return {
+      visibleText: "VERDICT: pass\nFINDINGS: none\nTEST GAPS: none\nSUMMARY: ok",
+      verdict: { verdict: "pass", findings: [], testGaps: [], summary: "ok" },
+    };
+  }
+
+  cancel(): void {}
+  cancelSubmission(): void {}
+  async stop(): Promise<void> {}
 }
 
 test("runs plan, repair, and review in the original DSH session", async () => {
@@ -2553,6 +2595,32 @@ test("planned workflow with a legacy distinct reviewerThreadId keeps using that 
   }
 });
 
+test("CLI planned review releases and resumes the legacy distinct Reviewer task", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-cli-legacy-reviewer-"));
+  try {
+    const gateway = new FakeGateway();
+    const audit = new FakeCliAudit();
+    const instance = manager(directory, gateway, {}, undefined, undefined, audit);
+    const exec = fakeExec("session-cli-legacy-reviewer", directory, []);
+    const planned = await instance.start({ task: "Build it" }, exec);
+    await changedFile(directory);
+    const store = new WorkflowStore(directory);
+    await store.update(planned.id, (r) => {
+      r.reviewerThreadId = "legacy-cli-reviewer";
+      r.reviewerTurnId = "legacy-cli-turn";
+    }, { ignoreCancelled: false });
+
+    const reviewed = await instance.review(planned.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
+    assert.equal(reviewed.phase, "passed");
+    assert.deepEqual(gateway.releasedThreads, ["legacy-cli-reviewer"]);
+    assert.equal(audit.reviewRequests.length, 1);
+    assert.equal(audit.reviewRequests[0]!.codexThreadId, "legacy-cli-reviewer");
+    assert.equal((await store.load(planned.id))!.reviewerThreadId, "legacy-cli-reviewer");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
 test("cancel during the conversion fork interrupts the FORK turn and never overwrites the persisted Reviewer id", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-normalizecancel-"));
   try {
@@ -2853,6 +2921,30 @@ test("submit persists a submission, resumes the exact thread and enqueues the st
     assert.equal(verdict.submissionId, submitted.submissionId);
     assert.equal(verdict.codexThreadId, codexThreadId);
     assert.equal(verdict.verdict.verdict, "pass");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("bridge callback releases the legacy Reviewer task instead of the source task", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-submit-legacy-reviewer-"));
+  try {
+    const gateway = new FakeGateway();
+    const callback = new FakeCallback();
+    const queue = fakeBridgeQueue();
+    const instance = manager(directory, gateway, {}, callback, queue);
+    const exec = fakeExec("session-submit-legacy-reviewer", directory, []);
+    const sourceThreadId = newRequestId();
+    const bridge = await bridgeWorkflow(instance, "session-submit-legacy-reviewer", directory, sourceThreadId);
+    const store = new WorkflowStore(directory);
+    await store.update(bridge.id, (r) => { r.reviewerThreadId = "legacy-callback-reviewer"; }, { ignoreCancelled: false });
+
+    await instance.submit(bridge.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
+    await waitFor(async () => (await store.load(bridge.id))?.submissionState === "received");
+    assert.deepEqual(gateway.releasedThreads, ["legacy-callback-reviewer"]);
+    assert.equal(callback.requests[0]!.codexThreadId, sourceThreadId);
+    assert.equal(callback.requests[0]!.reviewerThreadId, "legacy-callback-reviewer");
+    assert.equal((await store.load(bridge.id))!.reviewerThreadId, "legacy-callback-reviewer");
   } finally {
     await rmClosed(directory);
   }

@@ -29,6 +29,7 @@ import {
   ALIGN_OUTPUT_SCHEMA,
   AUTHORITY_HIERARCHY,
   parseAlignment,
+  reconciliationPreservationViolation,
   reviewAlignPrompt,
   reviewReconcilePrompt,
 } from "./review-authority.js";
@@ -50,6 +51,7 @@ import type {
   WorkflowPhase,
   WorkflowRecord,
 } from "./types.js";
+import type { CodexCliAuditGateway } from "./codex-cli-audit.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -86,6 +88,8 @@ export interface CodexGateway {
     onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
   }, signal?: AbortSignal): Promise<{ threadId: string; result: TurnWaitResult }>;
   interrupt(threadId: string, turnId: string, signal?: AbortSignal): Promise<void>;
+  unsubscribeThread?(threadId: string, signal?: AbortSignal): Promise<unknown>;
+  releaseThreadForExternal?(threadId: string, signal?: AbortSignal): Promise<void>;
   /** Structured conversion of a visible reply inside an EPHEMERAL fork of the
    * given persistent thread (`thread/fork` with `ephemeral: true` + one
    * read-only `turn/start` carrying the output schema). The fork is
@@ -204,6 +208,7 @@ export class WorkflowManager {
     private readonly config: WorkflowConfig,
     private readonly callback?: CodexCallback,
     private readonly bridgeQueue?: { enqueue(command: BridgeCommand): Promise<string> },
+    private readonly audit?: CodexCliAuditGateway,
   ) {
     this.leaseTtlMs = config.leaseTtlMs ?? 60_000;
   }
@@ -621,7 +626,10 @@ export class WorkflowManager {
     record.desktopOpenAttempts = 0;
     record.desktopOpenNextAt = undefined;
     record.desktopOpenError = undefined;
-    record.desktopOpenState = this.config.openCodexDesktopOnReview === false ? "disabled" : "pending";
+    // Reviewer audits now run in the backend CLI. Never schedule a Desktop
+    // deep-link or retry after an audit; the user's current Desktop window
+    // must remain untouched. The field stays for backward-compatible status.
+    record.desktopOpenState = "disabled";
   }
 
   async commitSubmissionNoticeDelivery(
@@ -950,6 +958,9 @@ export class WorkflowManager {
           | { kind: "verdict"; verdict: ReviewResult }
           | { kind: "retryable_busy"; reason?: string };
         try {
+          const visibleThreadId = current.reviewerThreadId ?? current.codexThreadId!;
+          if (this.codex.releaseThreadForExternal) await this.codex.releaseThreadForExternal(visibleThreadId, signal);
+          else await this.codex.unsubscribeThread?.(visibleThreadId, signal);
           outcome = await this.callback!.send({
             workflowId,
             submissionId,
@@ -1064,9 +1075,11 @@ export class WorkflowManager {
           } catch (error) {
             if (leaseLost) return current;
             if (signal?.aborted || this.stopped) throw error;
-            // The authority machinery itself failed: retryable infrastructure,
-            // never a verdict, never a consumed cycle.
-            outcome = { kind: "retryable_busy", reason: "review authority alignment failed" };
+            // The authority machinery itself failed (fork/turn/parse/invalid
+            // semantics/preservation): retryable infrastructure, never a
+            // verdict, never a consumed cycle. The concrete reason is kept so
+            // a stuck submission is diagnosable.
+            outcome = { kind: "retryable_busy", reason: `review authority alignment failed: ${errorMessage(error)}` };
           }
           if (outcome.kind === "retryable_busy") {
             // fall through to the shared busy handling below (marks retrying).
@@ -1718,6 +1731,10 @@ export class WorkflowManager {
       if (evidenceCommit.suppressed) return evidenceCommit.record;
       current = evidenceCommit.record;
 
+      if (this.audit) {
+        return await this.reviewOnceViaCli(workflowId, current, input, evidence, exec, priorPhase);
+      }
+
       // The durable visible workflow task: planned workflows append reviews to
       // their original Planner task, so planning and review stay together in
       // Desktop. `review_only` has no Planner and creates one review task. Old
@@ -2018,6 +2035,87 @@ export class WorkflowManager {
     }
   }
 
+  private async reviewOnceViaCli(
+    workflowId: string,
+    seed: WorkflowRecord,
+    input: ReviewInput,
+    evidence: ReviewEvidence,
+    exec: ToolRunContext,
+    priorPhase: WorkflowPhase,
+  ): Promise<WorkflowRecord> {
+    let current = seed;
+    const reviewerModel = current.reviewerModel || this.config.reviewerModel;
+    let threadId = current.reviewerThreadId || current.plannerThreadId;
+    if (!threadId) {
+      if (!this.codex.startReviewerThread) throw new Error("review-only CLI audit requires a visible review task");
+      threadId = await this.codex.startReviewerThread({ cwd: current.cwd, name: `DSH Reviewer: ${workflowId}`, ...(reviewerModel ? { model: reviewerModel } : {}) }, exec.signal);
+      const commit = await this.store.update(workflowId, (r) => { r.reviewerThreadId = threadId!; }, { ignoreCancelled: false });
+      if (commit.suppressed) return commit.record;
+      current = commit.record;
+    } else if (current.reviewerThreadId !== threadId) {
+      // CLI audits reuse the existing planner/source task. Persist that
+      // identity just like the App Server review path so cancellation,
+      // recovery, status and bridge compatibility all report the same visible
+      // task instead of leaving reviewerThreadId undefined.
+      const commit = await this.store.update(workflowId, (r) => { r.reviewerThreadId = threadId!; }, { ignoreCancelled: false });
+      if (commit.suppressed) return commit.record;
+      current = commit.record;
+    }
+    const prompt = reviewInstructions(current, input, evidence, await isGitRepository(current.cwd));
+    if (this.codex.releaseThreadForExternal) await this.codex.releaseThreadForExternal(threadId, exec.signal);
+    else await this.codex.unsubscribeThread?.(threadId, exec.signal);
+    const review = await this.audit!.review({
+      workflowId,
+      submissionId: `review-${Date.now()}`,
+      codexThreadId: threadId,
+      cwd: current.cwd,
+      prompt,
+      task: current.task,
+      planMarkdown: current.planMarkdown,
+      ...(reviewerModel ? { model: reviewerModel } : {}),
+      effort: current.reviewerEffort ?? this.config.reviewerEffort,
+    }, exec.signal);
+    if (review.kind !== "verdict") throw new Error("CLI audit did not return a verdict");
+    current = (await this.store.load(workflowId)) ?? current;
+    if (current.phase === "cancelled") return current;
+    const displayError = reviewDisplayError(review.visibleText, current);
+    if (displayError) throw new Error(`CLI review violates the display contract: ${displayError}`);
+    let applied: ReviewResult | undefined;
+    let conflictInfo: ReviewConflictInfo | undefined;
+    const alignment = await this.alignReview(current, review.verdict, exec.signal, input);
+    if (alignment.aligned) applied = review.verdict;
+    else {
+      const reconciled = await this.reconcileReview(current, review.verdict, alignment.conflicts, exec.signal, input);
+      conflictInfo = { conflicts: alignment.conflicts, reconciled: true, resolved: reconciled.aligned, at: new Date().toISOString() };
+      if (reconciled.aligned) applied = reconciled.result;
+    }
+    if (!applied) {
+      const commit = await this.store.update(workflowId, (r) => {
+        if (r.phase !== "reviewing") return;
+        r.latestReviewConflict = conflictInfo;
+        r.reviewContractFailures = (r.reviewContractFailures ?? 0) + 1;
+        const blocked = r.reviewContractFailures >= 2;
+        r.phase = blocked ? "blocked" : priorPhase;
+        r.error = blocked ? "reviewer contract failure: unresolved CLI review authority conflict" : "review contract conflict: CLI review requires reconciliation";
+      }, { ignoreCancelled: false });
+      return commit.record;
+    }
+    let message: string | undefined;
+    const commit = await this.store.update(workflowId, (r) => {
+      r.latestReview = applied!;
+      r.reviewCycles += 1;
+      r.reviewContractFailures = 0;
+      if (conflictInfo) r.latestReviewConflict = { ...conflictInfo, resolved: true };
+      const outcome = this.computeReviewOutcome(r, applied!);
+      message = outcome.message;
+      r.noChangeReviewRounds = outcome.noChangeReviewRounds ?? r.noChangeReviewRounds;
+      r.phase = outcome.phase;
+      r.error = outcome.error;
+    }, { ignoreCancelled: false });
+    if (message) exec.deferContext(pluginMessage(message));
+    return commit.record;
+  }
+
   /** Fail-closed read-back of the turn appended to the durable Reviewer thread
    * since its pre-turn baseline: exactly one new COMPLETED persisted turn
    * must exist, otherwise — a gateway without the read-back capability, no
@@ -2051,6 +2149,26 @@ export class WorkflowManager {
     signal?: AbortSignal,
     input?: ReviewInput,
   ): Promise<AlignmentOutcome> {
+    if (this.audit) {
+      return this.audit.align({
+        result,
+        task: record.task,
+        planMarkdown: record.planMarkdown,
+        previousReview: record.latestReview,
+        fixSummary: input?.implementationSummary,
+        cwd: record.cwd,
+        workflowId: record.id,
+        submissionId: record.submissionId,
+        model: record.reviewerModel || this.config.reviewerModel,
+        prompt: reviewAlignPrompt(result, {
+          workflowId: record.id,
+          task: record.task,
+          planMarkdown: record.planMarkdown,
+          previousReview: record.latestReview,
+          fixSummary: input?.implementationSummary,
+        }),
+      }, signal);
+    }
     // The alignment fork's SOURCE is the durable workflow task: the Reviewer
     // thread when persisted (DSH-led), otherwise the bridge source task.
     const threadId = record.reviewerThreadId ?? record.codexThreadId;
@@ -2089,7 +2207,7 @@ export class WorkflowManager {
     if (normalized.status !== "completed") {
       throw new Error(normalized.reason ?? `review authority alignment turn ${normalized.status}`);
     }
-    return parseAlignment(normalized.text);
+    return parseAlignment(normalized.text, result);
   }
 
   /** 1.0.10 ONE visible reconciliation turn on the SAME durable workflow task
@@ -2110,6 +2228,31 @@ export class WorkflowManager {
     signal?: AbortSignal,
     input?: ReviewInput,
   ): Promise<{ aligned: true; result: ReviewResult } | { aligned: false }> {
+    if (this.audit) {
+      const threadId = record.reviewerThreadId ?? record.codexThreadId;
+      if (!threadId) throw new Error("review reconciliation requires the workflow review thread");
+      if (this.codex.releaseThreadForExternal) await this.codex.releaseThreadForExternal(threadId, signal);
+      else await this.codex.unsubscribeThread?.(threadId, signal);
+      const corrected = await this.audit.reconcile({
+        workflowId: record.id,
+        submissionId: record.submissionId ?? `reconcile-${Date.now()}`,
+        codexThreadId: threadId,
+        cwd: record.cwd,
+        prompt: reviewReconcilePrompt(result, conflicts, {
+          workflowId: record.id,
+          task: record.task,
+          planMarkdown: record.planMarkdown,
+        }),
+        task: record.task,
+        planMarkdown: record.planMarkdown,
+        ...(record.reviewerModel || this.config.reviewerModel ? { model: record.reviewerModel || this.config.reviewerModel } : {}),
+        effort: record.reviewerEffort ?? this.config.reviewerEffort,
+      }, signal);
+      const preservationError = reconciliationPreservationViolation(result, conflicts, corrected.verdict);
+      if (preservationError) throw new Error(`reconciled review violated entry preservation: ${preservationError}`);
+      const recheck = await this.alignReview(record, corrected.verdict, signal, input);
+      return recheck.aligned ? { aligned: true, result: corrected.verdict } : { aligned: false };
+    }
     // The reconciliation appends to the SAME durable workflow task the visible
     // review came from: the persisted Reviewer thread, or the bridge source
     // task when the thread id was never persisted.
@@ -2170,6 +2313,17 @@ export class WorkflowManager {
       throw new Error(corrected.reason ?? `review reconciliation normalization turn ${corrected.status}`);
     }
     const correctedResult = applyReviewConsistency(parseReview(corrected.text));
+    // The rewrite may ONLY drop the aligned-conflict entries: every other
+    // finding/test gap of the original review must survive EXACTLY
+    // (severity/blocking/title/body/file/line, test-gap text). A
+    // reconciliation that silently swallows a real, aligned review entry is
+    // neither a verdict nor a conflict — it is a hardened failure the caller
+    // treats as retryable infrastructure (no cycle, no latestReview, no fix
+    // prompt).
+    const preservationError = reconciliationPreservationViolation(result, conflicts, correctedResult);
+    if (preservationError) {
+      throw new Error(`reconciled review violated entry preservation: ${preservationError}`);
+    }
     const recheck = await this.alignReview(after, correctedResult, signal, input);
     return recheck.aligned ? { aligned: true, result: correctedResult } : { aligned: false };
   }

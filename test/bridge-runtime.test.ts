@@ -522,7 +522,7 @@ test("a passing verdict delivers to the original DSH session exactly once", asyn
   }
 });
 
-test("a completed verdict opens the original Codex thread once after apply", async () => {
+test("a completed verdict does not reopen Codex Desktop after CLI audit", async () => {
   const opened: string[] = [];
   const h = await harness(5, 10, 5, 60_000, 60_000, {
     open: async (threadId) => { opened.push(threadId); },
@@ -541,21 +541,21 @@ test("a completed verdict opens the original Codex thread once after apply", asy
     await h.store.enqueue(command);
     const receipt = await waitForReceipt(h.store, command.requestId);
     assert.equal(receipt.status, "delivered");
-    assert.deepEqual(opened, [bridge.codexThreadId]);
+    assert.deepEqual(opened, []);
     const record = await h.workflowStore.load(bridge.workflowId);
-    assert.equal(record?.desktopOpenState, "opened");
+    assert.equal(record?.desktopOpenState, "disabled");
     assert.equal(record?.desktopOpenSubmissionId, bridge.submissionId);
     // Replaying the exact request cannot create a second desktop open.
     await h.store.enqueue(command);
     await h.runtime.pump();
-    assert.deepEqual(opened, [bridge.codexThreadId]);
+    assert.deepEqual(opened, []);
   } finally {
     await h.runtime.stop();
     await rmClosed(h.directory);
   }
 });
 
-test("desktop-open failures stay pending and retry after the backoff deadline", async () => {
+test("desktop opener is never scheduled after a CLI audit", async () => {
   let openAttempts = 0;
   const h = await harness(5, 10, 5, 60_000, 60_000, {
     open: async () => {
@@ -576,15 +576,16 @@ test("desktop-open failures stay pending and retry after the backoff deadline", 
     await h.store.enqueue(command);
     assert.equal((await waitForReceipt(h.store, command.requestId)).status, "delivered");
     let record = await h.workflowStore.load(bridge.workflowId);
-    assert.equal(record?.desktopOpenState, "pending");
-    assert.equal(record?.desktopOpenAttempts, 1);
-    assert.match(record?.desktopOpenError ?? "", /not running/);
-    await h.workflowStore.update(bridge.workflowId, (r) => { r.desktopOpenNextAt = Date.now() - 1; });
+    assert.equal(record?.desktopOpenState, "disabled");
+    assert.equal(record?.desktopOpenAttempts, 0);
+    assert.equal(record?.desktopOpenError, undefined);
+    // The receipt is acknowledged before the originating pump's finalizer
+    // finishes. Drive the due retry until that in-flight pump has settled,
+    // rather than relying on a single explicit pump racing the poll timer.
     await h.runtime.pump();
     record = await h.workflowStore.load(bridge.workflowId);
-    assert.equal(openAttempts, 2);
-    assert.equal(record?.desktopOpenState, "opened");
-    assert.equal(record?.desktopOpenError, undefined);
+    assert.equal(openAttempts, 0);
+    assert.equal(record?.desktopOpenState, "disabled");
   } finally {
     await h.runtime.stop();
     await rmClosed(h.directory);

@@ -4,12 +4,13 @@ import type { Context } from "@deepseek-ai/cordis";
 import { writeFile, mkdir } from "node:fs/promises";
 import { registerAutoTriggerPrompt } from "./auto-trigger.js";
 import { CodexAppServerClient } from "./app-server.js";
-import { AppServerCodexCallbackDispatcher } from "./app-server-callback.js";
+import { CodexCliAuditDispatcher } from "./codex-cli-audit.js";
 import { BridgeStore } from "./bridge-store.js";
 import { BridgeRuntime } from "./bridge-runtime.js";
 import { Config as ConfigSchema, type Config as RawConfig } from "./config.js";
 import { SystemDesktopThreadOpener } from "./desktop-thread-opener.js";
 import { REVIEW_OUTPUT_SCHEMA } from "./schemas.js";
+import { ALIGN_OUTPUT_SCHEMA } from "./review-authority.js";
 import { WorkflowStore } from "./store.js";
 import { createWorkflowTools } from "./tools.js";
 import type { WorkflowConfig } from "./types.js";
@@ -29,16 +30,27 @@ export function apply(ctx: Context, raw: Config): void {
     // Keep a materialized review schema for diagnostics and compatibility with
     // the legacy CLI dispatcher; production App Server turns receive it inline.
     const schemaFile = join(config.storageDir, "bridge", "review-schema.json");
+    const alignmentSchemaFile = join(config.storageDir, "bridge", "alignment-schema.json");
     await mkdir(join(config.storageDir, "bridge"), { recursive: true });
     await writeFile(schemaFile, `${JSON.stringify(REVIEW_OUTPUT_SCHEMA)}\n`, "utf8");
+    await writeFile(alignmentSchemaFile, `${JSON.stringify(ALIGN_OUTPUT_SCHEMA)}\n`, "utf8");
     const codex = new CodexAppServerClient({
       command: config.codexCommand,
       requestTimeoutMs: config.turnTimeoutMs,
       rpcTimeoutMs: config.rpcTimeoutMs,
       idleProcessMs: config.idleProcessMs,
     });
-    const callback = new AppServerCodexCallbackDispatcher(codex);
-    const manager = new WorkflowManager(store, codex, config, callback, bridgeStore);
+    const audit = new CodexCliAuditDispatcher({
+      command: config.codexCommand,
+      reviewSchemaFile: schemaFile,
+      alignmentSchemaFile,
+      timeoutMs: config.callbackTimeoutMs,
+      // `codex exec --json` can emit substantial tool/warning JSONL before the
+      // final agent message. Keep retention bounded while allowing real review
+      // contexts to complete instead of truncating at the unit-test default.
+      maxOutputBytes: 4 * 1024 * 1024,
+    });
+    const manager = new WorkflowManager(store, codex, config, audit, bridgeStore, audit);
     const autoTriggerDisposer = registerAutoTriggerPrompt(ctx.systemPrompt, config.autoTriggerMode);
     const runtime = new BridgeRuntime(bridgeStore, ctx.agents, {
       pollMs: config.bridgePollMs,
@@ -46,7 +58,7 @@ export function apply(ctx: Context, raw: Config): void {
       manager,
       workflowStore: store,
       terminalRelayTimeoutMs: config.terminalRelayTimeoutMs,
-      openCodexDesktopOnReview: config.openCodexDesktopOnReview,
+      openCodexDesktopOnReview: false,
       desktopOpenRetryBaseMs: config.desktopOpenRetryBaseMs,
       desktopOpenRetryMaxMs: config.desktopOpenRetryMaxMs,
       desktopOpener: new SystemDesktopThreadOpener(),
@@ -69,6 +81,7 @@ export function apply(ctx: Context, raw: Config): void {
       // Manager teardown blocks new callback sends, aborts in-flight recovery
       // and its backoff, then cancels and awaits every Reviewer operation.
       await manager.stop();
+      await audit.stop();
       await codex.stop();
       bridgeStore.close();
       store.close();
@@ -111,6 +124,7 @@ function resolveConfig(raw: Config): WorkflowConfig {
 }
 
 export { CodexAppServerClient } from "./app-server.js";
+export { CodexCliAuditDispatcher } from "./codex-cli-audit.js";
 export { AppServerCodexCallbackDispatcher } from "./app-server-callback.js";
 export { BridgeRuntime } from "./bridge-runtime.js";
 export { SystemDesktopThreadOpener, codexThreadUri } from "./desktop-thread-opener.js";

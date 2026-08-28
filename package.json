@@ -1,6 +1,6 @@
 {
   "name": "dsh-codex-workflow",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "description": "DeepSeek Harness plugin that uses Codex to plan and review while DSH executes.",
   "keywords": [
     "deepseek-harness",

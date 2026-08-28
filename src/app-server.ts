@@ -596,6 +596,19 @@ export class CodexAppServerClient {
     return "unsubscribed";
   }
 
+  /** Release a visible task before an external CLI resumes it. When the
+   * client is already idle, wait for the recoverable child shutdown so its
+   * thread-store writer is fully gone before the CLI starts. */
+  async releaseThreadForExternal(threadId: string, signal?: AbortSignal): Promise<void> {
+    await this.unsubscribeThread(threadId, signal).catch(() => undefined);
+    if (this.idleStopping) await this.idleStopping.catch(() => undefined);
+    // A completed Planner/review may still leave the App Server child alive
+    // for a short window after unsubscribe. Force the recoverable idle path so
+    // the process-held thread-store writer is definitely gone before CLI
+    // resume; the next Planner operation will transparently respawn it.
+    await this.idleShutdown().catch(() => undefined);
+  }
+
   /**
    * Create an EPHEMERAL fork of a persistent thread (`thread/fork` with
    * `ephemeral: true`) and run one structured-conversion turn inside it.
