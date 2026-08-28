@@ -6,3 +6,6 @@ coverage/
 .live-review-acceptance/
 docs/research/codex-thread-resume-feasibility-2026-08-18.md
 docs/superpowers/
+
+# DSH runtime memory (volatile, never part of review evidence)
+.mnemon/

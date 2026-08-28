@@ -9,6 +9,7 @@ import type { BridgeStore, ClaimedBridgeCommand } from "./bridge-store.js";
 import { WorkflowStore } from "./store.js";
 import type { WorkflowRecord } from "./types.js";
 import { executionPrompt, formatFindings, type WorkflowManager } from "./workflow.js";
+import { SystemDesktopThreadOpener, type DesktopThreadOpener } from "./desktop-thread-opener.js";
 
 export interface AgentRegistryLike {
   get(id: string): Agent | undefined;
@@ -47,6 +48,13 @@ export interface BridgeRuntimeOptions {
    * the relay is sent — lets a test move the world (cancel the workflow,
    * change the workspace) to verify the pre-relay re-check. */
   beforeRelayHook?: () => Promise<void> | void;
+  /** Automatically open the persisted review task in Codex Desktop after the
+   * verdict has been validated and the App Server writer has been released. */
+  openCodexDesktopOnReview?: boolean;
+  /** Injectable system opener; tests provide a recording implementation. */
+  desktopOpener?: DesktopThreadOpener;
+  desktopOpenRetryBaseMs?: number;
+  desktopOpenRetryMaxMs?: number;
 }
 
 /** Thrown by the test-only `afterFollowupHook` to simulate a crash between
@@ -102,6 +110,9 @@ export class BridgeRuntime {
     retryBaseMs: number;
     maxRetryAttempts: number;
     terminalRelayTimeoutMs: number;
+    desktopOpenRetryBaseMs: number;
+    desktopOpenRetryMaxMs: number;
+    desktopOpener: DesktopThreadOpener;
   };
   /** Per-instance random claim owner: stable for this process's lifetime, so
    * queue claim generations never collide across two overlapping runtimes. */
@@ -115,6 +126,9 @@ export class BridgeRuntime {
       retryBaseMs: options.retryBaseMs ?? 1_000,
       maxRetryAttempts: options.maxRetryAttempts ?? 5,
       terminalRelayTimeoutMs: options.terminalRelayTimeoutMs ?? 60_000,
+      desktopOpenRetryBaseMs: options.desktopOpenRetryBaseMs ?? 2_000,
+      desktopOpenRetryMaxMs: options.desktopOpenRetryMaxMs ?? 60_000,
+      desktopOpener: options.desktopOpener ?? new SystemDesktopThreadOpener(),
     };
     this.claimOwner = randomUUID();
   }
@@ -124,6 +138,7 @@ export class BridgeRuntime {
     void this.store.recoverOrphans().catch(() => undefined);
     // Resume callbacks that were durably persisted but never finished.
     void this.options.manager.recoverCallbacks().catch(() => undefined);
+    void this.retryPendingDesktopOpens().catch(() => undefined);
     void this.refreshSessions(true);
     // Session heartbeat is INDEPENDENT of the pump: a long Codex callback must
     // never let this runtime's live sessions expire, and agent churn (created /
@@ -253,6 +268,7 @@ export class BridgeRuntime {
       // callbacks stay durably retrying, and every normal pump gives due work
       // another fenced recovery round without requiring a DSH restart.
       await this.options.manager.recoverCallbacks().catch(() => 0);
+      await this.retryPendingDesktopOpens();
       for (;;) {
         const claim = await this.store.claimNext(this.claimOwner, (command) => this.isClaimEligible(command));
         if (!claim) break;
@@ -617,6 +633,7 @@ export class BridgeRuntime {
         || record.appliedVerdictRequestId === command.requestId)) {
       // This verdict was already applied AND delivered (e.g. a manual respond
       // duplicating the automatic path): idempotent ack, no second relay.
+      await this.tryOpenDesktopReview(record, command, isLost);
       if (!isLost()) {
         await this.store.ack(claim, {
           requestId: claim.requestId,
@@ -692,6 +709,11 @@ export class BridgeRuntime {
     }
 
     if (isLost()) return; // the claim was taken over: never relay for the new owner
+    // The callback's finally block has already unsubscribed its App Server
+    // client by the time this verdict command exists. The final identity and
+    // evidence checks above have passed, so opening the original Codex thread
+    // is now safe and cannot block the DSH relay if the desktop is unavailable.
+    await this.tryOpenDesktopReview(record, command, isLost);
     const agent = this.agents.get(record.dshSessionId);
     if (!agent) {
       // The original DSH session is temporarily unavailable: the verdict stays
@@ -754,6 +776,114 @@ export class BridgeRuntime {
     const attempts = claim.attempts + 1;
     const delayMs = Math.min(60_000, this.options.retryBaseMs * 2 ** Math.min(attempts - 1, 6));
     await this.store.retry(claim, error, new Date(Date.now() + delayMs).toISOString());
+  }
+
+  /** Resume due desktop-open work after startup and on every normal pump. */
+  private async retryPendingDesktopOpens(): Promise<void> {
+    if (this.stopped || this.options.openCodexDesktopOnReview === false) return;
+    let records: WorkflowRecord[];
+    try {
+      records = await this.options.workflowStore.list();
+    } catch {
+      return;
+    }
+    const now = Date.now();
+    for (const record of records) {
+      if (this.stopped) return;
+      if (record.desktopOpenState !== "pending") continue;
+      if (!record.codexThreadId || !record.desktopOpenSubmissionId) continue;
+      if (record.desktopOpenNextAt !== undefined && record.desktopOpenNextAt > now) continue;
+      if (record.submissionState !== "applied" && record.submissionState !== "delivered") continue;
+      if (record.callbackState === "queued"
+        || record.callbackState === "sending"
+        || record.callbackState === "waiting_verdict"
+        || record.callbackState === "retrying") continue;
+      await this.tryOpenDesktopReview(record).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Attempt one best-effort desktop deep-link. The durable CAS claim prevents
+   * overlapping pumps/restarts from launching the same pending submission
+   * twice in normal operation. External launch failures are recorded and
+   * retried with capped exponential backoff; they never fail verdict relay.
+   */
+  private async tryOpenDesktopReview(
+    record: WorkflowRecord,
+    command?: SubmitVerdictCommand,
+    isLost: () => boolean = () => false,
+  ): Promise<void> {
+    if (this.options.openCodexDesktopOnReview === false || this.stopped || isLost()) return;
+    if (record.desktopOpenState !== "pending" || !record.codexThreadId) return;
+    const expectedIdentity = command
+      ? (command.submissionId ?? command.requestId)
+      : record.desktopOpenSubmissionId;
+    if (!expectedIdentity || record.desktopOpenSubmissionId !== expectedIdentity) return;
+    if (command && record.appliedVerdictRequestId !== command.requestId) return;
+    if (record.submissionState !== "applied" && record.submissionState !== "delivered") return;
+    if (record.callbackState === "queued"
+      || record.callbackState === "sending"
+      || record.callbackState === "waiting_verdict"
+      || record.callbackState === "retrying") return;
+    const now = Date.now();
+    if (record.desktopOpenNextAt !== undefined && record.desktopOpenNextAt > now) return;
+
+    let claimed;
+    try {
+      claimed = await this.options.workflowStore.update(record.id, (current) => {
+        if (current.desktopOpenState !== "pending" || current.codexThreadId !== record.codexThreadId) return false;
+        if (current.desktopOpenSubmissionId !== expectedIdentity) return false;
+        if (command && current.appliedVerdictRequestId !== command.requestId) return false;
+        if (current.submissionState !== "applied" && current.submissionState !== "delivered") return false;
+        if (current.callbackState === "queued"
+          || current.callbackState === "sending"
+          || current.callbackState === "waiting_verdict"
+          || current.callbackState === "retrying") return false;
+        if (current.desktopOpenNextAt !== undefined && current.desktopOpenNextAt > now) return false;
+        const attempts = (current.desktopOpenAttempts ?? 0) + 1;
+        const delay = Math.min(
+          this.options.desktopOpenRetryMaxMs,
+          this.options.desktopOpenRetryBaseMs * 2 ** Math.min(attempts - 1, 6),
+        );
+        current.desktopOpenAttempts = attempts;
+        current.desktopOpenNextAt = now + delay;
+        return true;
+      }, { ignoreCancelled: false });
+    } catch {
+      // Desktop bookkeeping is best-effort; a store/teardown race must not
+      // turn an already-applied verdict into a failed bridge delivery.
+      return;
+    }
+    if (claimed.suppressed || claimed.result !== true || isLost() || this.stopped) return;
+
+    try {
+      await this.options.desktopOpener.open(record.codexThreadId);
+      if (isLost()) return;
+      await this.options.workflowStore.update(record.id, (current) => {
+        if (current.desktopOpenState !== "pending"
+          || current.desktopOpenSubmissionId !== expectedIdentity
+          || (command && current.appliedVerdictRequestId !== command.requestId)) return;
+        current.desktopOpenState = "opened";
+        current.desktopOpenNextAt = undefined;
+        current.desktopOpenError = undefined;
+      }, { ignoreCancelled: false }).catch(() => undefined);
+    } catch (error) {
+      const message = errorMessage(error);
+      await this.options.workflowStore.update(record.id, (current) => {
+        if (current.desktopOpenState !== "pending"
+          || current.desktopOpenSubmissionId !== expectedIdentity
+          || (command && current.appliedVerdictRequestId !== command.requestId)) return;
+        current.desktopOpenError = message;
+        if (current.desktopOpenNextAt === undefined || current.desktopOpenNextAt <= Date.now()) {
+          const attempts = Math.max(1, current.desktopOpenAttempts ?? 1);
+          const delay = Math.min(
+            this.options.desktopOpenRetryMaxMs,
+            this.options.desktopOpenRetryBaseMs * 2 ** Math.min(attempts - 1, 6),
+          );
+          current.desktopOpenNextAt = Date.now() + delay;
+        }
+      }, { ignoreCancelled: false }).catch(() => undefined);
+    }
   }
 
   private startTerminalRelayGuard(agent: Agent, workflowId: string): void {

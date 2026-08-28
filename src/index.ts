@@ -2,11 +2,13 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
 import { writeFile, mkdir } from "node:fs/promises";
+import { registerAutoTriggerPrompt } from "./auto-trigger.js";
 import { CodexAppServerClient } from "./app-server.js";
 import { AppServerCodexCallbackDispatcher } from "./app-server-callback.js";
 import { BridgeStore } from "./bridge-store.js";
 import { BridgeRuntime } from "./bridge-runtime.js";
 import { Config as ConfigSchema, type Config as RawConfig } from "./config.js";
+import { SystemDesktopThreadOpener } from "./desktop-thread-opener.js";
 import { REVIEW_OUTPUT_SCHEMA } from "./schemas.js";
 import { WorkflowStore } from "./store.js";
 import { createWorkflowTools } from "./tools.js";
@@ -14,7 +16,7 @@ import type { WorkflowConfig } from "./types.js";
 import { WorkflowManager } from "./workflow.js";
 
 export const name = "dsh-codex-workflow";
-export const inject = ["tools", "agents"];
+export const inject = ["tools", "agents", "systemPrompt"];
 export const Config = ConfigSchema;
 export type Config = RawConfig;
 
@@ -32,16 +34,22 @@ export function apply(ctx: Context, raw: Config): void {
     const codex = new CodexAppServerClient({
       command: config.codexCommand,
       requestTimeoutMs: config.turnTimeoutMs,
+      rpcTimeoutMs: config.rpcTimeoutMs,
       idleProcessMs: config.idleProcessMs,
     });
     const callback = new AppServerCodexCallbackDispatcher(codex);
     const manager = new WorkflowManager(store, codex, config, callback, bridgeStore);
+    const autoTriggerDisposer = registerAutoTriggerPrompt(ctx.systemPrompt, config.autoTriggerMode);
     const runtime = new BridgeRuntime(bridgeStore, ctx.agents, {
       pollMs: config.bridgePollMs,
       storageDir: config.storageDir,
       manager,
       workflowStore: store,
       terminalRelayTimeoutMs: config.terminalRelayTimeoutMs,
+      openCodexDesktopOnReview: config.openCodexDesktopOnReview,
+      desktopOpenRetryBaseMs: config.desktopOpenRetryBaseMs,
+      desktopOpenRetryMaxMs: config.desktopOpenRetryMaxMs,
+      desktopOpener: new SystemDesktopThreadOpener(),
     });
     const disposers = createWorkflowTools(manager, config).map((tool) => ctx.tools.register(tool));
     const stopListener = ctx.on("agent/turn-stopping", async ({ agent, turn }) => {
@@ -57,6 +65,7 @@ export function apply(ctx: Context, raw: Config): void {
       createdListener();
       disposedListener();
       for (const dispose of disposers.reverse()) dispose();
+      autoTriggerDisposer();
       // Manager teardown blocks new callback sends, aborts in-flight recovery
       // and its backoff, then cancels and awaits every Reviewer operation.
       await manager.stop();
@@ -69,8 +78,10 @@ export function apply(ctx: Context, raw: Config): void {
 
 function resolveConfig(raw: Config): WorkflowConfig {
   const dshHome = process.env.DSH_HOME ? resolve(process.env.DSH_HOME) : join(homedir(), ".dsh");
+  const turnTimeoutMs = Math.max(10_000, Math.trunc(raw.turnTimeoutMs));
   return {
     codexCommand: raw.codexCommand || "codex",
+    autoTriggerMode: raw.autoTriggerMode || "complex",
     plannerModel: raw.plannerModel,
     reviewerModel: raw.reviewerModel,
     plannerEffort: raw.plannerEffort,
@@ -78,9 +89,17 @@ function resolveConfig(raw: Config): WorkflowConfig {
     maxReviewCycles: Math.max(1, Math.min(10, Math.trunc(raw.maxReviewCycles))),
     maxNoChangeReviewRounds: Math.max(1, Math.min(10, Math.trunc(raw.maxNoChangeReviewRounds))),
     reviewDiffMaxBytes: Math.max(1024, Math.min(1024 * 1024, Math.trunc(raw.reviewDiffMaxBytes))),
-    turnTimeoutMs: Math.max(10_000, Math.trunc(raw.turnTimeoutMs)),
+    turnTimeoutMs,
+    // Control RPCs (thread/start, turn/start, thread/fork, collaborationMode/
+    // list, unsubscribe, ...) get a TIGHTER independent timeout so the tool
+    // budget is provable: every serial step is bounded, and slow RPCs can
+    // never make the host pre-empt a tool before its own cleanup.
+    rpcTimeoutMs: Math.max(5_000, Math.min(turnTimeoutMs, 60_000)),
     idleProcessMs: Math.max(0, Math.trunc(raw.idleProcessMs)),
     terminalRelayTimeoutMs: Math.max(0, Math.min(10 * 60 * 1000, Math.trunc(raw.terminalRelayTimeoutMs))),
+    openCodexDesktopOnReview: raw.openCodexDesktopOnReview,
+    desktopOpenRetryBaseMs: Math.max(200, Math.min(60_000, Math.trunc(raw.desktopOpenRetryBaseMs))),
+    desktopOpenRetryMaxMs: Math.max(1_000, Math.min(60_000, Math.trunc(raw.desktopOpenRetryMaxMs))),
     storageDir: raw.storageDir ? resolve(raw.storageDir) : join(dshHome, "storages", "dsh-codex-workflow"),
     bridgePollMs: Math.max(200, Math.min(60_000, Math.trunc(raw.bridgePollMs))),
     bridgeMaxPayloadBytes: Math.max(64 * 1024, Math.min(16 * 1024 * 1024, Math.trunc(raw.bridgeMaxPayloadBytes))),
@@ -94,8 +113,11 @@ function resolveConfig(raw: Config): WorkflowConfig {
 export { CodexAppServerClient } from "./app-server.js";
 export { AppServerCodexCallbackDispatcher } from "./app-server-callback.js";
 export { BridgeRuntime } from "./bridge-runtime.js";
+export { SystemDesktopThreadOpener, codexThreadUri } from "./desktop-thread-opener.js";
+export type { DesktopThreadOpener, SpawnLike, SpawnedProcessLike } from "./desktop-thread-opener.js";
 export { collectEvidence, isGitRepository } from "./evidence.js";
 export { WorkflowStore } from "./store.js";
 export { WorkflowManager } from "./workflow.js";
 export { PLUGIN_VERSION } from "./version.js";
+export type { AutoTriggerMode } from "./auto-trigger.js";
 export type * from "./types.js";

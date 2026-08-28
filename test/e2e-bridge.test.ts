@@ -43,6 +43,7 @@ async function rmClosed(path: string): Promise<void> {
 
 const config: WorkflowConfig = {
   codexCommand: "codex",
+  autoTriggerMode: "complex",
   plannerModel: "",
   reviewerModel: "",
   plannerEffort: "high",
@@ -67,6 +68,7 @@ class NoopGateway implements CodexGateway {
   async startTurn(): Promise<never> { throw new Error("not used"); }
   async continueTurn(): Promise<never> { throw new Error("not used"); }
   async startReview(): Promise<never> { throw new Error("not used"); }
+  async normalizeInFork(): Promise<never> { throw new Error("not used"); }
   async interrupt(): Promise<void> { throw new Error("not used"); }
 }
 
@@ -114,7 +116,7 @@ async function waitFor(predicate: () => Promise<boolean> | boolean, timeoutMs = 
   }
 }
 
-test("end-to-end: CLI dispatch -> followup -> submit -> fresh Reviewer -> final followup", async () => {
+test("end-to-end: CLI dispatch -> followup -> submit -> same-task review -> final followup", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-e2e-bridge-"));
   const dshHome = join(directory, "dsh-home");
   const storageDir = join(dshHome, "storages", "dsh-codex-workflow");
@@ -138,6 +140,7 @@ test("end-to-end: CLI dispatch -> followup -> submit -> fresh Reviewer -> final 
       env: {
         ...process.env,
         FAKE_CODEX_THREAD_PARAMS_MARKER: callsFile,
+        FAKE_CODEX_PLAIN_REVIEW_MARKDOWN: "1",
         FAKE_CODEX_REVIEW_VERDICT: JSON.stringify({ verdict: "pass", findings: [], testGaps: [], summary: "通过" }),
       },
     });
@@ -175,9 +178,9 @@ test("end-to-end: CLI dispatch -> followup -> submit -> fresh Reviewer -> final 
       const workflow = (await workflowStore.byBridgeRequest(dispatched.requestId))!;
       assert.equal(workflow.origin, "codex_bridge");
 
-      // 3) DSH submits implementation; the callback validates the source
-      //    read-only (thread/read) and starts a fresh, separately owned
-      //    read-only Reviewer (thread/start), then runs a schema turn.
+      // 3) DSH submits implementation; the callback validates and resumes the
+      //    exact source Codex task, appending the readable review there. It
+      //    never creates a second visible Reviewer task.
       let submitted = await manager.submit(workflow.id, {
         implementationSummary: "实现完成",
         changedFiles: ["src/search.ts"],
@@ -193,26 +196,36 @@ test("end-to-end: CLI dispatch -> followup -> submit -> fresh Reviewer -> final 
       assert.equal(submitted.submissionState, "received", submitted.submissionError);
       assert.ok(submitted.submissionId);
       assert.ok(submitted.reviewerThreadId);
-      assert.notEqual(submitted.reviewerThreadId, codexThreadId);
+      assert.equal(submitted.reviewerThreadId, codexThreadId);
       const calls = (await readFile(callsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
         method: string;
         params: Record<string, any>;
       });
       const read = calls.find((call) => call.method === "thread/read");
-      const start = calls.find((call) => call.method === "thread/start");
-      const settings = calls.find((call) => call.method === "thread/settings/update");
-      const turn = calls.find((call) => call.method === "turn/start");
+      const starts = calls.filter((call) => call.method === "thread/start");
+      const forks = calls.filter((call) => call.method === "thread/fork");
+      const turns = calls.filter((call) => call.method === "turn/start");
       assert.equal(read?.params.threadId, codexThreadId);
       assert.equal(read?.params.includeTurns, false, "source validation must not load turns");
-      assert.ok(!calls.some((call) => call.method === "thread/fork"), "reviewers are started fresh, never forked");
-      assert.ok(!calls.some((call) => call.method === "thread/resume" && call.params.threadId === codexThreadId), "the source task is never resumed");
-      assert.equal(start?.params.cwd, cwd);
-      assert.equal(start?.params.sandbox, "read-only");
-      assert.equal(settings?.params.threadId, submitted.reviewerThreadId);
-      assert.deepEqual(settings?.params.sandboxPolicy, { type: "readOnly", networkAccess: false });
-      assert.equal(turn?.params.threadId, submitted.reviewerThreadId);
-      assert.match(turn?.params.input?.[0]?.text ?? "", /实现完成/);
-      assert.match(turn?.params.input?.[0]?.text ?? "", /SUBMISSION:/);
+      assert.ok(calls.some((call) => call.method === "thread/resume" && call.params.threadId === codexThreadId));
+      assert.equal(starts.length, 0, "review creates no second visible task");
+      // 1.0.7: the VISIBLE Reviewer turn runs on the durable Reviewer WITHOUT
+      // an outputSchema; the structured verdict is produced by ONE ephemeral
+      // fork conversion turn. 1.0.10 adds a SECOND ephemeral fork: the
+      // review-authority alignment (internal schema, defaults to aligned).
+      assert.equal(forks.length, 2, "one conversion fork + one review-authority alignment fork per review");
+      assert.equal(forks[0]?.params.threadId, submitted.reviewerThreadId);
+      assert.equal(forks[0]?.params.ephemeral, true);
+      assert.equal(turns.length, 3, "one visible turn + one conversion turn + one alignment turn");
+      const visibleTurn = turns.find((call) => !call.params.outputSchema)!;
+      const conversionTurn = turns.find((call) => call.params.outputSchema)!;
+      assert.equal(visibleTurn.params.threadId, submitted.reviewerThreadId);
+      assert.equal(visibleTurn.params.outputSchema, undefined, "the persisted Reviewer task never carries the JSON schema");
+      assert.notEqual(conversionTurn.params.threadId, submitted.reviewerThreadId, "the conversion runs on the FORK thread");
+      assert.equal(conversionTurn.params.effort, "low", "conversion effort is fixed at low");
+      assert.ok(conversionTurn.params.outputSchema?.properties?.verdict);
+      assert.match(visibleTurn.params.input?.[0]?.text ?? "", /实现完成/);
+      assert.match(visibleTurn.params.input?.[0]?.text ?? "", /SUBMISSION:/);
 
       // 4) The automatic callback enqueued the structured verdict itself and
       //    committed `received`; the staged identity is KEPT in the record.
@@ -292,6 +305,7 @@ test("codex_workflow_submit returns promptly; DSH turn-end never aborts the stil
         FAKE_CODEX_THREAD_PARAMS_MARKER: callsFile,
         FAKE_CODEX_INTERRUPT_MARKER: interruptFile,
         FAKE_CODEX_TURN_DELAY_MS: "350",
+        FAKE_CODEX_PLAIN_REVIEW_MARKDOWN: "1",
         FAKE_CODEX_REVIEW_VERDICT: JSON.stringify({ verdict: "pass", findings: [], testGaps: [], summary: "通过" }),
       },
     });
@@ -362,13 +376,122 @@ test("codex_workflow_submit returns promptly; DSH turn-end never aborts the stil
       assert.ok(!(await exists(interruptFile)), "no turn was interrupted by tool-return or turn-end");
       const calls = (await readFile(callsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { method: string; params: Record<string, any> });
       assert.ok(!calls.some((call) => call.method === "turn/interrupt"), "no turn/interrupt was issued");
-      assert.equal(calls.filter((call) => call.method === "thread/start").length, 1, "one durable Reviewer was created");
-      assert.equal(calls.filter((call) => call.method === "thread/unsubscribe").length, 1, "the Reviewer thread was released once after completion");
+      assert.equal(calls.filter((call) => call.method === "thread/start").length, 0, "no second visible Reviewer task was created");
+      assert.equal(calls.filter((call) => call.method === "thread/fork").length, 2, "one conversion fork + one review-authority alignment fork");
+      assert.equal(calls.filter((call) => call.method === "thread/unsubscribe").length, 3, "the durable Reviewer and BOTH ephemeral forks (conversion + alignment) were each released once");
       void followups;
     } finally {
       await runtime.stop();
       await managerInstance.stop();
       await codex.stop();
+    }
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+/** Defect 6: an invalid/missing background NORMALIZATION output is retryable —
+ * never a terminal submission failure/notice, zero review cycles — and a
+ * simulated restart (fresh App Server + manager) auto-continues the SAME
+ * submission to its verdict via the shared mutable verdict queue. */
+test("invalid normalization output stays retryable; restart recovery auto-continues to the verdict", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-e2e-norm-retry-"));
+  try {
+    const cwd = join(directory, "ws");
+    await mkdir(cwd, { recursive: true });
+    await writeFile(join(cwd, "a.txt"), "v1", "utf8");
+    // rmClosed knows this layout: closes the coordination stores under
+    // dsh-home/storages/... before deleting the temp tree on Windows.
+    const storageDir = join(directory, "dsh-home", "storages", "dsh-codex-workflow");
+    await mkdir(join(storageDir, "bridge"), { recursive: true });
+    const store = new BridgeStore(storageDir);
+    const workflowStore = new WorkflowStore(join(directory, "workflows"));
+    const codexThreadId = newRequestId();
+    // A SHARED mutable verdict queue consumed by BOTH fake-server processes:
+    // attempt 1 returns garbage, attempt 2 returns a valid verdict.
+    const seqFile = join(directory, "verdicts.json");
+    await writeFile(seqFile, JSON.stringify([
+      "not-json",
+      JSON.stringify({ verdict: "pass", findings: [], testGaps: [], summary: "通过" }),
+    ]));
+    const makeClient = () => new CodexAppServerClient({
+      command: process.execPath,
+      args: [fakeCodexAppServer],
+      requestTimeoutMs: 10_000,
+      idleProcessMs: 0,
+      env: {
+        ...process.env,
+        FAKE_CODEX_PLAIN_REVIEW_MARKDOWN: "1",
+        FAKE_CODEX_REVIEW_VERDICT_SEQ_FILE: seqFile,
+      },
+    });
+    const { agent } = makeAgent("session-norm-retry", cwd);
+    const manager1Codex = makeClient();
+    const manager1 = new WorkflowManager(
+      workflowStore,
+      manager1Codex,
+      { ...config, storageDir, callbackRetryBaseMs: 200 },
+      new AppServerCodexCallbackDispatcher(manager1Codex),
+      store,
+    );
+    try {
+      const record = await manager1.startExternalPlan({
+        version: 1,
+        kind: "dispatch_plan",
+        requestId: newRequestId(),
+        createdAt: new Date().toISOString(),
+        codexThreadId,
+        target: { cwd, dshSessionId: "session-norm-retry" },
+        task: "实现功能",
+        planMarkdown: "<proposed_plan>\nDo it\n</proposed_plan>",
+        assumptions: [],
+      }, agent);
+      await manager1.submit(record.id, {
+        implementationSummary: "完成",
+        changedFiles: ["a.txt"],
+        testResults: "通过",
+      }, { agent, signal: new AbortController().signal, deferContext: () => undefined } as never);
+
+      // Attempt 1: the conversion fork returned garbage -> RETRYING with the
+      // attributed cause, NOT failed, NO notice, NO cycle consumed.
+      await waitFor(async () => {
+        const r = await workflowStore.load(record.id);
+        return r?.submissionState === "retrying" && (r.submissionCallbackReason ?? "").includes("normalization output invalid");
+      });
+      let r = (await workflowStore.load(record.id))!;
+      assert.equal(r.submissionState, "retrying");
+      assert.equal(r.submissionNotice, undefined, "an invalid normalization output must never stage a terminal notice");
+      assert.equal(r.reviewCycles, 0, "no review cycle consumed by a failed normalization");
+      assert.equal(r.phase, "executing", "the DSH workflow stays intact and retryable");
+
+      // SIMULATED RESTART: the plugin + App Server close, a FRESH manager
+      // takes over and recovers the SAME submission.
+      await manager1.stop();
+      await manager1Codex.stop();
+      const manager2Codex = makeClient();
+      const manager2 = new WorkflowManager(
+        workflowStore,
+        manager2Codex,
+        { ...config, storageDir, callbackRetryBaseMs: 200 },
+        new AppServerCodexCallbackDispatcher(manager2Codex),
+        store,
+      );
+      try {
+        await waitFor(async () => ((await workflowStore.load(record.id))?.submissionRetryAt ?? 0) <= Date.now());
+        assert.equal(await manager2.recoverCallbacks(), 1);
+        await waitFor(async () => (await workflowStore.load(record.id))?.submissionState === "received");
+        r = (await workflowStore.load(record.id))!;
+        assert.equal(r.submissionState, "received");
+        assert.equal(r.submissionNotice, undefined);
+        assert.equal(r.reviewCycles, 0, "still zero until the verdict is APPLIED");
+        assert.equal(r.submissionAttempts, 2, "the restart continued the same submission");
+        assert.equal(r.stagedVerdict?.command.verdict?.verdict, "pass");
+      } finally {
+        await manager2.stop();
+        await manager2Codex.stop();
+      }
+    } finally {
+      await manager1.stop();
     }
   } finally {
     await rmClosed(directory);

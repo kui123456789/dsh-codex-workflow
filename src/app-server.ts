@@ -3,8 +3,12 @@ import { createInterface } from "node:readline";
 import crossSpawn from "cross-spawn";
 import type { ChildProcess } from "node:child_process";
 import { CodexInvalidThreadError } from "./codex-callback.js";
-import { SILENT_REVIEW_DEVELOPER_INSTRUCTIONS } from "./review-contract.js";
+import {
+  CONVERSION_DEVELOPER_INSTRUCTIONS,
+  SILENT_REVIEW_DEVELOPER_INSTRUCTIONS,
+} from "./review-contract.js";
 import type {
+  PersistedTurnBaseline,
   PlannerQuestion,
   ReasoningEffort,
   TurnNeedsInputResult,
@@ -40,6 +44,13 @@ export interface CodexAppServerOptions {
   command: string;
   args?: string[];
   requestTimeoutMs: number;
+  /** Per-control-RPC timeout (thread/start, turn/start, thread/fork,
+   * collaborationMode/list, unsubscribe, ...). Defaults to
+   * min(requestTimeoutMs, 60s). The long turn WAIT is still bounded by
+   * `requestTimeoutMs`; only the JSON-RPC round trips use this tighter bound.
+   * Tool timeout budgets count every serial control RPC against this value,
+   * so the host can never pre-empt a legitimate operation. */
+  rpcTimeoutMs?: number;
   idleProcessMs: number;
   env?: NodeJS.ProcessEnv;
   /** How long graceful shutdown waits for the app-server to flush and exit
@@ -61,11 +72,24 @@ export interface StartTurnOptions {
   effort?: ReasoningEffort;
   outputSchema?: JsonObject;
   planMode?: boolean;
+  /** Reports the EFFECTIVE model this turn actually runs with — the explicit
+   * `model` override, or the model resolved from the collaboration mode
+   * (e.g. the Plan mode's model, the server's default when the mode selects
+   * none). Callers persist it so continuation/restart and the ephemeral
+   * conversion fork reuse the SAME model instead of falling back to a
+   * different default. Fired once, before the turn starts. */
+  onModel?: (model: string) => void;
   /** Pin the turn to the non-collaborative "default" mode and inject the
-   * silent single-verdict developer instructions at the protocol level. Used
-   * for Reviewer turns so they emit no commentary/progress and can never start
-   * sub-tasks. Takes precedence over `planMode`. */
+   * silent single-message review developer instructions at the protocol level.
+   * Used for VISIBLE Reviewer turns so they emit no commentary/progress and
+   * can never start sub-tasks; the structured verdict is produced separately
+   * by an ephemeral conversion fork. Takes precedence over `planMode`. */
   silentReview?: boolean;
+  /** Structured-conversion turn (run inside an ephemeral fork): pinned to the
+   * non-collaborative "default" mode with JSON-only conversion developer
+   * instructions, so the fork emits exactly one schema-conforming JSON object
+   * and nothing else. Takes precedence over `planMode`. */
+  conversion?: boolean;
   /** Called as soon as turn/start has returned the turn id, before waiting
    * for the turn to finish, so callers can persist the active turn for
    * cancellation while it is still running. */
@@ -76,6 +100,26 @@ export interface ReviewerStartOptions {
   cwd: string;
   name: string;
   model?: string;
+  /** Readable review contract + full per-round context (original task, plan,
+   * implementation summary, changed files, test results, workspace evidence)
+   * injected as the Reviewer thread's developer instructions BEFORE the first
+   * review runs. AUXILIARY channel only: a native review turn may not
+   * reliably see hidden thread-settings instructions, so verdict correctness
+   * must never depend on them — every DSH-led review turn carries the full
+   * context AND the coverage gate in the `review/start` custom target's
+   * instructions. */
+  developerInstructions?: string;
+}
+
+/** Options for an ephemeral-fork structured conversion turn. */
+export interface ForkConversionOptions {
+  /** The persistent source thread whose EPHEMERAL fork hosts the conversion. */
+  threadId: string;
+  cwd: string;
+  prompt: string;
+  model?: string;
+  outputSchema: JsonObject;
+  onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
 }
 
 export interface ReviewStartOptions {
@@ -98,12 +142,77 @@ interface ModelSelection {
   defaultReasoningEffort?: string;
 }
 
+/** Bounded wall-clock window each persisted read-back polls before declaring
+ * the appended text "missing" (roll-out lag) — well under the production turn
+ * budget, and folded into the provable tool budgets (reviewToolTimeout adds
+ * one bound per read-back). */
+export const APPENDED_READBACK_TIMEOUT_MS = 60_000;
+
+/** Snapshot view of the text-carrying appended turns since the baseline. */
+function sampleAppendedText(
+  thread: JsonObject,
+  baseline: PersistedTurnBaseline,
+): { kind: "ok"; result: { text: string; itemType?: string } } | { kind: "missing" } | { kind: "ambiguous" } {
+  const turns: JsonObject[] = Array.isArray(thread.turns) ? thread.turns.map(object) : [];
+  const baselineIds = new Set(baseline.ids);
+  const added = turns.filter((turn) => typeof turn.id === "string" && !baselineIds.has(turn.id));
+  // The appended turns that genuinely carry a final visible text; the
+  // review-mode marker turn and any text-less scaffolding are ignored.
+  const textTurns: Array<{ text: string; itemType: string }> = [];
+  for (const turn of added) {
+    const items: JsonObject[] = Array.isArray(turn.items) ? turn.items.map(object) : [];
+    const candidates = items.filter(
+      (item) => item.type === "agentMessage" || item.type === "plan" || item.type === "exitedReviewMode",
+    );
+    const finalItem = candidates.at(-1);
+    if (!finalItem) continue;
+    const text = typeof finalItem.text === "string" ? finalItem.text : typeof finalItem.review === "string" ? finalItem.review : "";
+    if (text.length === 0) continue;
+    textTurns.push({
+      text,
+      itemType: typeof finalItem.type === "string" ? finalItem.type : "agentMessage",
+    });
+  }
+  // Several text-carrying turns: unambiguous ONLY when they carry the SAME
+  // text (real review/start rolls the review out TWICE — once on the
+  // review-mode marker turn's `exitedReviewMode.review` and once on the
+  // streamed agentMessage turn). DIFFERENT texts mean a concurrent writer or
+  // a stale baseline — fail closed with `ambiguous`. Zero = not rolled out
+  // yet (lag).
+  if (textTurns.length === 0) return { kind: "missing" };
+  if (textTurns.length > 1) {
+    const normalized = (value: string) => value.trim().replace(/\s+/g, " ");
+    if (new Set(textTurns.map((turn) => normalized(turn.text))).size > 1) return { kind: "ambiguous" };
+  }
+  const { text, itemType } = textTurns[0]!;
+  return { kind: "ok", result: { text, ...(itemType ? { itemType } : {}) } };
+}
+
 export class CodexAppServerClient {
   private readonly events = new EventEmitter();
   private readonly pending = new Map<number, PendingRequest>();
   private readonly turns = new Map<string, TurnState>();
+  /** Registered turn-waiter rejection callbacks so `stop()` (and an unexpected
+   * process exit) can settle every in-flight waitForTurn immediately instead
+   * of leaving them to time out against a closed process/store. */
+  private readonly turnWaitersList = new Set<(error: Error) => void>();
   private child?: ChildProcess;
   private starting?: Promise<void>;
+  /** Teardown latch: once `stop()` has begun, no new `start()`/request may
+   * spawn the App Server again. Set synchronously at the START of the first
+   * stop() call so a turn-waiter settle racing teardown can never trigger a
+   * best-effort interrupt through a FRESH child. */
+  private stopped = false;
+  /** Single-flight teardown: every concurrent/repeated stop() call awaits the
+   * SAME settled promise, so "stop() returns" always means the teardown
+   * (including the old child's exit) is truly complete. */
+  private stopPromise?: Promise<void>;
+  /** Single-flight RECOVERABLE idle shutdown: closes ONLY the current idle
+   * child without latching this client — a later start()/health() respawns a
+   * fresh App Server. Distinct from `stopPromise`: the permanent teardown
+   * latch is NEVER armed by an idle shutdown, and `start()`/`stop()` wait for
+   * an in-flight idle shutdown before spawning or tearing down. */
+  private idleStopping?: Promise<void>;
   private nextId = 1;
   private idleTimer?: NodeJS.Timeout;
   private turnWaiters = 0;
@@ -113,6 +222,17 @@ export class CodexAppServerClient {
   constructor(private readonly options: CodexAppServerOptions) {}
 
   async start(signal?: AbortSignal): Promise<void> {
+    // Permanent-teardown fence: after stop() has begun this client must NEVER
+    // spawn the App Server again — a best-effort interrupt (e.g. a turn-waiter
+    // settle racing stop) or a late caller must fail loudly instead of
+    // restarting.
+    if (this.stopped) throw new Error("Codex app-server stopped");
+    // An IDLE shutdown is RECOVERABLE but the old child is already detaching:
+    // a racing spawn would write into a dying pipe, so WAIT for the old
+    // child's exit to complete before deciding. The await is also a yield
+    // point where a final stop() may latch — re-check the fence afterwards.
+    if (this.idleStopping) await this.idleStopping;
+    if (this.stopped) throw new Error("Codex app-server stopped");
     if (this.child && this.child.exitCode === null) return;
     if (this.starting) return this.starting;
     this.starting = this.startProcess(signal).finally(() => {
@@ -121,11 +241,45 @@ export class CodexAppServerClient {
     return this.starting;
   }
 
-  async stop(): Promise<void> {
+  /** NOT async on purpose: callers must receive the EXACT same promise object
+   * for concurrent/repeated calls (an async wrapper would mint a new promise
+   * on every call and break single-flight identity). The PERMANENT teardown:
+   * the FIRST call wins, sets `stopped` immediately (no restarts from here on)
+   * and becomes the ONE teardown every concurrent and repeated stop() awaits.
+   * A second caller can never return before the first has finished (old child
+   * exited), and repeated calls after completion stay idempotent. This is the
+   * FINAL, non-recoverable shutdown — the idle path uses `idleShutdown()`
+   * instead, which closes the child without arming this latch. */
+  stop(): Promise<void> {
+    // Single-flight + latch: the FIRST call wins, sets `stopped` immediately
+    // (no restarts from here on) and becomes the ONE teardown every
+    // concurrent and repeated stop() awaits. A second caller can never return
+    // before the first has finished (old child exited), and repeated calls
+    // after completion stay idempotent.
+    if (this.stopPromise) return this.stopPromise;
+    this.stopped = true;
+    const task = this.doStop();
+    this.stopPromise = task;
+    return task;
+  }
+
+  private async doStop(): Promise<void> {
     this.clearIdleTimer();
+    // A RECOVERABLE idle shutdown may be closing the current child right now:
+    // the permanent teardown must WAIT for that close to complete (the idle
+    // path already detached the child, so no double-close happens) and then
+    // finish the permanent teardown itself. No new child can be spawned in
+    // the meantime: `stopped` latched synchronously when stop() began.
+    if (this.idleStopping) await this.idleStopping;
     const child = this.child;
     this.child = undefined;
     this.turns.clear();
+    // Every pending RPC and every active turn waiter must settle NOW: after
+    // stop() returns, a late waitForTurn/request resolution could race the
+    // closed stores. (The manager interrupts and awaits foreground turns
+    // before stopping; this is the defensive fence for anything left.)
+    this.rejectPending(new Error("Codex app-server stopped"));
+    this.rejectTurnWaiters(new Error("Codex app-server stopped"));
     if (!child || child.exitCode !== null) return;
     // GRACEFUL shutdown: EOF on stdin gives the app-server the chance to flush
     // its final rollout write and exit on its own before we escalate. This is
@@ -192,10 +346,69 @@ export class CodexAppServerClient {
     }, signal);
   }
 
-  /** Read-only validation of the source task before a Reviewer is created.
+  /** Capture the PERSISTED-turn baseline of a durable thread BEFORE a visible
+   * review/rewrite turn starts (`thread/read` with `includeTurns: true`): the
+   * ids of the turns already in the history. The appended (newly-persisted)
+   * turn is later detected against this set, because the RPC turn id of
+   * `review/start`/`turn/start` is NOT guaranteed to equal the persisted
+   * `thread.turns[].id` (real App Server evidence: native review RPC turn ids
+   * never appear in the persisted rollout history). */
+  async captureTurnBaseline(threadId: string, signal?: AbortSignal): Promise<PersistedTurnBaseline> {
+    const thread = await this.readThread(threadId, true, signal);
+    const turns: JsonObject[] = Array.isArray(thread.turns) ? thread.turns.map(object) : [];
+    return {
+      ids: turns.flatMap((turn) => typeof turn.id === "string" && turn.id.length > 0 ? [turn.id] : []),
+    };
+  }
+
+  /** Read the PERSISTED final visible output appended to a durable thread since
+   * a {@link captureTurnBaseline} snapshot — the authoritative display text
+   * Codex Desktop actually shows, which can differ from what the
+   * streaming/`turn/completed` events aggregated in memory
+   * (`TurnWaitResult.text`). The appended turns are located by the baseline id
+   * set (never by assuming the RPC turn id equals the persisted one).
+   *
+   * Real App Server evidence for `review/start`: ONE review produces TWO
+   * appended turns — the review-mode marker turn (idx == the RPC turn id,
+   * items `enteredReviewMode`/`exitedReviewMode`, no text) and a second turn
+   * carrying the review's final agent message (a different persisted id, and
+   * on this server its status rolls out as `interrupted` even though the text
+   * is complete). The authoritative text is therefore taken from the appended
+   * turns that actually CARRY a final visible text (agentMessage/plan/
+   * exitedReviewMode with non-empty text): exactly one such turn, or several
+   * carrying the SAME text (the review is rolled out twice — once on the
+   * marker turn's `exitedReviewMode.review`, once on the streamed
+   * agentMessage turn), is required. Because the persisted rollout can LAG the
+   * turn/completed event, the read polls within
+   * {@link APPENDED_READBACK_TIMEOUT_MS} — zero text turns still rolling out,
+   * several with DIFFERENT texts (ambiguous/concurrent writers), and a
+   * timeout with no text all return `undefined`; callers must treat those as
+   * retryable failures and NEVER compensate by falling back to the in-memory
+   * text. */
+  async readAppendedTurnText(threadId: string, baseline: PersistedTurnBaseline, signal?: AbortSignal): Promise<{ text: string; itemType?: string } | undefined> {
+    const deadline = Date.now() + APPENDED_READBACK_TIMEOUT_MS;
+    for (;;) {
+      const thread = await this.readThread(threadId, true, signal);
+      const sample = sampleAppendedText(thread, baseline);
+      if (sample.kind === "ok") return sample.result;
+      if (sample.kind === "ambiguous" || Date.now() >= deadline) return undefined;
+      await new Promise<void>((resolve) => {
+        const onAbort = () => { clearTimeout(timer); resolve(); };
+        const timer = setTimeout(() => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        }, 250);
+        timer.unref();
+        signal?.addEventListener("abort", onAbort, { once: true });
+      });
+    }
+  }
+
+  /** Read-only validation of the source task before it is resumed for review.
    * `thread/read` with `includeTurns: false` confirms the source exists without
    * resuming it and without touching its writer, so Codex Desktop may keep the
-   * source open (or be its active writer) without making the validation busy.
+   * source open (or be its active writer) without making the validation busy;
+   * the later resume may still report that writer conflict and be retried.
    * A missing source maps to a terminal `CodexInvalidThreadError`. */
   async validateSourceThread(threadId: string, signal?: AbortSignal): Promise<void> {
     let response: JsonObject;
@@ -212,15 +425,17 @@ export class CodexAppServerClient {
     if (id !== threadId) throw new CodexInvalidThreadError(`codex thread ${threadId} does not exist`);
   }
 
-  /** Create a fresh, durable, independently owned Reviewer thread that carries
-   * none of the source task's history or writer state. Read-only, network
-   * disabled and approval-free are enforced at thread level here and again per
-   * review turn by `startTurn`.
+  /** Create a fresh, durable, independently owned REVIEW-ONLY thread that
+   * carries none of the source task's history or writer state. Since 1.0.8
+   * this is used ONLY by `review_only` flows (they have no Planner/source
+   * task to reuse); planned and bridge workflows append reviews to their
+   * original task instead. Read-only, network disabled and approval-free are
+   * enforced at thread level here and again per review turn by `startTurn`.
    *
    * `thread/start` already subscribes the new thread, so if any later setup
-   * step (settings update or naming) fails, the half-configured Reviewer is
-   * unsubscribed here before the error propagates — it must never be left
-   * holding a writer lock, even when `idleProcessMs` is 0. */
+   * step (settings update or naming) fails, the half-configured review-only
+   * thread is unsubscribed here before the error propagates — it must never
+   * be left holding a writer lock, even when `idleProcessMs` is 0. */
   async startReviewerThread(options: ReviewerStartOptions, signal?: AbortSignal): Promise<string> {
     const params: JsonObject = {
       cwd: options.cwd,
@@ -241,6 +456,7 @@ export class CodexAppServerClient {
         cwd: options.cwd,
         approvalPolicy: "never",
         sandboxPolicy: { type: "readOnly", networkAccess: false },
+        ...(options.developerInstructions ? { developerInstructions: options.developerInstructions } : {}),
       }, signal);
       await this.request("thread/name/set", { threadId, name: options.name }, signal);
     } catch (error) {
@@ -251,6 +467,20 @@ export class CodexAppServerClient {
       throw error;
     }
     return threadId;
+  }
+
+  /** Refresh the readable review contract + per-round context as developer
+   * instructions on a durable Reviewer thread right BEFORE an inline review
+   * runs (DSH-led re-reviews). AUXILIARY channel only: the `review/start`
+   * custom target carries the complete per-round context and the coverage
+   * gate on every path, Git included, so verdict correctness never depends
+   * on this thread-settings refresh. */
+  async updateReviewerInstructions(threadId: string, cwd: string, instructions: string, signal?: AbortSignal): Promise<void> {
+    await this.request("thread/settings/update", {
+      threadId,
+      cwd,
+      developerInstructions: instructions,
+    }, signal);
   }
 
   async startTurn(threadId: string, options: StartTurnOptions, signal?: AbortSignal): Promise<TurnWaitResult> {
@@ -266,10 +496,20 @@ export class CodexAppServerClient {
     if (options.silentReview) {
       const mode = await this.silentReviewMode(options.model, options.effort, signal);
       if (mode) params.collaborationMode = mode;
+    } else if (options.conversion) {
+      const mode = await this.conversionMode(options.model, options.effort, signal);
+      if (mode) params.collaborationMode = mode;
     } else if (options.planMode) {
       const mode = await this.planMode(options.model, options.effort, signal);
       if (mode) params.collaborationMode = mode;
     }
+    // Report the effective model so callers can persist it and reuse it for
+    // later turns (continuation, restart, ephemeral conversion fork).
+    const collaborationMode = params.collaborationMode as { settings?: { model?: unknown } } | undefined;
+    const modeSettings = collaborationMode && typeof collaborationMode === "object" ? collaborationMode.settings : undefined;
+    const settingsModel = modeSettings && typeof modeSettings.model === "string" ? modeSettings.model : undefined;
+    const effectiveModel = options.model ?? settingsModel;
+    if (effectiveModel && options.onModel) options.onModel(effectiveModel);
     const response = await this.request<JsonObject>("turn/start", params, signal);
     const turnId = string(object(response.turn).id, "turn/start result.turn.id");
     this.state(threadId, turnId);
@@ -356,6 +596,63 @@ export class CodexAppServerClient {
     return "unsubscribed";
   }
 
+  /**
+   * Create an EPHEMERAL fork of a persistent thread (`thread/fork` with
+   * `ephemeral: true`) and run one structured-conversion turn inside it.
+   *
+   * Used to convert the human-readable visible reply of a Planner or Reviewer
+   * task into the enforced structured result WITHOUT ever writing JSON into
+   * the persisted task history Codex Desktop shows. Safety is enforced per
+   * turn by `startTurn` (read-only sandbox, `networkAccess: false`,
+   * `approvalPolicy: never`) and the fork turn pins the non-collaborative
+   * "default" mode with the JSON-only conversion developer instructions. The
+   * fork runs at `effort: "low"` and, when a model is given, reuses the SAME
+   * model as the source task.
+   *
+   * Every ending path — success, turn failure, cancellation (abort), timeout —
+   * finally unsubscribes the fork exactly once (idempotent: `unsubscribed`,
+   * `notSubscribed` and `notLoaded` are all success outcomes), so an ephemeral
+   * fork is never left loaded or holding a writer hold. The fork's id is
+   * transient: callers must never persist it into
+   * `plannerThreadId`/`reviewerThreadId`.
+   */
+  async normalizeInFork(
+    options: ForkConversionOptions,
+    signal?: AbortSignal,
+  ): Promise<TurnWaitResult> {
+    const forkThreadId = await this.forkThread(options.threadId, options.cwd, signal);
+    try {
+      return await this.startTurn(forkThreadId, {
+        prompt: options.prompt,
+        ...(options.model ? { model: options.model } : {}),
+        effort: "low",
+        outputSchema: options.outputSchema,
+        conversion: true,
+        onStarted: options.onStarted,
+      }, signal);
+    } finally {
+      // All endings: success, failure, cancel, timeout — release the fork.
+      for (const key of [...this.turns.keys()]) {
+        if (key.startsWith(`${forkThreadId}:`)) this.turns.delete(key);
+      }
+      await this.unsubscribeThread(forkThreadId).catch(() => undefined);
+    }
+  }
+
+  /** Fork an existing thread with `ephemeral: true` (Codex's `thread/fork`).
+   * The fork is exclusively ours and subscribed; it must be unsubscribed by
+   * the caller (or by `normalizeInFork`'s finally) so it is not left loaded. */
+  async forkThread(threadId: string, cwd: string, signal?: AbortSignal): Promise<string> {
+    const response = await this.request<JsonObject>("thread/fork", {
+      threadId,
+      cwd,
+      runtimeWorkspaceRoots: [cwd],
+      ephemeral: true,
+    }, signal);
+    const thread = object(response.thread);
+    return string(thread.id, "thread/fork result.thread.id");
+  }
+
   private async startProcess(signal?: AbortSignal): Promise<void> {
     this.stderr = "";
     const child = crossSpawn(this.options.command, this.options.args ?? ["app-server", "--stdio"], {
@@ -388,7 +685,12 @@ export class CodexAppServerClient {
     const response = await this.request<JsonObject>("collaborationMode/list", {}, signal);
     const data = Array.isArray(response.data) ? response.data : [];
     const plan = data.map(object).find((entry) => entry.mode === "plan");
-    const selectedModel = model || (typeof plan?.model === "string" ? plan.model : "");
+    // The Plan mode's own model wins when no explicit model is given; only
+    // when the mode declares none do we pin the server's default model, so
+    // plan turns ALWAYS run with a concrete, reportable model (onModel) that
+    // the ephemeral conversion fork can reuse.
+    let selectedModel = model || (typeof plan?.model === "string" ? plan.model : "");
+    if (!selectedModel) selectedModel = (await this.defaultModel(signal))?.id ?? "";
     if (!selectedModel) return undefined;
     return {
       mode: "plan",
@@ -401,12 +703,29 @@ export class CodexAppServerClient {
   }
 
   /** Pin a Reviewer turn to the non-collaborative "default" collaboration mode
-   * and inject the silent single-verdict developer instructions at the
+   * and inject the silent single-message review developer instructions at the
    * protocol level. The mode's `settings` require a concrete model id: the
    * configured reviewer model when present, otherwise the app-server's default
    * model. When no explicit effort is configured, the selected model's own
    * `defaultReasoningEffort` (as reported by `model/list`) is used. */
   private async silentReviewMode(model?: string, effort?: ReasoningEffort, signal?: AbortSignal): Promise<JsonObject | undefined> {
+    return this.defaultModeWithInstructions(model, effort, signal, SILENT_REVIEW_DEVELOPER_INSTRUCTIONS);
+  }
+
+  /** Conversion-turn mode for ephemeral forks: non-collaborative "default"
+   * mode with the JSON-only conversion developer instructions, so the fork
+   * emits exactly one schema-conforming JSON object. Uses the source task's
+   * model when provided, otherwise the server's default model. */
+  private async conversionMode(model?: string, effort?: ReasoningEffort, signal?: AbortSignal): Promise<JsonObject | undefined> {
+    return this.defaultModeWithInstructions(model, effort, signal, CONVERSION_DEVELOPER_INSTRUCTIONS);
+  }
+
+  private async defaultModeWithInstructions(
+    model?: string,
+    effort?: ReasoningEffort,
+    signal?: AbortSignal,
+    instructions?: string,
+  ): Promise<JsonObject | undefined> {
     let selected: { id: string; defaultReasoningEffort?: string } | undefined;
     if (model) {
       selected = await this.modelSelection(model, signal);
@@ -419,7 +738,7 @@ export class CodexAppServerClient {
       settings: {
         model: selected.id,
         reasoning_effort: effort ?? selected.defaultReasoningEffort ?? null,
-        developer_instructions: SILENT_REVIEW_DEVELOPER_INSTRUCTIONS,
+        developer_instructions: instructions ?? null,
       },
     };
   }
@@ -478,6 +797,38 @@ export class CodexAppServerClient {
     return this.cachedDefault;
   }
 
+  /** Public view of the server's default model selection (isDefault entry,
+   * deterministic first-non-hidden fallback, else the first entry). Cached.
+   * Used by callers that must pass the SAME explicit model into visible turns
+   * and their ephemeral conversion forks when no model is configured. */
+  async resolveDefaultModel(signal?: AbortSignal): Promise<string | undefined> {
+    const selected = await this.defaultModel(signal);
+    return selected?.id;
+  }
+
+  /** Probe the App Server's thread directory (`thread/list`) when the protocol
+   * provides it. Returns the known thread ids, or `undefined` when the method
+   * is unsupported (older servers) so callers can skip directory assertions
+   * instead of failing on a missing capability. Any OTHER failure propagates. */
+  async listThreadIds(signal?: AbortSignal): Promise<string[] | undefined> {
+    let response: JsonObject;
+    try {
+      response = await this.request<JsonObject>("thread/list", {}, signal);
+    } catch (error) {
+      const message = errorMessage(error);
+      if (/unknown method|unsupported|not implemented|method not found/i.test(message)) return undefined;
+      throw error;
+    }
+    const entries = Array.isArray(response.data) ? response.data : Array.isArray(response.threads) ? response.threads : [];
+    const ids: string[] = [];
+    for (const entry of entries) {
+      const thread = object(entry);
+      const id = typeof thread.id === "string" && thread.id ? thread.id : undefined;
+      if (id) ids.push(id);
+    }
+    return ids;
+  }
+
   private async request<T = JsonObject>(method: string, params: JsonObject, signal?: AbortSignal): Promise<T> {
     await this.start(signal);
     return this.requestRaw<T>(method, params, signal);
@@ -492,11 +843,14 @@ export class CodexAppServerClient {
         this.scheduleIdle();
         return;
       }
+      // Control RPCs are bounded by the (tighter) rpc timeout; the long turn
+      // WAIT keeps the full requestTimeoutMs in waitForTurn.
+      const rpcTimeoutMs = this.options.rpcTimeoutMs ?? Math.max(5_000, Math.min(this.options.requestTimeoutMs, 60_000));
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`Codex request timed out: ${method}`));
         this.scheduleIdle();
-      }, this.options.requestTimeoutMs);
+      }, rpcTimeoutMs);
       const entry: PendingRequest = {
         resolve: (value) => resolve(value as T),
         reject,
@@ -538,10 +892,15 @@ export class CodexAppServerClient {
         return;
       }
       let cleaned = false;
-      const timeout = setTimeout(() => {
+      const rejectNow = (error: Error) => {
+        if (cleaned) return;
         void this.abandonTurn(threadId, turnId);
         cleanup();
-        reject(new Error(`Codex turn timed out: ${turnId}`));
+        reject(error);
+      };
+      this.turnWaitersList.add(rejectNow);
+      const timeout = setTimeout(() => {
+        rejectNow(new Error(`Codex turn timed out: ${turnId}`));
       }, this.options.requestTimeoutMs);
       const event = `turn:${key}`;
       const listener = () => {
@@ -552,9 +911,7 @@ export class CodexAppServerClient {
         resolve(result);
       };
       const onAbort = () => {
-        void this.abandonTurn(threadId, turnId);
-        cleanup();
-        reject(abortError(signal!));
+        rejectNow(abortError(signal!));
       };
       const cleanup = () => {
         if (cleaned) return;
@@ -562,6 +919,7 @@ export class CodexAppServerClient {
         clearTimeout(timeout);
         this.events.off(event, listener);
         signal?.removeEventListener("abort", onAbort);
+        this.turnWaitersList.delete(rejectNow);
         this.turnWaiters -= 1;
         this.scheduleIdle();
       };
@@ -675,6 +1033,23 @@ export class CodexAppServerClient {
       pending.reject(error);
       this.pending.delete(id);
     }
+    this.rejectTurnWaiters(error);
+  }
+
+  /** Settle every registered turn waiter with the given error (stop() and
+   * unexpected process exits). No waiter can later time out or resolve into a
+   * closed store. */
+  private rejectTurnWaiters(error: Error): void {
+    for (const rejectNow of [...this.turnWaitersList]) rejectNow(error);
+  }
+
+  private rejectPending(error: Error): void {
+    for (const [id, pending] of this.pending) {
+      clearTimeout(pending.timer);
+      if (pending.abort && pending.signal) pending.signal.removeEventListener("abort", pending.abort);
+      pending.reject(error);
+      this.pending.delete(id);
+    }
   }
 
   private clearIdleTimer(): void {
@@ -688,9 +1063,52 @@ export class CodexAppServerClient {
     if (!this.isIdle()) return;
     this.idleTimer = setTimeout(() => {
       this.idleTimer = undefined;
-      if (this.isIdle()) void this.stop();
+      // RECOVERABLE shutdown: idle closes the child but NEVER latches this
+      // client — the next start()/health() respawns a fresh App Server.
+      if (this.isIdle()) void this.idleShutdown();
     }, this.options.idleProcessMs);
     this.idleTimer.unref();
+  }
+
+  /** Recoverable idle shutdown (single-flight): gracefully closes ONLY the
+   * current idle child and cleans the per-process state. Unlike the permanent
+   * `stop()`, it NEVER sets the `stopped` latch and never occupies
+   * `stopPromise` — the very next start()/health() respawns a fresh App
+   * Server. Every concurrent caller shares the SAME in-flight promise, so a
+   * racing start() waits for the old child's full exit before spawning
+   * exactly one replacement. */
+  private idleShutdown(): Promise<void> {
+    if (this.idleStopping) return this.idleStopping;
+    this.idleStopping = this.doIdleShutdown().finally(() => {
+      this.idleStopping = undefined;
+    });
+    return this.idleStopping;
+  }
+
+  private async doIdleShutdown(): Promise<void> {
+    this.clearIdleTimer();
+    const child = this.child;
+    // Detach the child BEFORE closing it: its exit becomes EXPECTED, so the
+    // exit handler never classifies it as an unexpected failure while an idle
+    // shutdown (or a final stop() awaiting it) completes.
+    if (this.child === child) this.child = undefined;
+    // Completed turn state belongs to the old process session; a respawned
+    // App Server has never seen those turns (mirrors final teardown).
+    this.turns.clear();
+    if (!child || child.exitCode !== null) return;
+    // GRACEFUL shutdown: EOF on stdin gives the app-server the chance to flush
+    // and exit before we escalate. The client is idle by construction (no
+    // pending RPC, no active turn waiter), so EOF is never sent to abort a
+    // live review.
+    try { child.stdin?.end(); } catch {
+      // stdin may already be closed by the child side.
+    }
+    if (child.exitCode !== null) return;
+    await waitExitOr(child, this.options.quitGraceMs ?? 5_000);
+    if (child.exitCode !== null) return;
+    child.kill();
+    await waitExitOr(child, this.options.killGraceMs ?? 2_000);
+    if (child.exitCode === null) child.kill("SIGKILL");
   }
 
   private isIdle(): boolean {
@@ -729,12 +1147,20 @@ function turnResult(state: TurnState): TurnWaitResult | undefined {
     ? state.completed.items.map(object)
     : [];
   const candidates = completedItems.length > 0 ? completedItems : [...state.items];
+  // The FINAL visible output item of the turn: Plan-mode planner turns persist
+  // their plan as an item with `type: "plan"` (streamed as item/plan/delta,
+  // stored verbatim by thread/read), normal turns use `agentMessage`, review
+  // turns may end on `exitedReviewMode`. The LAST such item wins, so a
+  // "provisional pass then changes_requested" sequence can never be applied
+  // early, and the winner's type is reported for contract-level assertions.
+  const finalCandidates = candidates.filter(
+    (item) => item.type === "agentMessage" || item.type === "plan" || item.type === "exitedReviewMode",
+  );
+  const finalItem = finalCandidates.at(-1);
   const text = normalized === "completed"
-    ? (candidates
-      .filter((item) => item.type === "agentMessage" || item.type === "plan" || item.type === "exitedReviewMode")
-      .map((item) => typeof item.text === "string" ? item.text : typeof item.review === "string" ? item.review : "")
-      .filter(Boolean)
-      .at(-1) ?? "")
+    ? (finalItem
+      ? (typeof finalItem.text === "string" ? finalItem.text : typeof finalItem.review === "string" ? finalItem.review : "")
+      : "")
     : "";
   return {
     kind: "completed",
@@ -742,6 +1168,9 @@ function turnResult(state: TurnState): TurnWaitResult | undefined {
     turnId: state.turnId,
     status: normalized,
     text,
+    ...(normalized === "completed" && finalItem && typeof finalItem.type === "string"
+      ? { itemType: finalItem.type }
+      : {}),
     ...(normalized !== "completed" ? { reason: normalized === "interrupted" ? "interrupted" : "turn failed" } : {}),
     ...(error ? { error } : {}),
   };

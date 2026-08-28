@@ -38,6 +38,7 @@ function outSink(out: string) {
 
 const baseConfig = {
   codexCommand: "codex",
+  autoTriggerMode: "complex",
   plannerModel: "",
   reviewerModel: "",
   plannerEffort: "high",
@@ -118,7 +119,20 @@ async function main(): Promise<number> {
       stop: () => Promise.resolve(),
     };
     const store = new WorkflowStore(dir);
-    const manager = new WorkflowManager(store, {} as never, baseConfig as never, callback, blockingQueue);
+    // Minimal gateway answering the 1.0.10 review-authority alignment fork:
+    // production always binds the real App Server; this actor only needs the
+    // verdict to reach phase A staging unchanged.
+    const gateway = {
+      normalizeInFork: async () => ({
+        kind: "completed",
+        threadId: "fork-thread",
+        turnId: "fork-turn",
+        status: "completed",
+        text: JSON.stringify({ aligned: true, conflicts: [] }),
+      }),
+      resolveDefaultModel: async () => undefined,
+    } as never;
+    const manager = new WorkflowManager(store, gateway, baseConfig as never, callback, blockingQueue);
     // submit() requires observable changed files inside the workspace.
     await writeFile(join(dir, "changed.txt"), "v1", "utf8");
     const agent = {

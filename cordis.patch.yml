@@ -3,6 +3,7 @@
       name: 'dsh-codex-workflow'
       config:
         codexCommand: codex
+        autoTriggerMode: complex
         plannerModel: ''
         reviewerModel: ''
         plannerEffort: high
@@ -17,3 +18,6 @@
         turnTimeoutMs: 600000
         idleProcessMs: 5000
         terminalRelayTimeoutMs: 60000
+        openCodexDesktopOnReview: true
+        desktopOpenRetryBaseMs: 2000
+        desktopOpenRetryMaxMs: 60000

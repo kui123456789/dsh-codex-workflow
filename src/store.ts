@@ -213,6 +213,7 @@ function parseRecord(value: unknown): WorkflowRecord {
     // Old records predate the Codex bridge; treat them as DSH-originated.
     origin: record.origin === "codex_bridge" ? "codex_bridge" : "dsh",
     noChangeReviewRounds: typeof record.noChangeReviewRounds === "number" ? record.noChangeReviewRounds : 0,
+    reviewContractFailures: typeof record.reviewContractFailures === "number" ? record.reviewContractFailures : 0,
     callbackAttempts: typeof record.callbackAttempts === "number" ? record.callbackAttempts : 0,
     assumptions: Array.isArray(record.assumptions) ? record.assumptions : [],
     questions: Array.isArray(record.questions) ? record.questions : [],

@@ -1,3 +1,4 @@
+import { APPENDED_READBACK_TIMEOUT_MS } from "./app-server.js";
 import { defineTool, type JsonValue, type ToolDefinition } from "@deepseek-ai/dsh-tools";
 import type { WorkflowConfig } from "./types.js";
 import type { WorkflowManager } from "./workflow.js";
@@ -9,16 +10,55 @@ const jsonOutput = {
 
 /**
  * Tool timeout budgets. A tool may NEVER be cut by the host before the plugin's
- * own (configurable) operation could finish:
- *  - start/continue run ONE Codex turn bounded by turnTimeoutMs;
- *  - review/review_only run TWO serial turns (the review turn, then the
- *    normalize turn), each of which can independently exhaust turnTimeoutMs;
+ * own (configurable) operation could finish — the budget is PROVABLE: every
+ * serial step is bounded either by `turnTimeoutMs` (model turns) or by the
+ * tighter `rpcTimeoutMs` (control RPCs), and the budget covers the WORST-CASE
+ * serial path of each tool:
+ *  - start/continue: FOUR serial turns — visible plan turn + ephemeral
+ *    conversion fork + (when the first visible reply is not a complete plan)
+ *    one controlled completion turn on the same task + a SECOND conversion
+ *    fork;
+ *  - review/review_only: SEVEN serial turns — native review turn + (when the
+ *    persisted native review violates the display contract) one visible
+ *    rewrite turn + the ephemeral conversion fork + the 1.0.10 review-authority
+ *    alignment fork + (on conflict) one visible reconciliation turn on the
+ *    same durable task + a SECOND conversion fork + a SECOND alignment fork;
  *  - submit only validates, captures evidence, persists the submission and
- *    starts a manager-owned background Reviewer task.
+ *    starts a manager-owned background review on the existing workflow task.
+ *  - review/review_only additionally reserve ONE bounded persisted-read-back
+ *    window per readable turn (the native review, the display rewrite and the
+ *    reconciliation turn each poll {@link APPENDED_READBACK_TIMEOUT_MS} for
+ *    the authoritative text).
  * Budgets are computed overflow-safely (saturated at MAX_SAFE_INTEGER) with a
- * cleanup margin so the host never pre-empts a legitimate operation.
+ * cleanup margin so the host never pre-empts a legitimate operation, including
+ * the completion/rewrite/reconciliation/read-back/cleanup paths at the
+ * production-aligned 600 s turn ceiling.
  */
 const CLEANUP_MARGIN_MS = 15_000;
+
+/** Worst-case serial TURNS per tool flow (each independently bounded by
+ * `turnTimeoutMs`): the Planner worst path is visible plan turn → conversion
+ * fork → completion turn → conversion fork; the reviewer worst path is native
+ * review turn → display-rewrite turn → conversion fork → authority-alignment
+ * fork → reconciliation turn → second conversion fork → second alignment fork
+ * (the 1.0.10 authority path only engages its extra turns when the alignment
+ * finds a conflict; the budget must cover it regardless). */
+export const PLANNER_MAX_TURNS = 4;
+export const REVIEW_MAX_TURNS = 7;
+
+/** Upper bound on the number of SERIAL control RPCs (thread/start,
+ * thread/name/set, collaborationMode/list, turn/start, thread/fork,
+ * thread/unsubscribe, model/list, settings/update, thread/read baselines and
+ * read-backs, review/start, ...) a tool flow can issue before its turn waits.
+ * The Planner reaches ≈15; review/review_only reaches ≈31 with its 1.0.10
+ * authority path (alignment fork, reconciliation turn, second conversion fork
+ * and second alignment fork each add a thread/fork + collaborationMode/list +
+ * turn/start + thread/unsubscribe or turn/start + settings, plus one read-back
+ * poll per visible turn). MAX_SERIAL_RPCS = 40 covers both with headroom. The
+ * budgets multiply this by the (tighter) control RPC timeout, so the total
+ * stays provable: slow control RPCs can never make the host pre-empt a tool
+ * before its own cleanup. */
+export const MAX_SERIAL_RPCS = 40;
 
 function saturatedAdd(...values: number[]): number {
   let total = 0;
@@ -30,24 +70,40 @@ function saturatedAdd(...values: number[]): number {
   return total;
 }
 
-/** start/continue: one turn + margin. */
-function singleTurnToolTimeout(turnTimeoutMs: number): number {
-  return saturatedAdd(turnTimeoutMs, CLEANUP_MARGIN_MS);
+function rpcTimeoutOf(config: WorkflowConfig): number {
+  return config.rpcTimeoutMs ?? Math.max(5_000, Math.min(config.turnTimeoutMs, 60_000));
 }
 
-/** review/review_only: two serial turns (review + normalize) + margin. */
-function reviewToolTimeout(turnTimeoutMs: number): number {
-  return saturatedAdd(turnTimeoutMs, turnTimeoutMs, CLEANUP_MARGIN_MS);
+/** start/continue: the Planner worst path of FOUR serial turns (visible +
+ * conversion + completion + conversion) + every control RPC at its own
+ * timeout + margin. */
+export function startToolTimeout(turnTimeoutMs: number, rpcTimeoutMs: number): number {
+  return saturatedAdd(turnTimeoutMs * PLANNER_MAX_TURNS, MAX_SERIAL_RPCS * rpcTimeoutMs, CLEANUP_MARGIN_MS);
+}
+
+/** review/review_only: SEVEN serial turns (native + display rewrite +
+ * conversion + authority alignment + reconciliation + second conversion +
+ * second alignment) + RPCs + one bound for EACH persisted read-back (the
+ * native read-back, the rewrite read-back and the reconciliation read-back
+ * poll a bounded rollout window) + margin. */
+export function reviewToolTimeout(turnTimeoutMs: number, rpcTimeoutMs: number): number {
+  return saturatedAdd(
+    turnTimeoutMs * REVIEW_MAX_TURNS,
+    MAX_SERIAL_RPCS * rpcTimeoutMs,
+    3 * APPENDED_READBACK_TIMEOUT_MS,
+    CLEANUP_MARGIN_MS,
+  );
 }
 
 export function createWorkflowTools(manager: WorkflowManager, config: WorkflowConfig): ToolDefinition[] {
-  const startTimeout = singleTurnToolTimeout(config.turnTimeoutMs);
-  const reviewTimeout = reviewToolTimeout(config.turnTimeoutMs);
+  const rpcTimeoutMs = rpcTimeoutOf(config);
+  const startTimeout = startToolTimeout(config.turnTimeoutMs, rpcTimeoutMs);
+  const reviewTimeout = reviewToolTimeout(config.turnTimeoutMs, rpcTimeoutMs);
   const instantTimeout = 60_000;
   return [
     defineTool({
       name: "codex_workflow_start",
-      description: "Ask Codex to inspect this workspace read-only and produce the implementation plan that this same DSH session must execute, test, and submit to Codex review.",
+      description: "Start the Codex planning workflow before making changes. DSH may call this autonomously when the installed auto-trigger policy matches the user's development task. Call it at most once per task/session: Codex inspects the bound workspace read-only and returns the plan that this same DSH session must execute, test, and submit to the existing Codex task for review.",
       parameters: {
         task: { type: "string", required: true, description: "The complete coding task for Codex to plan." },
         plannerModel: { type: "string", description: "Optional Codex planner model override." },
@@ -70,7 +126,7 @@ export function createWorkflowTools(manager: WorkflowManager, config: WorkflowCo
     }),
     defineTool({
       name: "codex_workflow_review",
-      description: "Send the implementation in this workspace to an independent read-only Codex Reviewer. Call after implementing the plan and after every repair round.",
+      description: "Append an independent read-only Codex review to this workflow's existing Codex task: for planned workflows that is the original Planner task, for review_only it is the workflow's dedicated review task (no Planner exists). Call after implementing the plan and after every repair round; re-reviews reuse the same task.",
       parameters: {
         workflowId: { type: "string", required: true },
         implementationSummary: { type: "string", required: true },

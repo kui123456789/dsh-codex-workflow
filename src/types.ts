@@ -8,7 +8,7 @@ export type WorkflowMode = "planned" | "review_only";
  * Codex-led bridge. Old records default to "dsh". */
 export type WorkflowOrigin = "dsh" | "codex_bridge";
 
-/** Durable state of the callback that validates/creates/resumes the independent Reviewer. */
+/** Durable state of the callback that validates/resumes the workflow's Codex review task. */
 export type CallbackState = "idle" | "queued" | "sending" | "waiting_verdict" | "retrying" | "failed";
 
 /** Per-submission lifecycle inside a bridge workflow. */
@@ -104,6 +104,41 @@ export interface ReviewDecision {
   decidedAt: string;
 }
 
+/** One review entry (finding or test gap) judged to conflict with the review
+ * authority hierarchy (1.0.10). */
+export interface ReviewConflict {
+  /** Kind of the conflicting entry inside the normalized ReviewResult. */
+  kind: "finding" | "testGap";
+  /** 0-based index of the entry inside the normalized ReviewResult. */
+  index: number;
+  reason: string;
+  /** The original-task constraint or approved-plan entry the entry violates
+   * ("generic quality suggestion" when none applies). */
+  violated: string;
+  /** True when the entry is excused by a REPRODUCIBLE critical/high
+   * correctness, security or data-corruption defect with concrete code
+   * evidence (level-1 exception). */
+  highSeverityException: boolean;
+}
+
+/** Durable audit of the most recent review-authority alignment conflict. */
+export interface ReviewConflictInfo {
+  conflicts: ReviewConflict[];
+  /** True when ONE visible reconciliation turn ran on the same Codex task. */
+  reconciled: boolean;
+  /** True when the reconciliation re-alignment ended aligned (the corrected
+   * verdict was applied). An unresolved conflict never touches `latestReview`. */
+  resolved: boolean;
+  at: string;
+}
+
+/** Internal result of the alignment fork (never persisted, never the public
+ * ReviewResult). */
+export interface AlignmentOutcome {
+  aligned: boolean;
+  conflicts: ReviewConflict[];
+}
+
 export interface WorkflowRecord {
   schemaVersion: 1;
   id: string;
@@ -120,6 +155,12 @@ export interface WorkflowRecord {
   updatedAt: string;
   plannerThreadId?: string;
   plannerTurnId?: string;
+  /** The EFFECTIVE model the visible Planner turn actually ran with (explicit
+   * tool/config override, or the model selected by the Plan collaboration
+   * mode). Persisted so continue/restart and the ephemeral normalization fork
+   * all reuse the SAME model instead of falling back to a different default.
+   * Optional for records written by older versions. */
+  plannerModel?: string;
   /** Read-only source thread that hosted the first detached review (review-only
    * workflows); kept for diagnostics and restart recovery. */
   sourceThreadId?: string;
@@ -139,6 +180,19 @@ export interface WorkflowRecord {
   reviewCycles: number;
   /** Optional for records written by older versions; defaults to 0. */
   noChangeReviewRounds?: number;
+  /** Consecutive review CALLS (DSH-led review rounds or bridge submissions)
+   * that ended in an UNRESOLVED reviewer-contract conflict (review authority
+   * alignment). An aligned review resets this to 0; two consecutive
+   * unresolved conflicts block the workflow WITHOUT consuming review cycles.
+   * Optional for records written by older versions; defaults to 0. */
+  reviewContractFailures?: number;
+  /** The most recent review-authority alignment conflict: which findings/test
+   * gaps conflicted with the authority hierarchy, whether ONE visible
+   * reconciliation turn ran on the same Codex task, and whether the corrected
+   * verdict ended aligned (resolved). `latestReview` only ever holds APPLIED
+   * verdicts, so an unresolved conflict never overwrites it. Optional for
+   * records written by older versions. */
+  latestReviewConflict?: ReviewConflictInfo;
   latestReview?: ReviewResult;
   latestReviewEvidence?: ReviewEvidence;
   previousReviewFingerprint?: string;
@@ -207,10 +261,17 @@ export interface WorkflowRecord {
   submissionLeaseToken?: string;
   submissionLeaseEpoch?: number;
   submissionLeaseUntil?: number;
+  /** Durable state for opening the completed review in Codex Desktop. */
+  desktopOpenState?: "pending" | "opened" | "disabled";
+  desktopOpenSubmissionId?: string;
+  desktopOpenAttempts?: number;
+  desktopOpenNextAt?: number;
+  desktopOpenError?: string;
 }
 
 export interface WorkflowConfig {
   codexCommand: string;
+  autoTriggerMode: import("./auto-trigger.js").AutoTriggerMode;
   plannerModel: string;
   reviewerModel: string;
   plannerEffort: ReasoningEffort;
@@ -227,8 +288,17 @@ export interface WorkflowConfig {
    * ttl/3 while a callback runs. Default 60000. */
   leaseTtlMs?: number;
   turnTimeoutMs: number;
+  /** Per-control-RPC timeout (thread/start, turn/start, thread/fork,
+   * collaborationMode/list, unsubscribe, ...): derived from turnTimeoutMs
+   * (default min(turnTimeoutMs, 60s)). The tool timeout budgets count every
+   * serial control RPC against THIS bound, so the host can never pre-empt a
+   * legitimate operation even when several control RPCs are slow. */
+  rpcTimeoutMs?: number;
   idleProcessMs: number;
   terminalRelayTimeoutMs: number;
+  openCodexDesktopOnReview?: boolean;
+  desktopOpenRetryBaseMs?: number;
+  desktopOpenRetryMaxMs?: number;
   storageDir: string;
 }
 
@@ -246,6 +316,12 @@ export interface TurnCompleteResult {
   turnId: string;
   status: "completed" | "interrupted" | "failed";
   text: string;
+  /** The FINAL visible output item's type of a genuinely completed turn:
+   * `plan` for Plan-mode Planner output (persisted as an item of that type and
+   * rendered by Codex Desktop as a readable plan), `agentMessage` for normal
+   * turns, `exitedReviewMode` for review turns. Absent for interrupted/failed
+   * turns or when no candidate item exists. */
+  itemType?: string;
   error?: string;
   /** Why the turn ended the way it did, when it did not complete normally:
    * `interrupted` (some actor interrupted it), `failed`, or `timed_out` (our
@@ -261,3 +337,15 @@ export interface TurnNeedsInputResult {
 }
 
 export type TurnWaitResult = TurnCompleteResult | TurnNeedsInputResult;
+
+/** The identity baseline of the turns already PERSISTED on a durable thread,
+ * captured (`thread/read` with `includeTurns: true`) BEFORE a visible
+ * review/rewrite turn starts. The newly-persisted turn is detected against
+ * these ids, because the RPC turn id returned by `review/start`/`turn/start`
+ * is NOT guaranteed to equal the persisted `thread.turns[].id` — real App
+ * Server evidence shows native review RPC turn ids that never appear in the
+ * persisted rollout history. */
+export interface PersistedTurnBaseline {
+  /** id of every turn already persisted at baseline time. */
+  ids: string[];
+}

@@ -10,12 +10,24 @@ export interface CodexCallbackRequest {
   codexThreadId: string;
   cwd: string;
   prompt: string;
+  /** The workflow's original task (and approved plan when present): the
+   * background dispatcher validates the final visible review against the
+   * same display contract as the DSH-led path (task language + four
+   * readable sections) and may run ONE rewrite turn on the same Reviewer. */
+  task?: string;
+  planMarkdown?: string;
   reviewerThreadId?: string;
+  /** Legacy compatibility only. New bridge workflows append reviews to
+   * codexThreadId and do not create or rename a Reviewer task. */
   reviewerName?: string;
   model?: string;
   effort?: ReasoningEffort;
   onThread?: (threadId: string) => Promise<void> | void;
   onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
+  /** Called when the EPHEMERAL conversion fork's turn starts, with the FORK
+   * thread/turn. Never persisted: the fork id must not land in
+   * plannerThreadId/reviewerThreadId. */
+  onEphemeralStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
 }
 
 export interface CodexCallbackOptions {

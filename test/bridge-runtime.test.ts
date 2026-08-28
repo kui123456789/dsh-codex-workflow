@@ -12,6 +12,7 @@ import { collectEvidence } from "../src/evidence.js";
 import { WorkflowStore } from "../src/store.js";
 import type { WorkflowConfig } from "../src/types.js";
 import { WorkflowManager, type CodexGateway } from "../src/workflow.js";
+import type { DesktopThreadOpener } from "../src/desktop-thread-opener.js";
 
 async function rmClosed(path: string): Promise<void> {
   // Close only this tree's coordination connections first (Windows locks an
@@ -35,6 +36,7 @@ async function rmClosed(path: string): Promise<void> {
 
 const config: WorkflowConfig = {
   codexCommand: "codex",
+  autoTriggerMode: "complex",
   plannerModel: "",
   reviewerModel: "",
   plannerEffort: "high",
@@ -59,6 +61,7 @@ class NoopGateway implements CodexGateway {
   async startTurn(): Promise<never> { throw new Error("not used"); }
   async continueTurn(): Promise<never> { throw new Error("not used"); }
   async startReview(): Promise<never> { throw new Error("not used"); }
+  async normalizeInFork(): Promise<never> { throw new Error("not used"); }
   async interrupt(): Promise<void> { throw new Error("not used"); }
 }
 
@@ -154,12 +157,14 @@ async function harness(
   maxRetryAttempts = 5,
   leaseMs = 60_000,
   terminalRelayTimeoutMs = 60_000,
+  desktopOpener: DesktopThreadOpener = { open: async () => undefined },
+  workflowConfigOverrides: Partial<WorkflowConfig> = {},
 ): Promise<Harness> {
   const directory = await mkdtemp(join(tmpdir(), "dsh-bridge-runtime-"));
   const store = new BridgeStore(join(directory, "storage"), 1024 * 1024, leaseMs);
   await store.init();
   const workflowStore = new WorkflowStore(join(directory, "workflows"));
-  const manager = new WorkflowManager(workflowStore, new NoopGateway(), { ...config, storageDir: directory });
+  const manager = new WorkflowManager(workflowStore, new NoopGateway(), { ...config, ...workflowConfigOverrides, storageDir: directory });
   const registry = new FakeRegistry();
   const runtime = new BridgeRuntime(store, registry, {
     pollMs,
@@ -169,6 +174,10 @@ async function harness(
     retryBaseMs,
     maxRetryAttempts,
     terminalRelayTimeoutMs,
+    desktopOpener,
+    openCodexDesktopOnReview: workflowConfigOverrides.openCodexDesktopOnReview,
+    desktopOpenRetryBaseMs: workflowConfigOverrides.desktopOpenRetryBaseMs,
+    desktopOpenRetryMaxMs: workflowConfigOverrides.desktopOpenRetryMaxMs,
   });
   return { directory, store, workflowStore, manager, runtime, registry };
 }
@@ -507,6 +516,100 @@ test("a passing verdict delivers to the original DSH session exactly once", asyn
     await h.store.enqueue(command);
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(target.followups.length, 1);
+  } finally {
+    await h.runtime.stop();
+    await rmClosed(h.directory);
+  }
+});
+
+test("a completed verdict opens the original Codex thread once after apply", async () => {
+  const opened: string[] = [];
+  const h = await harness(5, 10, 5, 60_000, 60_000, {
+    open: async (threadId) => { opened.push(threadId); },
+  });
+  try {
+    const workspace = await makeWorkspace(h.directory);
+    const target = makeAgent("session-desktop-open", "C:\\work");
+    h.registry.register(target);
+    h.runtime.start();
+    const bridge = await makeBridgeWorkflow(h, target.id, workspace);
+    const command = verdict({
+      workflowId: bridge.workflowId,
+      codexThreadId: bridge.codexThreadId,
+      submissionId: bridge.submissionId,
+    });
+    await h.store.enqueue(command);
+    const receipt = await waitForReceipt(h.store, command.requestId);
+    assert.equal(receipt.status, "delivered");
+    assert.deepEqual(opened, [bridge.codexThreadId]);
+    const record = await h.workflowStore.load(bridge.workflowId);
+    assert.equal(record?.desktopOpenState, "opened");
+    assert.equal(record?.desktopOpenSubmissionId, bridge.submissionId);
+    // Replaying the exact request cannot create a second desktop open.
+    await h.store.enqueue(command);
+    await h.runtime.pump();
+    assert.deepEqual(opened, [bridge.codexThreadId]);
+  } finally {
+    await h.runtime.stop();
+    await rmClosed(h.directory);
+  }
+});
+
+test("desktop-open failures stay pending and retry after the backoff deadline", async () => {
+  let openAttempts = 0;
+  const h = await harness(5, 10, 5, 60_000, 60_000, {
+    open: async () => {
+      openAttempts += 1;
+      if (openAttempts === 1) throw new Error("Codex Desktop is not running");
+    },
+  }, {
+    desktopOpenRetryBaseMs: 20,
+    desktopOpenRetryMaxMs: 100,
+  });
+  try {
+    const workspace = await makeWorkspace(h.directory);
+    const target = makeAgent("session-desktop-retry", "C:\\work");
+    h.registry.register(target);
+    h.runtime.start();
+    const bridge = await makeBridgeWorkflow(h, target.id, workspace);
+    const command = verdict({ workflowId: bridge.workflowId, codexThreadId: bridge.codexThreadId, submissionId: bridge.submissionId });
+    await h.store.enqueue(command);
+    assert.equal((await waitForReceipt(h.store, command.requestId)).status, "delivered");
+    let record = await h.workflowStore.load(bridge.workflowId);
+    assert.equal(record?.desktopOpenState, "pending");
+    assert.equal(record?.desktopOpenAttempts, 1);
+    assert.match(record?.desktopOpenError ?? "", /not running/);
+    await h.workflowStore.update(bridge.workflowId, (r) => { r.desktopOpenNextAt = Date.now() - 1; });
+    await h.runtime.pump();
+    record = await h.workflowStore.load(bridge.workflowId);
+    assert.equal(openAttempts, 2);
+    assert.equal(record?.desktopOpenState, "opened");
+    assert.equal(record?.desktopOpenError, undefined);
+  } finally {
+    await h.runtime.stop();
+    await rmClosed(h.directory);
+  }
+});
+
+test("desktop auto-open can be disabled for headless deployments", async () => {
+  let openAttempts = 0;
+  const h = await harness(5, 10, 5, 60_000, 60_000, {
+    open: async () => { openAttempts += 1; },
+  }, {
+    openCodexDesktopOnReview: false,
+  });
+  try {
+    const workspace = await makeWorkspace(h.directory);
+    const target = makeAgent("session-desktop-disabled", "C:\\work");
+    h.registry.register(target);
+    h.runtime.start();
+    const bridge = await makeBridgeWorkflow(h, target.id, workspace);
+    const command = verdict({ workflowId: bridge.workflowId, codexThreadId: bridge.codexThreadId, submissionId: bridge.submissionId });
+    await h.store.enqueue(command);
+    assert.equal((await waitForReceipt(h.store, command.requestId)).status, "delivered");
+    const record = await h.workflowStore.load(bridge.workflowId);
+    assert.equal(openAttempts, 0);
+    assert.equal(record?.desktopOpenState, "disabled");
   } finally {
     await h.runtime.stop();
     await rmClosed(h.directory);

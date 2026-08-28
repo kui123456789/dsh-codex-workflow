@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Release check for dsh-codex-workflow 1.0.6.
+// Release check for dsh-codex-workflow 1.0.10.
 //
 // A repeatable, OFFLINE gate (no Codex login, no real DSH_HOME):
 //   1. verify      : typecheck + full test suite + build
@@ -47,6 +47,20 @@ const versionSource = await readFile(join(root, "src", "version.ts"), "utf8");
 const sourceVersion = versionSource.match(/PLUGIN_VERSION\s*=\s*"([^"]+)"/)?.[1];
 report("runtime/package version match", sourceVersion === packageJson.version,
   `src/version.ts=${sourceVersion ?? "missing"}, package.json=${packageJson.version ?? "missing"}`);
+
+// Docs keep pace with the release: the CHANGELOG must document this exact
+// version and the README must not advertise itself as an older release.
+const changelog = await readFile(join(root, "CHANGELOG.md"), "utf8");
+report("CHANGELOG documents the release version", changelog.includes(`## [${packageJson.version}]`),
+  `CHANGELOG.md has no ${packageJson.version} entry`);
+const readme = await readFile(join(root, "README.md"), "utf8");
+const patch = await readFile(join(root, "cordis.patch.yml"), "utf8");
+report("README documents autonomous trigger modes", /autoTriggerMode[\s\S]*off[\s\S]*complex[\s\S]*always/.test(readme),
+  "README.md does not document off | complex | always");
+report("bundle defaults autonomous trigger to complex", /^\s*autoTriggerMode:\s*complex\s*$/m.test(patch),
+  "cordis.patch.yml does not set autoTriggerMode: complex");
+report("system-prompt peer dependency is declared", typeof packageJson.peerDependencies?.["@deepseek-ai/dsh-system-prompt"] === "string",
+  "package.json has no @deepseek-ai/dsh-system-prompt peer dependency");
 
 // 1) verify
 report("typecheck", runPnpm(["typecheck"]) === 0, "pnpm typecheck failed");

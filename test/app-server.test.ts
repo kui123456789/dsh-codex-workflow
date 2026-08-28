@@ -29,6 +29,10 @@ test("starts a read-only planning thread and collects structured output", async 
     });
     assert.equal(result.kind, "completed");
     assert.match(result.kind === "completed" ? result.text : "", /proposed_plan/);
+    // 1.0.7: a completed turn reports the FINAL visible item type so the
+    // planner contract can distinguish Plan-mode `plan` items from plain
+    // agentMessages (the fake server emits agentMessage items).
+    assert.equal(result.kind === "completed" ? result.itemType : undefined, "agentMessage");
   } finally {
     await codex.stop();
   }
@@ -99,7 +103,7 @@ test("startReview interrupts the reviewer turn when onStarted fails", async () =
     await assert.rejects(codex.startReview({
       threadId: planner,
       cwd: process.cwd(),
-      target: { type: "uncommittedChanges" },
+      target: { type: "custom", instructions: "Review it" },
       detached: true,
       onStarted: async () => { throw new Error("onStarted failed"); },
     }), /onStarted failed/);
@@ -132,7 +136,7 @@ test("startReview interrupts the reviewer turn when thread settings fail", async
     await assert.rejects(codex.startReview({
       threadId: planner,
       cwd: process.cwd(),
-      target: { type: "uncommittedChanges" },
+      target: { type: "custom", instructions: "Review it" },
       detached: true,
     }), /settings failed/);
     await waitForFile(marker);
@@ -257,7 +261,7 @@ test("starts a detached review and normalizes its result", async () => {
     const review = await codex.startReview({
       threadId: planner,
       cwd: process.cwd(),
-      target: { type: "uncommittedChanges" },
+      target: { type: "custom", instructions: "Review the current changes" },
       detached: true,
     });
     assert.notEqual(review.threadId, planner);
@@ -272,6 +276,218 @@ test("starts a detached review and normalizes its result", async () => {
     assert.match(text, /"blocking":true/);
   } finally {
     await codex.stop();
+  }
+});
+
+test("normalizeInFork forks ephemeral and converts with safe low-effort settings, unsubscribing exactly once", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-fork-ok-"));
+  const marker = join(directory, "calls.jsonl");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: {
+      ...process.env,
+      FAKE_CODEX_THREAD_PARAMS_MARKER: marker,
+      FAKE_CODEX_REVIEW_VERDICT: JSON.stringify({ verdict: "pass", findings: [], testGaps: [], summary: "ok" }),
+    },
+  });
+  try {
+    const source = await codex.startThread({ cwd: directory, name: "Plan source" });
+    const started: Array<{ threadId: string; turnId: string }> = [];
+    const converted = await codex.normalizeInFork({
+      threadId: source,
+      cwd: directory,
+      prompt: "Convert the plan",
+      model: "source-model",
+      outputSchema: REVIEW_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+      onStarted: (entry) => { started.push(entry); },
+    });
+    assert.equal(converted.kind, "completed", "the fork conversion completes with the schema output");
+    assert.match(converted.kind === "completed" ? converted.text : "", /"verdict":"pass"/);
+    const forkThread = started[0]?.threadId;
+    assert.ok(forkThread);
+    assert.notEqual(forkThread, source, "the conversion runs on a NEW fork thread");
+
+    const calls = (await readFile(marker, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
+      method: string;
+      params: Record<string, any>;
+    });
+    const forks = calls.filter((call) => call.method === "thread/fork");
+    assert.equal(forks.length, 1);
+    assert.equal(forks[0]?.params.threadId, source, "the fork is created from the persistent source task");
+    assert.equal(forks[0]?.params.ephemeral, true, "the conversion fork is ALWAYS ephemeral");
+    assert.equal(forks[0]?.params.cwd, directory);
+    assert.deepEqual(forks[0]?.params.runtimeWorkspaceRoots, [directory]);
+
+    const turn = calls.find((call) => call.method === "turn/start");
+    assert.equal(turn?.params.threadId, forkThread);
+    assert.ok(turn?.params.outputSchema?.properties?.verdict, "the conversion turn carries the output schema");
+    assert.equal(turn?.params.model, "source-model", "the fork reuses the SAME model as the source task");
+    assert.equal(turn?.params.effort, "low", "conversion effort is fixed at low");
+    // Per-turn safety settings: read-only, network disabled, approval never.
+    assert.equal(turn?.params.approvalPolicy, "never");
+    assert.deepEqual(turn?.params.sandboxPolicy, { type: "readOnly", networkAccess: false });
+    assert.equal(turn?.params.collaborationMode?.mode, "default");
+    assert.match(turn?.params.collaborationMode?.settings?.developer_instructions, /JSON object conforming to the enforced output schema/);
+    assert.equal(turn?.params.collaborationMode?.settings?.model, "source-model");
+    assert.equal(turn?.params.collaborationMode?.settings?.reasoning_effort, "low");
+
+    // Exactly one unsubscribe — the fork is released once on success.
+    const unsubs = calls.filter((call) => call.method === "thread/unsubscribe");
+    assert.equal(unsubs.length, 1, "the ephemeral fork is unsubscribed exactly once on success");
+    assert.equal(unsubs[0]?.params.threadId, forkThread, "the fork (never the source) is unsubscribed");
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("normalizeInFork interrupts the fork and unsubscribes exactly once when onStarted fails", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-fork-onstarted-"));
+  const marker = join(directory, "interrupt.txt");
+  const callsFile = join(directory, "calls.jsonl");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: {
+      ...process.env,
+      FAKE_CODEX_THREAD_PARAMS_MARKER: callsFile,
+      FAKE_CODEX_INTERRUPT_MARKER: marker,
+    },
+  });
+  try {
+    const source = await codex.startThread({ cwd: directory, name: "Plan source" });
+    await assert.rejects(codex.normalizeInFork({
+      threadId: source,
+      cwd: directory,
+      prompt: "Convert",
+      outputSchema: REVIEW_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+      onStarted: async () => { throw new Error("onStarted failed"); },
+    }), /onStarted failed/);
+    await waitForFile(marker);
+    const [thread, turn] = (await readFile(marker, "utf8")).trim().split(":");
+    assert.notEqual(thread, source, "the interrupt targets the FORK turn, never the source task");
+    assert.ok(turn);
+    const calls = (await readFile(callsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
+      method: string;
+      params: Record<string, any>;
+    });
+    assert.equal(calls.filter((call) => call.method === "thread/unsubscribe").length, 1, "onStarted failure still releases the fork exactly once");
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("normalizeInFork interrupts the fork and unsubscribes exactly once on cancellation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-fork-cancel-"));
+  const marker = join(directory, "interrupt.txt");
+  const callsFile = join(directory, "calls.jsonl");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: {
+      ...process.env,
+      FAKE_CODEX_THREAD_PARAMS_MARKER: callsFile,
+      FAKE_CODEX_INTERRUPT_MARKER: marker,
+    },
+  });
+  try {
+    const source = await codex.startThread({ cwd: directory, name: "Plan source" });
+    const controller = new AbortController();
+    let forkThread = "";
+    const converting = codex.normalizeInFork({
+      threadId: source,
+      cwd: directory,
+      prompt: "HANG",
+      outputSchema: REVIEW_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+      onStarted: (started) => { forkThread = started.threadId; controller.abort(new Error("cancelled during conversion")); },
+    }, controller.signal);
+    await assert.rejects(converting, /cancelled during conversion/);
+    assert.ok(forkThread);
+    assert.notEqual(forkThread, source);
+    await waitForFile(marker);
+    const [thread, turn] = (await readFile(marker, "utf8")).trim().split(":");
+    assert.equal(thread, forkThread, "cancellation interrupts the actual active FORK turn");
+    assert.ok(turn);
+    const calls = (await readFile(callsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
+      method: string;
+      params: Record<string, any>;
+    });
+    assert.equal(calls.filter((call) => call.method === "thread/unsubscribe").length, 1, "cancellation still releases the fork exactly once");
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("normalizeInFork unsubscribes exactly once when the fork turn fails", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-fork-failed-"));
+  const callsFile = join(directory, "calls.jsonl");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: {
+      ...process.env,
+      FAKE_CODEX_THREAD_PARAMS_MARKER: callsFile,
+      FAKE_CODEX_TURN_STATUS: "interrupted",
+    },
+  });
+  try {
+    const source = await codex.startThread({ cwd: directory, name: "Plan source" });
+    const result = await codex.normalizeInFork({
+      threadId: source,
+      cwd: directory,
+      prompt: "Convert",
+      outputSchema: REVIEW_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+    });
+    assert.equal(result.kind, "completed");
+    if (result.kind === "completed") assert.equal(result.status, "interrupted", "a failed fork turn is surfaced, never a verdict");
+    const calls = (await readFile(callsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
+      method: string;
+      params: Record<string, any>;
+    });
+    assert.equal(calls.filter((call) => call.method === "thread/unsubscribe").length, 1, "a failed fork turn still releases the fork exactly once");
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("normalizeInFork unsubscribes exactly once when the fork turn times out", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-fork-timeout-"));
+  const callsFile = join(directory, "calls.jsonl");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 2_000,
+    idleProcessMs: 0,
+    env: { ...process.env, FAKE_CODEX_THREAD_PARAMS_MARKER: callsFile },
+  });
+  try {
+    const source = await codex.startThread({ cwd: directory, name: "Plan source" });
+    await assert.rejects(codex.normalizeInFork({
+      threadId: source,
+      cwd: directory,
+      prompt: "HANG",
+      outputSchema: REVIEW_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+    }), /Codex turn timed out/);
+    const calls = (await readFile(callsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
+      method: string;
+      params: Record<string, any>;
+    });
+    assert.equal(calls.filter((call) => call.method === "thread/unsubscribe").length, 1, "a timed-out fork turn still releases the fork exactly once");
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
   }
 });
 
@@ -461,6 +677,333 @@ test("stop() drains the app-server stdin gracefully and the process exits", asyn
     const pid = Number(await readFile(marker, "utf8"));
     await codex.stop();
     assert.equal(processAlive(pid), false, "graceful stop must let the app-server exit on stdin EOF");
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("control RPCs use their own tighter timeout: a slow RPC is cut short, never the host budget", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-rpc-timeout-"));
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 30_000,
+    rpcTimeoutMs: 800,
+    idleProcessMs: 0,
+    env: { ...process.env, FAKE_CODEX_RPC_DELAY_MS: "2000" },
+  });
+  try {
+    const startedAt = Date.now();
+    await assert.rejects(codex.startThread({ cwd: directory, name: "Slow RPC" }), /Codex request timed out/);
+    const elapsed = Date.now() - startedAt;
+    assert.ok(elapsed < 10_000, `an RPC timeout must settle in ~800ms, took ${elapsed}ms`);
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("control RPCs within the rpc timeout complete normally despite delays", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-rpc-ok-"));
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 10_000,
+    rpcTimeoutMs: 2_000,
+    idleProcessMs: 0,
+    env: { ...process.env, FAKE_CODEX_RPC_DELAY_MS: "300" },
+  });
+  try {
+    const threadId = await codex.startThread({ cwd: directory, name: "Delayed RPC" });
+    const result = await codex.startTurn(threadId, { prompt: "Plan it", planMode: true });
+    assert.equal(result.kind, "completed");
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("stop() settles a pending turn waiter immediately (teardown never waits out the turn timeout)", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-stop-pending-"));
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 60_000,
+    idleProcessMs: 0,
+  });
+  try {
+    const threadId = await codex.startThread({ cwd: directory, name: "Pending turn" });
+    const pending = codex.startTurn(threadId, { prompt: "HANG" });
+    await sleep(120); // the turn is genuinely running inside waitForTurn now
+    // Attach the rejection handler BEFORE stop() so the settle is observed,
+    // never an unhandled rejection.
+    const pendingAssertion = assert.rejects(pending, /Codex app-server stopped/);
+    const startedAt = Date.now();
+    await codex.stop();
+    await pendingAssertion;
+    const elapsed = Date.now() - startedAt;
+    assert.ok(elapsed < 10_000, `stop must settle the waiter immediately (not after the 60s turn timeout), took ${elapsed}ms`);
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("planMode resolves a concrete model and onModel reports the effective model for reuse", async () => {
+  const codex = client();
+  try {
+    const threadId = await codex.startThread({ cwd: process.cwd(), name: "Plan model" });
+    const reported: string[] = [];
+    const result = await codex.startTurn(threadId, {
+      prompt: "Plan it",
+      planMode: true,
+      onModel: (model) => reported.push(model),
+    });
+    assert.equal(result.kind, "completed");
+    // The Plan collaboration mode's model is resolved and reported even
+    // though NO explicit model was configured — the ephemeral conversion fork
+    // can therefore reuse the SAME effective model.
+    assert.deepEqual(reported, ["fake-model"]);
+    // An explicit model wins and is reported as-is.
+    const reportedExplicit: string[] = [];
+    await codex.startTurn(threadId, { prompt: "Plan it", model: "explicit-model", planMode: true, onModel: (m) => reportedExplicit.push(m) });
+    assert.deepEqual(reportedExplicit, ["explicit-model"]);
+  } finally {
+    await codex.stop();
+  }
+});
+
+test("a Plan-mode turn/start carries the plan collaboration mode on the wire", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-planmode-wire-"));
+  const marker = join(directory, "calls.jsonl");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: { ...process.env, FAKE_CODEX_THREAD_PARAMS_MARKER: marker },
+  });
+  try {
+    const threadId = await codex.startThread({ cwd: directory, name: "Plan wire" });
+    await codex.startTurn(threadId, { prompt: "Plan it", planMode: true });
+    const calls = (await readFile(marker, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
+      method: string;
+      params: Record<string, any>;
+    });
+    const turn = calls.find((call) => call.method === "turn/start");
+    assert.equal(turn?.params.collaborationMode?.mode, "plan", "Plan mode is the wire contract for the visible planner turn");
+    assert.equal(turn?.params.collaborationMode?.settings?.model, "fake-model");
+    assert.equal(turn?.params.collaborationMode?.settings?.reasoning_effort, "high", "the Plan collaboration mode's own effort");
+    assert.equal(turn?.params.outputSchema, undefined, "no outputSchema on the visible Planner turn");
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("stop() with a live turn waiter never respawns the App Server and leaves no child", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-stop-norestart-"));
+  const marker = join(directory, "process.txt");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 60_000,
+    idleProcessMs: 0,
+    env: { ...process.env, FAKE_CODEX_PROCESS_MARKER: marker },
+  });
+  try {
+    const threadId = await codex.startThread({ cwd: directory, name: "Live waiter" });
+    const pending = codex.startTurn(threadId, { prompt: "HANG" });
+    await sleep(120); // the turn is genuinely running: a live waiter is registered
+    const pid = Number(await readFile(marker, "utf8"));
+    // Handler attached BEFORE stop so the settle is observed, never unhandled.
+    const pendingAssertion = assert.rejects(pending, /Codex app-server stopped/);
+    await codex.stop();
+    await pendingAssertion;
+    // The waiter settle during stop() must NOT have crashed into a fresh
+    // start()/respawn: any replacement child would have overwritten the
+    // process marker with ITS pid.
+    await sleep(400);
+    const after = Number((await readFile(marker, "utf8")).trim());
+    assert.equal(after, pid, "stop() must never respawn a replacement App Server (marker pid changed)");
+    await waitForProcessExit(pid); // the ORIGINAL child is gone: no leftover
+    // stop() is idempotent AND post-stop start/request FAIL explicitly instead
+    // of restarting the process.
+    await codex.stop();
+    await assert.rejects(codex.startThread({ cwd: directory, name: "Late caller" }), /Codex app-server stopped/);
+    const still = Number((await readFile(marker, "utf8")).trim());
+    assert.equal(still, pid, "a post-stop start must never spawn a process");
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("concurrent stop() calls share ONE teardown: both settle only after the old child exits, no replacement", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-stop-singleflight-"));
+  const marker = join(directory, "process.txt");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 60_000,
+    idleProcessMs: 0,
+    env: { ...process.env, FAKE_CODEX_PROCESS_MARKER: marker },
+  });
+  try {
+    const threadId = await codex.startThread({ cwd: directory, name: "Single flight" });
+    const pending = codex.startTurn(threadId, { prompt: "HANG" });
+    await sleep(120); // live waiter registered so the teardown has work to settle
+    const pid = Number(await readFile(marker, "utf8"));
+    const pendingAssertion = assert.rejects(pending, /Codex app-server stopped/);
+    const first = codex.stop();
+    const second = codex.stop();
+    // Deterministic single-flight: both callers await the SAME promise, so the
+    // second can never resolve before the first finishes tearing down.
+    assert.strictEqual(second, first, "concurrent stop() calls share ONE settle promise");
+    let doneBeforeExit = false;
+    void first.then(() => { doneBeforeExit = processAlive(pid); });
+    await Promise.all([first, second, pendingAssertion]);
+    assert.equal(doneBeforeExit, false, "stop() settles only AFTER the old child exited");
+    await waitForProcessExit(pid); // the ORIGINAL child is gone: no leftover
+    // Repeated stop() after completion stays idempotent on the same promise.
+    const third = codex.stop();
+    assert.strictEqual(third, first, "stop() stays idempotent after completion");
+    // No replacement child was ever spawned.
+    const after = Number((await readFile(marker, "utf8")).trim());
+    assert.equal(after, pid, "no replacement App Server child was spawned");
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("idle shutdown is recoverable: the child exits but the next health() respawns a fresh App Server", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-idle-recoverable-"));
+  const marker = join(directory, "process.txt");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 50,
+    env: { ...process.env, FAKE_CODEX_PROCESS_MARKER: marker },
+  });
+  try {
+    // health() starts the App Server; with nothing else outstanding the client
+    // goes idle and the RECOVERABLE idle shutdown closes the child.
+    await codex.health();
+    const firstPid = Number(await readFile(marker, "utf8"));
+    await waitForProcessExit(firstPid);
+    // The client was NOT permanently stopped (1.0.7 regression: an idle close
+    // used to latch the client forever with "Codex app-server stopped"): the
+    // very next call spawns a FRESH App Server and succeeds.
+    await codex.health();
+    const secondPid = Number(await readFile(marker, "utf8"));
+    assert.notEqual(secondPid, firstPid, "idle shutdown must be followed by a NEW App Server process");
+    assert.equal(processAlive(secondPid), true);
+    // A completed RPC on the respawned server works and no THIRD process
+    // appears while the replacement is healthy.
+    await codex.health();
+    assert.equal(Number((await readFile(marker, "utf8")).trim()), secondPid, "no third process may be spawned while the replacement is healthy");
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("start() racing an in-flight idle shutdown waits for the old child and spawns exactly ONE replacement", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-idle-race-"));
+  const marker = join(directory, "process.txt");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    quitGraceMs: 1_000,
+    killGraceMs: 1_000,
+    env: { ...process.env, FAKE_CODEX_PROCESS_MARKER: marker },
+  });
+  try {
+    await codex.health();
+    const firstPid = Number(await readFile(marker, "utf8"));
+    const internals = codex as unknown as { idleShutdown(): Promise<void> };
+    // Begin the RECOVERABLE idle shutdown and race it with TWO concurrent
+    // start()-driven calls: both must WAIT for the old child to exit, then
+    // share ONE replacement spawn.
+    const shuttingDown = internals.idleShutdown();
+    const concurrent = await Promise.all([codex.health(), codex.health()]);
+    await shuttingDown;
+    assert.equal(concurrent.length, 2);
+    await waitForProcessExit(firstPid);
+    const secondPid = Number((await readFile(marker, "utf8")).trim());
+    assert.notEqual(secondPid, firstPid, "a fresh App Server replaced the idle-closed one");
+    assert.equal(processAlive(secondPid), true);
+    // The race settled: exactly ONE replacement may exist, never more.
+    await sleep(300);
+    assert.equal(Number((await readFile(marker, "utf8")).trim()), secondPid, "exactly ONE replacement may be spawned by the race");
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("idle shutdown then final stop(): the permanent teardown still latches and refuses restart", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-idle-then-stop-"));
+  const marker = join(directory, "process.txt");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: { ...process.env, FAKE_CODEX_PROCESS_MARKER: marker },
+  });
+  try {
+    await codex.health();
+    const pid = Number(await readFile(marker, "utf8"));
+    // Recoverable idle shutdown completes first; the client stays usable.
+    await (codex as unknown as { idleShutdown(): Promise<void> }).idleShutdown();
+    await waitForProcessExit(pid);
+    // The FINAL stop still latches the client: no restart is possible after.
+    await codex.stop();
+    await assert.rejects(codex.health(), /Codex app-server stopped/, "the FINAL stop must still refuse any restart");
+    assert.equal(Number((await readFile(marker, "utf8")).trim()), pid, "no process may ever be spawned after the final stop");
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("final stop() colliding with an in-flight idle shutdown stays single-flight with no leftover child", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-stop-idle-race-"));
+  const marker = join(directory, "process.txt");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    quitGraceMs: 1_000,
+    killGraceMs: 1_000,
+    env: { ...process.env, FAKE_CODEX_PROCESS_MARKER: marker },
+  });
+  try {
+    await codex.health();
+    const pid = Number(await readFile(marker, "utf8"));
+    const internals = codex as unknown as { idleShutdown(): Promise<void> };
+    const shuttingDown = internals.idleShutdown();
+    // The final stop lands WHILE the recoverable idle shutdown closes the
+    // child: it must WAIT for that close, stay single-flight, and leave no
+    // child behind.
+    const first = codex.stop();
+    const second = codex.stop();
+    assert.strictEqual(second, first, "concurrent final stop() calls share ONE settle promise");
+    await Promise.all([first, second, shuttingDown]);
+    await waitForProcessExit(pid);
+    // No replacement was ever spawned and the latch refuses restarts.
+    await sleep(300);
+    assert.equal(Number((await readFile(marker, "utf8")).trim()), pid, "no replacement App Server may be spawned by the race");
+    await assert.rejects(codex.health(), /Codex app-server stopped/);
+    const third = codex.stop();
+    assert.strictEqual(third, first, "stop() stays idempotent after the idle-shutdown collision");
   } finally {
     await codex.stop();
     await rm(directory, { recursive: true, force: true });

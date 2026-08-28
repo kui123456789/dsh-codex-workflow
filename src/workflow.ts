@@ -20,11 +20,26 @@ import {
   type SubmitVerdictCommand,
 } from "./bridge-protocol.js";
 import { collectEvidence, isGitRepository } from "./evidence.js";
-import { SILENT_REVIEW_PROMPT_BLOCK } from "./review-contract.js";
+import {
+  SILENT_REVIEW_PROMPT_BLOCK,
+  reviewDisplayError,
+  reviewRewritePrompt,
+} from "./review-contract.js";
+import {
+  ALIGN_OUTPUT_SCHEMA,
+  AUTHORITY_HIERARCHY,
+  parseAlignment,
+  reviewAlignPrompt,
+  reviewReconcilePrompt,
+} from "./review-authority.js";
 import { PLANNER_OUTPUT_SCHEMA, REVIEW_OUTPUT_SCHEMA } from "./schemas.js";
 import { WorkflowStore } from "./store.js";
 import type {
+  AlignmentOutcome,
+  PersistedTurnBaseline,
   PlannerResult,
+  ReviewConflict,
+  ReviewConflictInfo,
   ReviewEvidence,
   ReviewInput,
   ReviewResult,
@@ -47,6 +62,15 @@ export interface CodexGateway {
     effort?: WorkflowConfig["plannerEffort"];
     outputSchema?: Record<string, unknown>;
     planMode?: boolean;
+    /** Pin the turn to the silent single-message review mode (non-collaborative
+     * "default" mode with the silent-review developer instructions at protocol
+     * level). Used by the DISPLAY-REWRITE turn on the durable Reviewer task:
+     * it emits exactly one final message and can never start sub-tasks. */
+    silentReview?: boolean;
+    /** Reports the EFFECTIVE model the turn actually runs with (explicit
+     * override or the collaboration-mode-resolved model), so callers can
+     * persist it and reuse it for later turns and forks. */
+    onModel?: (model: string) => void;
     onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
   }, signal?: AbortSignal): Promise<TurnWaitResult>;
   continueTurn(
@@ -62,6 +86,62 @@ export interface CodexGateway {
     onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
   }, signal?: AbortSignal): Promise<{ threadId: string; result: TurnWaitResult }>;
   interrupt(threadId: string, turnId: string, signal?: AbortSignal): Promise<void>;
+  /** Structured conversion of a visible reply inside an EPHEMERAL fork of the
+   * given persistent thread (`thread/fork` with `ephemeral: true` + one
+   * read-only `turn/start` carrying the output schema). The fork is
+   * unsubscribed exactly once on every ending path and its id must never be
+   * persisted into plannerThreadId/reviewerThreadId. */
+  normalizeInFork(options: {
+    threadId: string;
+    cwd: string;
+    prompt: string;
+    model?: string;
+    outputSchema: Record<string, unknown>;
+    onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
+  }, signal?: AbortSignal): Promise<TurnWaitResult>;
+  /** The App Server's default model selection (when present). Used to make the
+   * reviewer model explicit even when nothing is configured, so visible
+   * reviewer turns and their conversion forks always share one model. */
+  resolveDefaultModel?(signal?: AbortSignal): Promise<string | undefined>;
+  /** Create a fresh, durable, empty REVIEW-ONLY thread (never copying the
+   * source chat history) with the readable review contract + full context as
+   * its developer instructions (AUXILIARY channel only: a native review turn
+   * may not reliably see thread-settings instructions), plus model/safety
+   * settings. Since 1.0.8 this is used ONLY by `review_only` (which has no
+   * Planner task to reuse) and never for planned flows — planned reviews
+   * append to the original Planner task. Verdict correctness never depends on
+   * the developer instructions — the full per-round context AND the
+   * item-by-item coverage gate ride the `review/start` custom target on every
+   * round. */
+  startReviewerThread?(options: {
+    cwd: string;
+    name: string;
+    model?: string;
+    developerInstructions?: string;
+  }, signal?: AbortSignal): Promise<string>;
+  /** Refresh the per-round readable contract/context as developer instructions
+   * on the durable Reviewer thread before a re-review runs. AUXILIARY channel
+   * only: the `review/start` custom target carries the complete per-round
+   * context (original task, approved plan, implementation summary, test
+   * results, workspace evidence) plus the coverage gate on every path, Git
+   * included — so verdict correctness never depends on this thread-settings
+   * refresh reaching the model. */
+  updateReviewerInstructions?(threadId: string, cwd: string, instructions: string, signal?: AbortSignal): Promise<void>;
+  /** Capture the PERSISTED-turn baseline of a durable thread (`thread/read`,
+   * `includeTurns: true`) BEFORE a visible review/rewrite turn starts: the
+   * ids of the turns already in the history. The appended turn is later
+   * detected against this set, because the RPC turn id of `review/start`/
+   * `turn/start` is NOT guaranteed to equal the persisted `thread.turns[].id`
+   * (real App Server evidence). */
+  captureTurnBaseline?(threadId: string, signal?: AbortSignal): Promise<PersistedTurnBaseline>;
+  /** Read the PERSISTED final visible output of the turn appended to a
+   * durable thread since its baseline — the authoritative display text Codex
+   * Desktop actually shows, which can differ from the streamed/`turn/
+   * completed` aggregation in `TurnWaitResult.text`. Exactly one new
+   * COMPLETED turn must have appeared: zero (missing) or several (ambiguous)
+   * return `undefined`, and callers must treat that as a retryable failure —
+   * NEVER fall back to the in-memory text. */
+  readAppendedTurnText?(threadId: string, baseline: PersistedTurnBaseline, signal?: AbortSignal): Promise<{ text: string; itemType?: string } | undefined>;
 }
 
 export type { ReviewInput };
@@ -89,6 +169,19 @@ export class WorkflowManager {
   private readonly nudgedTurns = new Set<string>();
   private readonly recovering = new Set<string>();
   private readonly recoveringNotices = new Set<string>();
+  /** In-process exact mapping of the CURRENTLY ACTIVE turn per workflow —
+   * visible (persistent-thread) turns AND ephemeral conversion-fork turns.
+   * `cancel` interrupts this mapping first so it always hits the thread/turn
+   * pair that is genuinely running right now: an ephemeral fork turn is
+   * interrupted on the FORK thread and can never be mispaired with the
+   * persisted thread id, and a completed visible turn is never interrupted.
+   * Ephemeral entries are never persisted. */
+  private readonly activeTurns = new Map<string, { threadId: string; turnId: string; kind: "planner" | "reviewer"; ephemeral: boolean }>();
+  /** Foreground tool flows (Planner start/continue, DSH-led review/review-only
+   * including their ephemeral normalization) that teardown must interrupt and
+   * AWAIT before the App Server stops and the stores close — otherwise a
+   * late-resolving turn could write into a closed store. */
+  private readonly foreground = new Set<Promise<unknown>>();
   /** Manager-owned background tasks that must settle before teardown. */
   private readonly backgroundTasks = new Set<Promise<unknown>>();
   /** Per-submission lifecycle signals. Tool-call signals are deliberately not
@@ -140,15 +233,35 @@ export class WorkflowManager {
     this.stopped = true;
     this.lifecycleController.abort();
     for (const controller of this.submissionControllers.values()) controller.abort();
+    // Interrupt every ACTIVE foreground turn (visible Planner/Reviewer or
+    // ephemeral normalization fork) so the foreground tool flows settle via
+    // their own abort/interrupt paths instead of timing out into a closed
+    // store. Background Reviewer turns are interrupted by callback.stop().
+    for (const active of this.activeTurns.values()) {
+      void this.codex.interrupt(active.threadId, active.turnId).catch(() => undefined);
+    }
+    const foreground = [...this.foreground];
     const callbackStop = this.callback?.stop();
     const chain = this.recoveryChain;
     this.recoveryChain = undefined;
     if (chain) await chain.catch(() => undefined);
-    // Wait for every manager-owned task to settle (they observe the abort
-    // and stop writing/enqueueing/spawning).
+    // Wait for EVERY manager-owned task to settle (foreground tool flows AND
+    // background recovery-derived tasks; they observe the abort and the
+    // interrupts and stop writing/enqueueing/spawning).
     const tasks = [...this.backgroundTasks];
-    await Promise.allSettled(tasks);
+    await Promise.allSettled([...tasks, ...foreground]);
     await callbackStop;
+  }
+
+  /** Track every foreground tool flow so teardown can interrupt and await it
+   * before stopping the App Server and closing the stores. Registered at the
+   * method boundary so even a tool call that dies mid-flight is awaited. */
+  private trackForeground(task: Promise<unknown>): Promise<unknown> {
+    this.foreground.add(task);
+    void task.finally(() => {
+      this.foreground.delete(task);
+    }).catch(() => undefined);
+    return task;
   }
 
   /** Track every manager-owned background task so teardown can await them
@@ -194,29 +307,46 @@ export class WorkflowManager {
     this.trackBackground(task);
   }
 
+  /** Foreground tool flow: tracked so teardown interrupts and awaits it. */
   async start(
     args: { task: string; plannerModel?: string; plannerEffort?: WorkflowConfig["plannerEffort"] },
     exec: ToolRunContext,
   ): Promise<WorkflowRecord> {
+    return this.trackForeground(this.startInner(args, exec)) as Promise<WorkflowRecord>;
+  }
+
+  private async startInner(
+    args: { task: string; plannerModel?: string; plannerEffort?: WorkflowConfig["plannerEffort"] },
+    exec: ToolRunContext,
+  ): Promise<WorkflowRecord> {
     const agent = requireAgent(exec);
-    await this.assertNoActiveWorkflow(agent.id);
-    const now = new Date().toISOString();
-    const record: WorkflowRecord = {
-      schemaVersion: 1,
-      id: randomUUID(),
-      dshSessionId: agent.id,
-      cwd: agent.session.header.cwd ?? process.cwd(),
-      task: args.task.trim(),
-      mode: "planned",
-      phase: "planning",
-      createdAt: now,
-      updatedAt: now,
-      assumptions: [],
-      questions: [],
-      reviewCycles: 0,
-      noChangeReviewRounds: 0,
-    };
-    await this.store.save(record);
+    const createLease = await this.acquireWorkflowCreateLease(agent.id);
+    if (!createLease) {
+      throw new Error(`session ${agent.id} is already creating a Codex workflow; continue the existing workflow instead of starting another`);
+    }
+    let record: WorkflowRecord;
+    try {
+      await this.assertNoActiveWorkflow(agent.id);
+      const now = new Date().toISOString();
+      record = {
+        schemaVersion: 1,
+        id: randomUUID(),
+        dshSessionId: agent.id,
+        cwd: agent.session.header.cwd ?? process.cwd(),
+        task: args.task.trim(),
+        mode: "planned",
+        phase: "planning",
+        createdAt: now,
+        updatedAt: now,
+        assumptions: [],
+        questions: [],
+        reviewCycles: 0,
+        noChangeReviewRounds: 0,
+      };
+      await this.store.save(record);
+    } finally {
+      await createLease.release().catch(() => undefined);
+    }
     try {
       const plannerThreadId = await this.codex.startThread({
         cwd: record.cwd,
@@ -229,18 +359,25 @@ export class WorkflowManager {
         r.plannerThreadId = plannerThreadId;
       }, { ignoreCancelled: false });
       if (threadCommit.suppressed) return threadCommit.record;
+      // The EFFECTIVE planner model: explicit override/config, or — when
+      // unconfigured — whatever the Plan collaboration mode resolves (the
+      // client reports it via onModel and the fork reuses the SAME model).
+      let plannerModel = args.plannerModel || this.config.plannerModel || undefined;
       const outcome = await this.codex.startTurn(plannerThreadId, {
         prompt: plannerPrompt(record.task),
-        ...(args.plannerModel || this.config.plannerModel
-          ? { model: args.plannerModel || this.config.plannerModel }
-          : {}),
+        ...(plannerModel ? { model: plannerModel } : {}),
         effort: args.plannerEffort ?? this.config.plannerEffort,
-        outputSchema: PLANNER_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+        // Since 1.0.7 the VISIBLE planner turn carries no outputSchema: its
+        // readable reply (a <proposed_plan> Markdown block, numbered questions
+        // or a failure explanation) is what Codex Desktop shows. The structured
+        // PlannerResult is produced by an ephemeral-fork conversion turn inside
+        // acceptPlannerOutcome.
         planMode: true,
+        onModel: (model) => { plannerModel = model; },
         // Persist the planner turn the moment it starts so cancel can interrupt it.
         onStarted: (started) => this.registerActiveTurn(record.id, started.threadId, started.turnId, "planner"),
       }, exec.signal);
-      return await this.acceptPlannerOutcome(record.id, outcome, exec);
+      return await this.acceptPlannerOutcome(record.id, outcome, exec, plannerModel, record.cwd);
     } catch (error) {
       const failed = await this.store.update(record.id, (r) => {
         r.phase = "failed";
@@ -348,6 +485,7 @@ export class WorkflowManager {
         r.stagedVerdict = undefined;
         r.submissionNotice = undefined;
         r.callbackState = "idle";
+        this.resetDesktopOpenState(r, command.submissionId ?? r.submissionId);
         return r;
       }
       if (submitted.fingerprint !== evidence.fingerprint) {
@@ -362,6 +500,7 @@ export class WorkflowManager {
         r.appliedVerdictEvidenceFingerprint = undefined;
         r.stagedVerdict = undefined;
         r.callbackState = "idle";
+        this.resetDesktopOpenState(r, command.submissionId ?? r.submissionId);
         return r;
       }
       const result = applyReviewConsistency(command.verdict);
@@ -382,6 +521,7 @@ export class WorkflowManager {
       r.phase = computed.phase;
       r.error = computed.error;
       r.noChangeReviewRounds = computed.noChangeReviewRounds ?? r.noChangeReviewRounds;
+      this.resetDesktopOpenState(r, command.submissionId ?? r.submissionId);
       return r;
     }, { ignoreCancelled: false });
     return outcome.record;
@@ -472,6 +612,18 @@ export class WorkflowManager {
     return { committed: !outcome.suppressed && changed, record: outcome.record };
   }
 
+  /** Mark the current applied verdict for one best-effort desktop deep-link.
+   * The opener runs only after the callback has released its App Server writer. */
+  private resetDesktopOpenState(record: WorkflowRecord, submissionId: string | undefined): void {
+    // Legacy/manual verdicts have no submission id; the verdict request id is
+    // still a stable per-round identity for desktop-open deduplication.
+    record.desktopOpenSubmissionId = submissionId ?? record.appliedVerdictRequestId;
+    record.desktopOpenAttempts = 0;
+    record.desktopOpenNextAt = undefined;
+    record.desktopOpenError = undefined;
+    record.desktopOpenState = this.config.openCodexDesktopOnReview === false ? "disabled" : "pending";
+  }
+
   async commitSubmissionNoticeDelivery(
     command: SubmissionNoticeCommand,
   ): Promise<{ committed: boolean; record: WorkflowRecord }> {
@@ -556,6 +708,10 @@ export class WorkflowManager {
       throw new Error(`workflow ${workflowId} is not waiting for planner input`);
     }
     let outcome: TurnWaitResult;
+    // Reuse the persisted EFFECTIVE planner model (start's override or the
+    // Plan-mode-resolved model) so continue/restart and the conversion fork
+    // all run with the SAME model the original planner turn used.
+    let plannerModel = record.plannerModel || this.config.plannerModel || undefined;
     const pending = this.pending.get(workflowId);
     if (pending) {
       outcome = await this.codex.continueTurn(pending, answers, exec.signal);
@@ -563,16 +719,19 @@ export class WorkflowManager {
       await this.codex.resumeThread(record.plannerThreadId, record.cwd, exec.signal);
       outcome = await this.codex.startTurn(record.plannerThreadId, {
         prompt: resumedAnswerPrompt(answers),
-        ...(this.config.plannerModel ? { model: this.config.plannerModel } : {}),
+        ...(plannerModel ? { model: plannerModel } : {}),
         effort: this.config.plannerEffort,
-        outputSchema: PLANNER_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+        // Same visible-reply contract as the first planner turn: no
+        // outputSchema, the readable reply is converted by an ephemeral fork.
         planMode: true,
+        onModel: (model) => { plannerModel = model; },
         onStarted: (started) => this.registerActiveTurn(workflowId, started.threadId, started.turnId, "planner"),
       }, exec.signal);
     }
-    return this.acceptPlannerOutcome(workflowId, outcome, exec);
+    return this.acceptPlannerOutcome(workflowId, outcome, exec, plannerModel, record.cwd);
   }
 
+  /** Foreground tool flow: tracked so teardown interrupts and awaits it. */
   async review(
     workflowId: string,
     input: ReviewInput,
@@ -585,7 +744,7 @@ export class WorkflowManager {
     if (record.mode !== "review_only") {
       if (!record.planMarkdown || !record.plannerThreadId) throw new Error(`workflow ${workflowId} has no completed plan`);
     }
-    return this.reviewOnce(workflowId, input, exec, record.mode === "review_only" ? undefined : record.plannerThreadId);
+    return this.trackForeground(this.reviewOnce(workflowId, input, exec)) as Promise<WorkflowRecord>;
   }
 
   /**
@@ -724,7 +883,7 @@ export class WorkflowManager {
   }
 
   /**
-   * One callback run for a submission: create/resume the Reviewer task, apply
+   * One callback run for a submission: resume the workflow's review task, apply
    * the structured verdict or classify the failure, with bounded retry on
    * busy conditions. Verdict handling is a durable two-phase pipeline so a
    * crash can never lose the only valid verdict:
@@ -797,6 +956,11 @@ export class WorkflowManager {
             codexThreadId: current.codexThreadId!,
             cwd: current.cwd,
             prompt,
+            // The original task/plan context lets the background dispatcher
+            // enforce the SAME visible-review display contract as the
+            // DSH-led path (task language + four readable sections).
+            task: current.task,
+            ...(current.planMarkdown ? { planMarkdown: current.planMarkdown } : {}),
             reviewerThreadId: current.reviewerThreadId,
             reviewerName: `DSH Reviewer: ${workflowId}`,
             ...(current.reviewerModel || this.config.reviewerModel
@@ -859,6 +1023,99 @@ export class WorkflowManager {
           outcome = { kind: "retryable_busy", reason: busyReason };
         }
         if (leaseLost) return current; // never write or enqueue after losing the lease
+        // 1.0.10 authority outcome of this review call, shared by the conflict
+        // refusal and the staging pipeline below. An unresolved conflict
+        // restores the PRE-REVIEW phase (executing/fixing as the workflow was
+        // when this submission started).
+        const priorPhase: WorkflowPhase = current.phase === "fixing" ? "fixing" : "executing";
+        let contractConflict: ReviewConflictInfo | undefined;
+        if (outcome.kind === "verdict") {
+          // 1.0.10 REVIEW AUTHORITY ALIGNMENT on the bridge path: the verdict
+          // must align with the authority hierarchy before it may be staged.
+          // One invisible alignment fork checks the result; on conflict the
+          // SAME visible task gets ONE reconciliation turn and the corrected
+          // verdict is re-normalized and re-aligned. An unresolved conflict
+          // NEVER stages/applies (no latestReview, no cycle, no fix prompt);
+          // two CONSECUTIVE unresolved conflicts block the workflow. An
+          // authority-machinery failure (fork/turn/timeout) keeps the
+          // submission RETRYABLE like any normalization failure.
+          let verdict = applyReviewConsistency(outcome.verdict);
+          let contractFailed = false;
+          try {
+            // The alignment prompt receives the PREVIOUSLY APPLIED review and
+            // THIS submission's fix summary (both persisted on the record), so
+            // a legitimately carried-forward finding is never misjudged as a
+            // generic conflict.
+            const alignment = await this.alignReview(current, verdict, signal, current.pendingReviewRequest);
+            if (!alignment.aligned) {
+              const reconciled = await this.reconcileReview(current, verdict, alignment.conflicts, signal, current.pendingReviewRequest);
+              contractConflict = {
+                conflicts: alignment.conflicts,
+                reconciled: true,
+                resolved: reconciled.aligned,
+                at: new Date().toISOString(),
+              };
+              if (reconciled.aligned) {
+                verdict = reconciled.result;
+              } else {
+                contractFailed = true;
+              }
+            }
+          } catch (error) {
+            if (leaseLost) return current;
+            if (signal?.aborted || this.stopped) throw error;
+            // The authority machinery itself failed: retryable infrastructure,
+            // never a verdict, never a consumed cycle.
+            outcome = { kind: "retryable_busy", reason: "review authority alignment failed" };
+          }
+          if (outcome.kind === "retryable_busy") {
+            // fall through to the shared busy handling below (marks retrying).
+          } else if (contractFailed) {
+            const failures = (current.reviewContractFailures ?? 0) + 1;
+            const blocked = failures >= 2;
+            const conflicted = await updateCurrent((r) => {
+              if (r.submissionId !== submissionId || submissionTerminal(r.submissionState)) return;
+              r.latestReviewConflict = contractConflict;
+              r.reviewContractFailures = failures;
+              r.submissionState = "failed";
+              r.submissionError = "reviewer contract conflict: the review conflicts with the authority hierarchy and was not reconciled after one correction attempt; no code changes are required";
+              r.callbackState = "failed";
+              if (blocked) {
+                r.phase = "blocked";
+                r.error = `reviewer contract failure: the review conflicts with the authority hierarchy and was not reconciled after ${failures} consecutive review calls; no code changes are required`;
+              } else {
+                r.phase = priorPhase;
+                r.error = "review contract conflict: the review conflicts with the authority hierarchy and was not reconciled; no code changes are required — the next submission may retry";
+              }
+              if (!r.submissionNotice || r.submissionNotice.command.submissionId !== submissionId) {
+                const command: SubmissionNoticeCommand = {
+                  version: 1,
+                  kind: "submission_notice",
+                  requestId: newRequestId(),
+                  createdAt: new Date().toISOString(),
+                  workflowId,
+                  submissionId,
+                  codexThreadId: r.codexThreadId!,
+                  dshSessionId: r.dshSessionId,
+                  level: "error",
+                  message: blocked
+                    ? `Codex Reviewer 契约故障：审查意见与权威层级（原始任务/批准计划）冲突且连续 ${failures} 次审查未能在一次纠正中对齐；无需修改代码。`
+                    : `Codex Reviewer 审查意见与权威层级（原始任务/批准计划）冲突且一次纠正未对齐；无需修改代码，可以再次提交审查。`,
+                };
+                r.submissionNotice = { command, state: "prepared" };
+              }
+            });
+            if (conflicted.submissionId !== submissionId) return conflicted;
+            // Delivery of the contract-failure diagnostic (never a fix prompt).
+            await this.enqueueSubmissionNotice(workflowId, submissionId, conflicted, signal)
+              .catch(() => undefined);
+            return conflicted;
+          } else {
+            // The authority validated the verdict (or the reconciliation
+            // corrected it): hand the aligned verdict to the staging pipeline.
+            outcome = { kind: "verdict", verdict };
+          }
+        }
         if (outcome.kind === "verdict") {
           if (!this.bridgeQueue) {
             const committed = await updateCurrent((r) => {
@@ -891,6 +1148,13 @@ export class WorkflowManager {
             r.stagedVerdict = { command, createdAt: command.createdAt };
             r.submissionError = undefined;
             r.submissionRetryAt = undefined;
+            // 1.0.10: a reconciliation-corrected verdict records the
+            // auto-correction on the durable record (status surface), and an
+            // ALIGNED verdict (with or without reconciliation) ends the
+            // unresolved-conflict streak — a later NON-consecutive conflict
+            // must never accumulate towards the two-strike block.
+            if (contractConflict) r.latestReviewConflict = contractConflict;
+            r.reviewContractFailures = 0;
           });
           if (staged.submissionId !== submissionId || submissionTerminal(staged.submissionState)) return staged;
           // Phase B: idempotent enqueue of the exact staged command.
@@ -1220,6 +1484,7 @@ export class WorkflowManager {
    * reuse the persisted Reviewer task via the ordinary `review` tool. All
    * evidence, decision-gate, no-change and cycle-limit logic is shared.
    */
+  /** Foreground tool flow: tracked so teardown interrupts and awaits it. */
   async reviewOnly(
     args: {
       task?: string;
@@ -1240,6 +1505,15 @@ export class WorkflowManager {
       );
     }
     const now = new Date().toISOString();
+    // Persist the EFFECTIVE reviewer model/effort so the durable Reviewer
+    // thread, the ephemeral normalization fork and every later repair round
+    // all share the SAME model — the caller's override, the bundle config, or
+    // the resolved server default when nothing is configured (never a silent
+    // re-pick).
+    const reviewerModel = args.reviewerModel
+      || this.config.reviewerModel
+      || await this.codex.resolveDefaultModel?.(exec.signal)
+      || undefined;
     const record: WorkflowRecord = {
       schemaVersion: 1,
       id: randomUUID(),
@@ -1254,36 +1528,15 @@ export class WorkflowManager {
       questions: [],
       reviewCycles: 0,
       noChangeReviewRounds: 0,
-      // Persist the effective reviewer model/effort so later repair rounds keep
-      // the caller's override even when the bundle config changes.
-      reviewerModel: args.reviewerModel || this.config.reviewerModel || undefined,
+      reviewerModel,
       reviewerEffort: args.reviewerEffort ?? this.config.reviewerEffort,
     };
     await this.store.save(record);
-    let sourceThread: string;
-    try {
-      sourceThread = await this.codex.startThread({
-        cwd: record.cwd,
-        ...(record.reviewerModel ? { model: record.reviewerModel } : {}),
-        name: threadName("DSH Review", record.task || "review workspace"),
-      }, exec.signal);
-      const sourceCommit = await this.store.update(record.id, (r) => {
-        r.sourceThreadId = sourceThread;
-      }, { ignoreCancelled: false });
-      if (sourceCommit.suppressed) return sourceCommit.record;
-    } catch (error) {
-      const failed = await this.store.update(record.id, (r) => {
-        r.phase = "failed";
-        r.error = errorMessage(error);
-      }, { ignoreCancelled: false });
-      if (failed.suppressed) return failed.record;
-      throw error;
-    }
-    return this.reviewOnce(record.id, {
+    return this.trackForeground(this.reviewOnce(record.id, {
       implementationSummary: args.implementationSummary,
       ...(args.changedFiles ? { changedFiles: args.changedFiles } : {}),
       ...(args.testResults ? { testResults: args.testResults } : {}),
-    }, exec, sourceThread);
+    }, exec)) as Promise<WorkflowRecord>;
   }
 
   async decide(
@@ -1326,10 +1579,13 @@ export class WorkflowManager {
     // Whether a Reviewer turn is currently executing. Provsional per-message
     // JSON is never surfaced; `latestReview` only ever holds an applied verdict.
     // A live Reviewer turn is reported by the callback dispatcher (accurate even
-    // during retry backoff / verdict delivery / terminal states); the DSH-led
-    // reviewing phase is the fallback when no dispatcher is injected.
+    // during retry backoff / verdict delivery / terminal states), by the
+    // in-process active-turn mapping (visible Reviewer turns AND ephemeral
+    // conversion forks), or by the DSH-led reviewing phase as the fallback when
+    // no dispatcher is injected.
     const reviewerActive =
       this.callback?.activeReview?.(record.id) === true
+      || this.activeTurns.get(record.id)?.kind === "reviewer"
       || (record.phase === "reviewing" && Boolean(record.reviewerTurnId));
     return { ...record, reviewerActive };
   }
@@ -1340,15 +1596,39 @@ export class WorkflowManager {
    * atomic update; the interrupt afterwards is best-effort and a failure keeps
    * the workflow cancelled. All other writers suppress themselves once the
    * record is cancelled, so cancelled is terminal.
+   *
+   * The interrupt targets the in-process ACTIVE turn (visible or ephemeral)
+   * whenever one is registered: an active ephemeral conversion-fork turn is
+   * interrupted on the FORK thread/turn pair, so an ephemeral turnId can never
+   * be mispaired with a persistent threadId. Only when nothing is active does
+   * cancel fall back to the persisted planner/reviewer pair.
    */
   async cancel(workflowId: string, exec: ToolRunContext): Promise<WorkflowRecord> {
     const agent = requireAgent(exec);
+    const active = this.activeTurns.get(workflowId);
     let target: { threadId: string; turnId: string } | undefined;
     const outcome = await this.store.update(workflowId, (r) => {
       if (r.dshSessionId !== agent.id) throw new Error("workflow belongs to another DSH session");
-      const threadId = r.reviewerThreadId ?? r.plannerThreadId;
-      const turnId = r.reviewerTurnId ?? r.plannerTurnId;
-      if (threadId && turnId) target = { threadId, turnId };
+      if (!active) {
+        // Persisted fallback, ONLY for the distinct-Reviewer layout
+        // (review_only task, or a legacy record with its own reviewer id):
+        // there the persisted reviewer pair points at a review task that is
+        // never the planning task, so interrupting its last-known turn keeps
+        // the pre-1.0.8 contract. Since 1.0.8, planned/bridge workflows
+        // share ONE task (`reviewerThreadId === plannerThreadId`): a
+        // persisted turn id there may be an ALREADY-COMPLETED Planner or
+        // review turn, and a completed turn must never receive an
+        // `turn/interrupt` — the genuinely running turn is covered by the
+        // in-process active-turn map, by registerActiveTurn's
+        // suppressed-registration interrupt, and by the callback latch.
+        if (r.reviewerThreadId && r.reviewerTurnId && r.reviewerThreadId !== r.plannerThreadId) {
+          target = { threadId: r.reviewerThreadId, turnId: r.reviewerTurnId };
+        }
+        // The planner pair is never a fallback target: `plannerTurnId` is
+        // only persisted for COMPLETED planner turns (while the planner is
+        // running, the active-turn map covers it), so it must never receive
+        // an interrupt.
+      }
       r.phase = "cancelled";
       if (r.submissionId && !submissionTerminal(r.submissionState)) {
         // Terminate the in-flight submission so no callback state may regress.
@@ -1357,6 +1637,7 @@ export class WorkflowManager {
         r.callbackState = "failed";
       }
     }, { ignoreCancelled: true });
+    if (active) target = { threadId: active.threadId, turnId: active.turnId };
     if (target) {
       await this.codex.interrupt(target.threadId, target.turnId, exec.signal).catch(() => undefined);
     }
@@ -1376,6 +1657,10 @@ export class WorkflowManager {
     // decides whether non-blocking findings get fixed.
     if (!record || (record.phase !== "executing" && record.phase !== "fixing")) return;
     if (submissionActive(record.submissionState)) return;
+    // 1.0.10: after an UNRESOLVED review-contract conflict the workflow is not
+    // waiting for code fixes — the authority alignment refused the review, so
+    // never nudge DSH to "finish the fixes".
+    if (record.error && /review(er)? contract (conflict|failure)/i.test(record.error)) return;
     const key = `${record.id}:${turn}`;
     if (this.nudgedTurns.has(key)) return;
     this.nudgedTurns.add(key);
@@ -1391,16 +1676,22 @@ export class WorkflowManager {
 
   /**
    * Shared review pipeline used by both `review` and `reviewOnly`: capture
-   * evidence, run the detached/inline reviewer, normalize its verdict, and
-   * apply the blocking gate, no-change termination and cycle limits. Every
-   * store write goes through the atomic update primitive; any write that races
-   * a cancellation is suppressed and the cancelled record is returned.
+   * evidence, ensure the durable workflow task is available with the readable
+   * contract + full context as AUXILIARY developer instructions, run the
+   * visible review via the `review/start` CUSTOM target — Git and non-Git
+   * alike — whose instructions carry the full per-round context (original
+   * task, approved plan, implementation summary, changed files, test
+   * results, workspace evidence), the review scope and the item-by-item
+   * coverage gate, convert the readable review through an ephemeral fork,
+   * and apply the blocking gate, no-change termination and cycle limits.
+   * Every store write goes through the atomic update primitive; any write
+   * that races a cancellation is suppressed and the cancelled record is
+   * returned.
    */
   private async reviewOnce(
     workflowId: string,
     input: ReviewInput,
     exec: ToolRunContext,
-    initialSourceThread: string | undefined,
   ): Promise<WorkflowRecord> {
     const pre = await this.store.load(workflowId);
     const priorPhase: WorkflowPhase = pre?.phase === "fixing" ? "fixing" : "executing";
@@ -1419,9 +1710,6 @@ export class WorkflowManager {
         changedFiles: input.changedFiles,
       });
       const git = await isGitRepository(current.cwd);
-      const sourceThread = current.reviewerThreadId ?? initialSourceThread;
-      if (!sourceThread) throw new Error(`workflow ${workflowId} has no review source thread`);
-      if (current.reviewerThreadId) await this.codex.resumeThread(current.reviewerThreadId, current.cwd, exec.signal);
 
       const evidenceCommit = await this.store.update(workflowId, (r) => {
         r.latestReviewEvidence = evidence;
@@ -1430,50 +1718,278 @@ export class WorkflowManager {
       if (evidenceCommit.suppressed) return evidenceCommit.record;
       current = evidenceCommit.record;
 
-      const review = await this.codex.startReview({
-        threadId: sourceThread,
-        cwd: current.cwd,
-        detached: !current.reviewerThreadId,
-        target: git
-          ? { type: "uncommittedChanges" }
-          : { type: "custom", instructions: reviewInstructions(current, input) },
-        // Persist the reviewer thread/turn the moment the review has started so
-        // codex_workflow_cancel can interrupt it while it is still running.
-        onStarted: (started) => this.registerActiveTurn(workflowId, started.threadId, started.turnId, "reviewer"),
-      }, exec.signal);
-      const afterReview = await this.store.load(workflowId);
-      if (!afterReview || afterReview.phase === "cancelled") return afterReview!;
-      current = afterReview;
-      if (review.result.kind !== "completed") throw new Error("review unexpectedly requested user input");
+      // The durable visible workflow task: planned workflows append reviews to
+      // their original Planner task, so planning and review stay together in
+      // Desktop. `review_only` has no Planner and creates one review task. Old
+      // records with a distinct reviewerThreadId keep using it. The
+      // readable review contract + FULL per-round context (workflow identity,
+      // original task, approved plan, implementation summary, changed files,
+      // test results, workspace evidence) are ALSO injected as the thread's
+      // developer instructions (refreshed before every round) — but only as an
+      // AUXILIARY channel: a real App Server native review turn does not
+      // reliably see hidden thread-settings instructions, so verdict
+      // correctness never depends on them. The complete context and the
+      // coverage gate ride the `review/start` custom target on every path
+      // (see below). Desktop keeps seeing ONE workflow task for planned flows.
+      const reviewerModel = current.reviewerModel
+        || this.config.reviewerModel
+        || await this.codex.resolveDefaultModel?.(exec.signal)
+        || undefined;
+      const contract = reviewContractInstructions(current, input, evidence);
+      let reviewerThreadId = current.reviewerThreadId;
+      if (!reviewerThreadId) {
+        if (current.mode === "planned" && current.plannerThreadId) {
+          reviewerThreadId = current.plannerThreadId;
+          await this.codex.resumeThread(reviewerThreadId, current.cwd, exec.signal);
+          await this.codex.updateReviewerInstructions?.(reviewerThreadId, current.cwd, contract, exec.signal);
+        } else {
+          if (!this.codex.startReviewerThread) throw new Error("codex gateway has no startReviewerThread");
+          reviewerThreadId = await this.codex.startReviewerThread({
+            cwd: current.cwd,
+            name: `DSH Reviewer: ${workflowId}`,
+            ...(reviewerModel ? { model: reviewerModel } : {}),
+            developerInstructions: contract,
+          }, exec.signal);
+        }
+        const threadCommit = await this.store.update(workflowId, (r) => {
+          r.reviewerThreadId = reviewerThreadId!;
+        }, { ignoreCancelled: false });
+        if (threadCommit.suppressed) return threadCommit.record;
+        current = threadCommit.record;
+      } else {
+        await this.codex.resumeThread(reviewerThreadId, current.cwd, exec.signal);
+        // Auxiliary refresh of the hidden channel; never load-bearing.
+        await this.codex.updateReviewerInstructions?.(reviewerThreadId, current.cwd, contract, exec.signal);
+      }
 
-      const normalized = await this.codex.startTurn(review.threadId, {
-        prompt: normalizeReviewPrompt(current, input, review.result.text),
-        // Effective model/effort persisted at review-only creation; planned
-        // workflows fall back to the bundle config.
-        ...(current.reviewerModel || this.config.reviewerModel
-          ? { model: current.reviewerModel || this.config.reviewerModel }
-          : {}),
-        effort: current.reviewerEffort ?? this.config.reviewerEffort,
-        outputSchema: REVIEW_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
-        // The normalize turn becomes the active reviewer turn for cancellation.
-        onStarted: (started) => this.registerActiveTurn(workflowId, started.threadId, started.turnId, "reviewer"),
+      // Git AND non-Git reviews use the SAME `review/start` custom target. Its
+      // instructions carry the FULL per-round context (original task, approved
+      // plan, implementation summary, changed files, test results, workspace
+      // evidence), the review scope (for Git: the current staged/unstaged/
+      // untracked changes to be confirmed with an independent read-only `git
+      // status`/`git diff`) and the item-by-item coverage gate — a native
+      // review turn sees these directly, so the verdict never depends on
+      // hidden thread settings.
+      // Capture the PERSISTED-turn baseline BEFORE the native review turn
+      // starts: the appended (newly-persisted) turn will be detected against
+      // these ids, because the `review/start` RPC turn id is NOT guaranteed
+      // to equal the persisted `thread.turns[].id` (real App Server
+      // evidence). The baseline read is metadata-only and never touches the
+      // thread's writer.
+      const reviewBaseline = await this.codex.captureTurnBaseline?.(reviewerThreadId, exec.signal);
+      const review = await this.codex.startReview({
+        threadId: reviewerThreadId,
+        cwd: current.cwd,
+        detached: false,
+        target: { type: "custom", instructions: reviewInstructions(current, input, evidence, git) },
+        // The App Server reports the ACTUAL review task id through onStarted
+        // (an inline review may return a different thread). Enforce the 1.0.8
+        // invariant AT THE START — before registerActiveTurn or any store
+        // write — so a mismatched id can NEVER be persisted as
+        // reviewerThreadId or enter the active-turn map: interrupt the rogue
+        // turn and fail the round retryably. registerActiveTurn is only
+        // reached for the exact workflow task.
+        onStarted: async (started) => {
+          if (started.threadId !== reviewerThreadId) {
+            await this.codex.interrupt?.(started.threadId, started.turnId).catch(() => undefined);
+            throw new Error(`review/start returned task ${started.threadId}, expected the workflow task ${reviewerThreadId}; refusing to persist a second visible task`);
+          }
+          await this.registerActiveTurn(workflowId, started.threadId, started.turnId, "reviewer");
+        },
       }, exec.signal);
+      // Second net for the same invariant: a mismatched return value is
+      // rejected fail-closed — the round becomes retryable and the persisted
+      // reviewerThreadId is untouched (registerActiveTurn never saw it).
+      if (review.threadId !== reviewerThreadId) {
+        throw new Error(`review/start returned task ${review.threadId}, expected the workflow task ${reviewerThreadId}; refusing to persist a second visible task`);
+      }
+      const afterReview = await this.store.load(workflowId);
+      if (!afterReview || afterReview.phase === "cancelled") {
+        // The review turn is no longer the active target; a later cancel must
+        // never interrupt it (or the completed Planner task).
+        this.activeTurns.delete(workflowId);
+        return afterReview!;
+      }
+      current = afterReview;
+      // BOTH the visible review turn AND the ephemeral normalization turn must
+      // have genuinely completed (`status === "completed"`, not just the
+      // `completed` kind): interrupted/failed/timed-out turns carry no usable
+      // text and their residual text must never be parsed or applied. The
+      // failure falls back to the retryable phase without consuming a cycle.
+      if (review.result.kind !== "completed" || review.result.status !== "completed") {
+        if (review.result.kind !== "completed") throw new Error("review unexpectedly requested user input");
+        throw new Error(review.result.reason ?? `review turn ${review.result.status}`);
+      }
+
+      // 1.0.7 display contract, ENFORCED ON THE PERSISTED HISTORY. The
+      // authoritative display text is what `thread/read(includeTurns: true)`
+      // returns for the turn appended since the pre-review baseline on the
+      // durable workflow task — the streamed/`turn/completed` aggregation
+      // (`review.result.text`) can differ from what Codex Desktop actually
+      // persists, so it alone must never gate the contract. Validate the
+      // READ-BACK text (non-empty,
+      // readable Markdown — never a JSON envelope — the four required sections
+      // verdict/findings/test gaps/summary, and the original task's language
+      // for Chinese tasks) BEFORE the ephemeral normalization. When the
+      // persisted native review violates it, run ONE ordinary visible rewrite
+      // turn on the SAME durable workflow task (no outputSchema, read-only/
+      // network disabled/approval never enforced per turn, low effort, silent),
+      // which only re-presents the SAME verdict/findings/test-gaps in the
+      // task's language with the fixed readable sections — it never re-reviews
+      // and never creates a second visible task. The rewrite turn is persisted
+      // like any visible turn; its READ-BACK final message becomes the
+      // authoritative text for the ephemeral conversion. A missing/ambiguous
+      // read-back and a still-violating rewrite are retryable failures — NEVER
+      // a silent fallback to the in-memory text.
+      const persistedNative = await this.readBackAppended(reviewerThreadId, reviewBaseline, exec.signal);
+      if (!persistedNative) throw new Error("persisted review read-back missing or ambiguous");
+      let authoritativeText = persistedNative.text;
+      const displayError = reviewDisplayError(authoritativeText, current);
+      if (displayError) {
+        // An EMPTY review has nothing to re-present: a rewrite turn would have
+        // to invent one (a hidden re-review), which the contract forbids — so
+        // fail retryably without a rewrite turn.
+        if (authoritativeText.trim().length === 0) {
+          throw new Error(`review is empty`);
+        }
+        // Baseline BEFORE the rewrite turn, exactly like the native turn: the
+        // rewrite's persisted output is detected as an APPENDED turn, never by
+        // assuming the `turn/start` RPC id equals the persisted rollout id.
+        const rewriteBaseline = await this.codex.captureTurnBaseline?.(reviewerThreadId, exec.signal);
+        const rewrite = await this.codex.startTurn(reviewerThreadId, {
+          prompt: reviewRewritePrompt(authoritativeText, current),
+          ...(reviewerModel ? { model: reviewerModel } : {}),
+          effort: "low",
+          silentReview: true,
+          // The rewrite turn is a VISIBLE turn on the same durable thread:
+          // persist thread/turn so codex_workflow_cancel and teardown can
+          // interrupt exactly this turn while it runs.
+          onStarted: (started) => this.registerActiveTurn(workflowId, started.threadId, started.turnId, "reviewer"),
+        }, exec.signal);
+        const afterRewrite = await this.store.load(workflowId);
+        if (!afterRewrite || afterRewrite.phase === "cancelled") {
+          // Never leave the completed rewrite turn as the active cancel target.
+          this.activeTurns.delete(workflowId);
+          return afterRewrite!;
+        }
+        current = afterRewrite;
+        if (rewrite.kind !== "completed" || rewrite.status !== "completed") {
+          if (rewrite.kind !== "completed") throw new Error("review rewrite unexpectedly requested user input");
+          throw new Error(rewrite.status === "interrupted"
+            ? "review rewrite turn interrupted"
+            : (rewrite.reason ?? `review rewrite turn ${rewrite.status}`));
+        }
+        // The rewrite's AUTHORITY is its persisted history, read back exactly
+        // like the native turn's — never the in-memory aggregation. A
+        // missing/ambiguous read-back of the rewrite is also retryable.
+        const persistedRewrite = await this.readBackAppended(reviewerThreadId, rewriteBaseline, exec.signal);
+        if (!persistedRewrite) throw new Error("persisted rewrite read-back missing or ambiguous");
+        const rewrittenError = reviewDisplayError(persistedRewrite.text, current);
+        if (rewrittenError) {
+          throw new Error(`corrected review still violates the display contract: ${rewrittenError}`);
+        }
+        authoritativeText = persistedRewrite.text;
+      }
+
+      // Since 1.0.7 the visible review turn (startReview) produces a readable
+      // review; the structured verdict is derived by an EPHEMERAL fork of the
+      // workflow task, never written into the persisted task history. The fork
+      // passes the SAME effective reviewer model (persisted override, bundle
+      // config, or the resolved server default) so it never drifts to a
+      // different default. The authoritative text is the rewrite turn's final
+      // message when a display-rewrite ran, otherwise the native review text.
+      let normalized: TurnWaitResult;
+      try {
+        normalized = await this.codex.normalizeInFork({
+          threadId: review.threadId,
+          cwd: current.cwd,
+          prompt: reviewConversionPrompt(authoritativeText, workflowId),
+          ...(reviewerModel ? { model: reviewerModel } : {}),
+          outputSchema: REVIEW_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+          // The ephemeral conversion fork becomes the active reviewer turn for
+          // cancellation (in-process only — the fork id is never persisted, so
+          // reviewerThreadId keeps pointing at the durable workflow task).
+          onStarted: (started) => this.registerEphemeralTurn(workflowId, started.threadId, started.turnId, "reviewer"),
+        }, exec.signal);
+      } finally {
+        this.activeTurns.delete(workflowId);
+      }
       const afterNormalize = await this.store.load(workflowId);
       if (!afterNormalize || afterNormalize.phase === "cancelled") return afterNormalize!;
       current = afterNormalize;
       if (normalized.kind !== "completed") throw new Error("review normalization unexpectedly requested user input");
+      if (normalized.status !== "completed") {
+        throw new Error(normalized.reason ?? `review normalization turn ${normalized.status}`);
+      }
 
       const result = applyReviewConsistency(parseReview(normalized.text));
+      // 1.0.10 REVIEW AUTHORITY ALIGNMENT: after the visible review is
+      // normalized into the public ReviewResult, an INVISIBLE ephemeral fork
+      // checks every finding/test gap against the authority hierarchy
+      // (reproducible critical/high defect > original task > approved plan >
+      // previous applied findings > generic suggestions). A conflict does NOT
+      // overwrite latestReview, does NOT consume a cycle and does NOT ask DSH
+      // to fix: ONE visible reconciliation turn on the SAME durable task asks
+      // the Reviewer to rewrite the verdict per the hierarchy, then the
+      // corrected review is re-normalized and re-aligned. Only an aligned
+      // verdict is applied (one business cycle). Two consecutive unresolved
+      // conflicts block the workflow with a reportable contract failure.
+      let applied: ReviewResult | undefined;
+      let conflictInfo: ReviewConflictInfo | undefined;
+      const alignment = await this.alignReview(current, result, exec.signal, input);
+      if (alignment.aligned) {
+        applied = result;
+      } else {
+        const reconciled = await this.reconcileReview(current, result, alignment.conflicts, exec.signal, input);
+        conflictInfo = {
+          conflicts: alignment.conflicts,
+          reconciled: true,
+          resolved: reconciled.aligned,
+          at: new Date().toISOString(),
+        };
+        if (reconciled.aligned) applied = reconciled.result;
+      }
+      if (!applied) {
+        // Unresolved conflict: restore the pre-review phase (blocked after
+        // two CONSECUTIVE unresolved conflicts). NO latestReview, NO cycle,
+        // NO fixing prompt — the reviewer contract failed, not the code.
+        this.activeTurns.delete(workflowId);
+        const conflictCommit = await this.store.update(workflowId, (r) => {
+          if (r.phase !== "reviewing") return;
+          r.latestReviewConflict = conflictInfo;
+          r.reviewContractFailures = (r.reviewContractFailures ?? 0) + 1;
+          const blocked = (r.reviewContractFailures ?? 0) >= 2;
+          r.phase = blocked ? "blocked" : priorPhase;
+          r.error = blocked
+            ? "reviewer contract failure: the review conflicts with the authority hierarchy and was not reconciled after "
+              + `${r.reviewContractFailures} consecutive review calls; no code changes are required`
+            : "review contract conflict: the review conflicts with the authority hierarchy and was not reconciled "
+              + "after one correction attempt; no code changes are required — the next review call may retry";
+        }, { ignoreCancelled: false });
+        if (conflictCommit.suppressed) return conflictCommit.record;
+        if (conflictCommit.record.phase === "blocked") {
+          // A contract failure MUST be reported to the user as such — but it
+          // is never a fix instruction and never re-enters the repair loop.
+          exec.deferContext(pluginMessage(
+            `Workflow ${workflowId} is blocked by a REVIEWER CONTRACT FAILURE: two consecutive reviews conflicted with the authority hierarchy (original task / approved plan) and the reconciliation turned could not align them. No code changes are required. Report the remaining findings and the conflict details to the user:\n${formatFindings(result)}`,
+          ));
+        }
+        return conflictCommit.record;
+      }
       // Compute the outcome inside the atomic commit so the cycle count seen by
       // the outcome policy includes this round; the message is only injected
       // after the commit confirmed we were not cancelled in the meantime.
       let outcomeMessage: string | undefined;
       const commit = await this.store.update(workflowId, (r) => {
-        r.latestReview = result;
+        r.latestReview = applied!;
         // A cycle is consumed only now that a structured verdict is applied:
         // infrastructure failures never eat a cycle, so retries stay possible.
         r.reviewCycles += 1;
-        const outcome = this.computeReviewOutcome(r, result);
+        // An aligned review ends the unresolved-conflict streak; the last
+        // conflict stays visible in status (audit of the auto-correction).
+        r.reviewContractFailures = 0;
+        if (conflictInfo) r.latestReviewConflict = { ...conflictInfo, resolved: true };
+        const outcome = this.computeReviewOutcome(r, applied!);
         outcomeMessage = outcome.message;
         r.noChangeReviewRounds = outcome.noChangeReviewRounds ?? r.noChangeReviewRounds;
         r.phase = outcome.phase;
@@ -1488,6 +2004,10 @@ export class WorkflowManager {
       // normalize throw) returns the workflow to its RETRYABLE phase and
       // records the error — it must not burn a cycle or become failed, so the
       // same workflow can later receive its first real verdict.
+      // The visible turn (review/rewrite) is no longer running or was never
+      // registered: clear the in-process active-turn mapping so a later cancel
+      // can never interrupt a completed turn through a stale map entry.
+      this.activeTurns.delete(workflowId);
       const failed = await this.store.update(workflowId, (r) => {
         if (r.phase !== "reviewing") return;
         r.phase = priorPhase;
@@ -1498,10 +2018,168 @@ export class WorkflowManager {
     }
   }
 
+  /** Fail-closed read-back of the turn appended to the durable Reviewer thread
+   * since its pre-turn baseline: exactly one new COMPLETED persisted turn
+   * must exist, otherwise — a gateway without the read-back capability, no
+   * baseline, zero appended turns (missing) or several (ambiguous) — this
+   * returns `undefined`. It NEVER falls back to the in-memory streamed text. */
+  private async readBackAppended(
+    threadId: string,
+    baseline: PersistedTurnBaseline | undefined,
+    signal?: AbortSignal,
+  ): Promise<{ text: string; itemType?: string } | undefined> {
+    if (!this.codex.readAppendedTurnText || !baseline) return undefined;
+    return this.codex.readAppendedTurnText(threadId, baseline, signal);
+  }
+
+  /** 1.0.10 Review Authority alignment: an INVISIBLE ephemeral fork of the
+   * durable workflow task checks the normalized ReviewResult against the
+   * authority hierarchy (same model, low effort). The prompt carries the
+   * levels of that hierarchy the alignment must judge against: the original
+   * task, the approved plan, the PREVIOUSLY APPLIED review (carried-forward
+   * findings stay aligned unless a higher level contradicts them) and THIS
+   * round's fix summary (`input`; the bridge path passes the persisted
+   * `pendingReviewRequest`). The fork output is the INTERNAL alignment JSON
+   * (never the public ReviewResult, never persisted, never the bridge
+   * protocol). A fork/turn/parse failure throws, so the caller's retryable
+   * phase handling applies: no cycle, no latestReview, no fix prompt. Used by
+   * BOTH the DSH-led review round and the bridge submission callback — first
+   * review and re-review alike. */
+  private async alignReview(
+    record: WorkflowRecord,
+    result: ReviewResult,
+    signal?: AbortSignal,
+    input?: ReviewInput,
+  ): Promise<AlignmentOutcome> {
+    // The alignment fork's SOURCE is the durable workflow task: the Reviewer
+    // thread when persisted (DSH-led), otherwise the bridge source task.
+    const threadId = record.reviewerThreadId ?? record.codexThreadId;
+    if (!threadId) throw new Error("review authority alignment requires the workflow review thread");
+    const model = record.reviewerModel
+      || this.config.reviewerModel
+      || await this.codex.resolveDefaultModel?.(signal)
+      || undefined;
+    let normalized: TurnWaitResult;
+    try {
+      normalized = await this.codex.normalizeInFork({
+        threadId,
+        cwd: record.cwd,
+        prompt: reviewAlignPrompt(result, {
+          workflowId: record.id,
+          task: record.task,
+          planMarkdown: record.planMarkdown,
+          previousReview: record.latestReview,
+          fixSummary: input?.implementationSummary,
+        }),
+        ...(model ? { model } : {}),
+        outputSchema: ALIGN_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+        // The alignment fork is ephemeral: its thread/turn pair is the exact
+        // active cancel target WHILE it runs, but the fork id is never
+        // persisted (reviewerThreadId keeps pointing at the durable task).
+        onStarted: (started) => this.registerEphemeralTurn(record.id, started.threadId, started.turnId, "reviewer"),
+      }, signal);
+    } finally {
+      // Every ending path — completion, cancel, timeout — drops the mapping so
+      // a completed fork turn can never be interrupted by a later cancel.
+      this.activeTurns.delete(record.id);
+    }
+    const after = await this.store.load(record.id);
+    if (!after || after.phase === "cancelled") throw new Error("workflow cancelled during review authority alignment");
+    if (normalized.kind !== "completed") throw new Error("review authority alignment unexpectedly requested user input");
+    if (normalized.status !== "completed") {
+      throw new Error(normalized.reason ?? `review authority alignment turn ${normalized.status}`);
+    }
+    return parseAlignment(normalized.text);
+  }
+
+  /** 1.0.10 ONE visible reconciliation turn on the SAME durable workflow task
+   * when the alignment found conflicts: the Reviewer rewrites the COMPLETE
+   * verdict per the authority hierarchy (readable Markdown, the same display
+   * contract as any visible review, low effort, silent). The corrected
+   * visible review is APPENDED to the task, read back from the PERSISTED
+   * history like any visible turn, re-normalized in an ephemeral fork and
+   * re-aligned. Returns the corrected ReviewResult when the re-alignment
+   * ended aligned; `{ aligned: false }` when it did not. A turn/read-back/
+   * normalization failure throws, so the caller's retryable phase handling
+   * applies (no cycle, no latestReview). Shared by the DSH-led round and the
+   * bridge submission callback. */
+  private async reconcileReview(
+    record: WorkflowRecord,
+    result: ReviewResult,
+    conflicts: ReviewConflict[],
+    signal?: AbortSignal,
+    input?: ReviewInput,
+  ): Promise<{ aligned: true; result: ReviewResult } | { aligned: false }> {
+    // The reconciliation appends to the SAME durable workflow task the visible
+    // review came from: the persisted Reviewer thread, or the bridge source
+    // task when the thread id was never persisted.
+    const threadId = record.reviewerThreadId ?? record.codexThreadId;
+    if (!threadId) throw new Error("review reconciliation requires the workflow review thread");
+    const model = record.reviewerModel || this.config.reviewerModel;
+    // Baseline BEFORE the reconciliation turn, exactly like the native
+    // review/rewrite turns: the appended turn is detected against these ids.
+    const baseline = await this.codex.captureTurnBaseline?.(threadId, signal);
+    let reconcile: TurnWaitResult;
+    try {
+      reconcile = await this.codex.startTurn(threadId, {
+        prompt: reviewReconcilePrompt(result, conflicts, {
+          workflowId: record.id,
+          task: record.task,
+          planMarkdown: record.planMarkdown,
+        }),
+        ...(model ? { model } : {}),
+        effort: "low",
+        // The reconciliation is a VISIBLE turn on the same durable thread:
+        // silent, non-collaborative, one final message — and the exact active
+        // cancel/teardown target while it runs.
+        silentReview: true,
+        onStarted: (started) => this.registerActiveTurn(record.id, started.threadId, started.turnId, "reviewer"),
+      }, signal);
+    } finally {
+      this.activeTurns.delete(record.id);
+    }
+    const after = await this.store.load(record.id);
+    if (!after || after.phase === "cancelled") throw new Error("workflow cancelled during review reconciliation");
+    if (reconcile.kind !== "completed") throw new Error("review reconciliation unexpectedly requested user input");
+    if (reconcile.status !== "completed") {
+      throw new Error(reconcile.status === "interrupted"
+        ? "review reconciliation turn interrupted"
+        : (reconcile.reason ?? `review reconciliation turn ${reconcile.status}`));
+    }
+    // The reconciliation's authority is its PERSISTED history, read back like
+    // the native review's — never the in-memory aggregation.
+    const persisted = await this.readBackAppended(threadId, baseline, signal);
+    if (!persisted) throw new Error("persisted reconciliation read-back missing or ambiguous");
+    const displayError = reviewDisplayError(persisted.text, after);
+    if (displayError) throw new Error(`reconciled review violates the display contract: ${displayError}`);
+    let corrected: TurnWaitResult;
+    try {
+      corrected = await this.codex.normalizeInFork({
+        threadId,
+        cwd: after.cwd,
+        prompt: reviewConversionPrompt(persisted.text, after.id),
+        ...(model ? { model } : {}),
+        outputSchema: REVIEW_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+        onStarted: (started) => this.registerEphemeralTurn(after.id, started.threadId, started.turnId, "reviewer"),
+      }, signal);
+    } finally {
+      this.activeTurns.delete(after.id);
+    }
+    if (corrected.kind !== "completed") throw new Error("review reconciliation normalization unexpectedly requested user input");
+    if (corrected.status !== "completed") {
+      throw new Error(corrected.reason ?? `review reconciliation normalization turn ${corrected.status}`);
+    }
+    const correctedResult = applyReviewConsistency(parseReview(corrected.text));
+    const recheck = await this.alignReview(after, correctedResult, signal, input);
+    return recheck.aligned ? { aligned: true, result: correctedResult } : { aligned: false };
+  }
+
   /**
-   * Persist a freshly started turn as the active turn of its kind. If the
-   * workflow was cancelled in the meantime the write is suppressed (the record
-   * is never resurrected) and the turn we just obtained is interrupted.
+   * Persist a freshly started VISIBLE turn as the active turn of its kind
+   * (and track it in-process as the exact active thread/turn pair for
+   * cancellation). If the workflow was cancelled in the meantime the write is
+   * suppressed (the record is never resurrected) and the turn we just obtained
+   * is interrupted.
    */
   private async registerActiveTurn(
     workflowId: string,
@@ -1509,6 +2187,7 @@ export class WorkflowManager {
     turnId: string,
     kind: "planner" | "reviewer",
   ): Promise<void> {
+    this.activeTurns.set(workflowId, { threadId, turnId, kind, ephemeral: false });
     const outcome = await this.store.update(workflowId, (r) => {
       if (kind === "planner") {
         r.plannerThreadId = threadId;
@@ -1521,6 +2200,28 @@ export class WorkflowManager {
     if (outcome.suppressed) {
       // Cancelled while the turn was being registered: kill the turn we just
       // started, never the record.
+      this.activeTurns.delete(workflowId);
+      await this.codex.interrupt(threadId, turnId).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Track a freshly started EPHEMERAL conversion-fork turn as the exact active
+   * thread/turn pair for cancellation. NEVER persisted: the fork id must not
+   * land in plannerThreadId/reviewerThreadId (the durable ids keep pointing at
+   * the visible tasks Codex Desktop shows). If the workflow was cancelled in
+   * the meantime, the fork turn we just obtained is interrupted.
+   */
+  private async registerEphemeralTurn(
+    workflowId: string,
+    threadId: string,
+    turnId: string,
+    kind: "planner" | "reviewer",
+  ): Promise<void> {
+    this.activeTurns.set(workflowId, { threadId, turnId, kind, ephemeral: true });
+    const record = await this.store.load(workflowId);
+    if (!record || record.phase === "cancelled") {
+      this.activeTurns.delete(workflowId);
       await this.codex.interrupt(threadId, turnId).catch(() => undefined);
     }
   }
@@ -1583,10 +2284,41 @@ export class WorkflowManager {
     };
   }
 
+  /**
+   * Accept the visible Planner turn outcome and derive the structured
+   * PlannerResult:
+   *
+   * - `needs_input` (native clarification request) is used directly — the turn
+   *   is still open and `continue` answers it.
+   * - Any COMPLETED visible reply — the complete plan, a numbered-question
+   *   fallback or a readable failure explanation — is converted into the
+   *   enforced PlannerResult JSON by an EPHEMERAL fork of the Planner task
+   *   (`normalizeInFork`). The fork runs read-only with the planner output
+   *   schema, the SAME model as the visible turn and effort `low`; its id is
+   *   never persisted (plannerThreadId keeps pointing at the durable task
+   *   Codex Desktop shows).
+   * - READY is only accepted when the CURRENT visible reply itself is a
+   *   complete, decision-complete plan. A reply that merely confirms or
+   *   acknowledges ("已确认…后续将规划…"), promises to plan later, or is a
+   *   short summary is NEVER injected: if the conversion nevertheless said
+   *   ready for such a reply, the plugin runs ONE controlled completion turn
+   *   on the SAME persistent Planner task (a normal visible Plan-mode turn,
+   *   reusing the same task id) and re-converts; only a genuinely complete
+   *   plan from one of the two replies enters executing — otherwise the
+   *   workflow FAILS without writing planMarkdown. No plan is ever
+   *   fabricated or padded from earlier history.
+   *
+   * Planner normalization failure is terminal for the workflow: the raw
+   * visible Markdown is NEVER accepted as a plan — the record is failed with
+   * the diagnostic. Reviewer normalization failures, by contrast, fall back to
+   * a retryable phase (see reviewOnce).
+   */
   private async acceptPlannerOutcome(
     workflowId: string,
     outcome: TurnWaitResult,
     exec: ToolRunContext,
+    model?: string,
+    cwd?: string,
   ): Promise<WorkflowRecord> {
     if (outcome.kind === "needs_input") {
       this.pending.set(workflowId, outcome);
@@ -1594,21 +2326,132 @@ export class WorkflowManager {
         r.phase = "waiting_input";
         r.questions = outcome.request.questions;
         r.pendingInput = { turnId: outcome.turnId, itemId: outcome.request.itemId };
+        if (model) r.plannerModel = model;
       }, { ignoreCancelled: false });
       return commit.record;
     }
     this.pending.delete(workflowId);
     if (outcome.status !== "completed") throw new Error(outcome.error ?? `planner turn ${outcome.status}`);
-    const result = parsePlanner(outcome.text);
+    // Visible-reply contract (HARD conditions, independent of the final item
+    // type — a Plan-mode turn may legitimately complete as a `plan` item on
+    // the first generation and as an `agentMessage` item after a native
+    // clarification/continue; both are readable Markdown in Desktop):
+    //  - the visible text must be non-empty (no fake/short filler accepted);
+    //  - it must not BE the raw structured JSON envelope (status/planMarkdown).
+    if (!outcome.text || !outcome.text.trim()) {
+      return this.failPlannerNormalization(workflowId, "planner visible reply is empty");
+    }
+    if (isPlannerJsonEnvelope(outcome.text)) {
+      return this.failPlannerNormalization(workflowId, "planner visible reply leaked the structured JSON envelope");
+    }
+    // A cancel that won while the visible turn was running ends here: never
+    // create a conversion fork for a cancelled workflow.
+    const beforeFork = await this.store.load(workflowId);
+    if (!beforeFork || beforeFork.phase === "cancelled") return beforeFork!;
+    // One ephemeral conversion of a visible reply; every failure path FAILS
+    // the workflow terminally and never writes a plan.
+    const convert = async (visibleText: string): Promise<PlannerResult | WorkflowRecord> => {
+      let normalized: TurnWaitResult;
+      try {
+        normalized = await this.codex.normalizeInFork({
+          threadId: outcome.threadId,
+          cwd: cwd ?? process.cwd(),
+          prompt: plannerConvertPrompt(visibleText),
+          ...(model ? { model } : {}),
+          outputSchema: PLANNER_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+          onStarted: (started) => this.registerEphemeralTurn(workflowId, started.threadId, started.turnId, "planner"),
+        }, exec.signal);
+      } catch (error) {
+        return this.failPlannerNormalization(workflowId, errorMessage(error));
+      } finally {
+        this.activeTurns.delete(workflowId);
+      }
+      if (normalized.kind !== "completed" || normalized.status !== "completed") {
+        return this.failPlannerNormalization(
+          workflowId,
+          normalized.kind === "needs_input"
+            ? "planner normalization unexpectedly requested user input"
+            : `planner normalization turn ${normalized.status}`,
+        );
+      }
+      try {
+        return parsePlanner(normalized.text);
+      } catch (error) {
+        return this.failPlannerNormalization(workflowId, `planner normalization returned an invalid result: ${errorMessage(error)}`);
+      }
+    };
+    let visibleText = outcome.text;
+    let converted = await convert(visibleText);
+    if (isWorkflowRecord(converted)) return converted;
+    let result = converted;
+    // The conversion said ready, but the CURRENT visible reply itself is not a
+    // complete plan (confirmation/acknowledgement, promise-to-plan-later,
+    // short summary): never inject it. Run ONE controlled completion turn on
+    // the SAME persistent Planner task, then re-convert; the second reply is
+    // judged by the same gate.
+    if (result.status === "ready" && result.planMarkdown?.trim() && !isPlausibleCompletePlan(visibleText)) {
+      let completion: TurnWaitResult;
+      try {
+        completion = await this.codex.startTurn(outcome.threadId, {
+          prompt: plannerCompletionPrompt(visibleText),
+          ...(model ? { model } : {}),
+          effort: this.config.plannerEffort,
+          planMode: true,
+          onStarted: (started) => this.registerActiveTurn(workflowId, started.threadId, started.turnId, "planner"),
+        }, exec.signal);
+      } finally {
+        // EVERY ending path — completion, cancel, timeout, onStarted
+        // persistence failure, process error — must drop the active-turn
+        // mapping, so a stale completed/failed turn can never be interrupted
+        // by a later cancel.
+        this.activeTurns.delete(workflowId);
+      }
+      if (completion.kind === "needs_input") {
+        // The completion turn asked for user input: fall back to the normal
+        // waiting_input machinery (user answers via codex_workflow_continue).
+        this.pending.set(workflowId, completion);
+        const commit = await this.store.update(workflowId, (r) => {
+          r.phase = "waiting_input";
+          r.questions = completion.request.questions;
+          r.pendingInput = { turnId: completion.turnId, itemId: completion.request.itemId };
+          if (model) r.plannerModel = model;
+        }, { ignoreCancelled: false });
+        return commit.record;
+      }
+      if (completion.status !== "completed") {
+        throw new Error(completion.error ?? `planner completion turn ${completion.status}`);
+      }
+      if (!completion.text || !completion.text.trim() || isPlannerJsonEnvelope(completion.text)) {
+        return this.failPlannerNormalization(workflowId, "planner completion reply is empty or a JSON envelope");
+      }
+      visibleText = completion.text;
+      converted = await convert(visibleText);
+      if (isWorkflowRecord(converted)) return converted;
+      result = converted;
+      // The completion turn's reply is judged by the SAME hard gate: a still
+      // incomplete reply can never become a plan.
+      if (result.status === "ready" && !isPlausibleCompletePlan(visibleText)) {
+        return this.failPlannerNormalization(
+          workflowId,
+          "planner visible reply is not a complete plan (confirmation/acknowledgement or too short); the completion turn did not produce a plan either",
+        );
+      }
+    }
     if (result.status === "needs_input") {
       const commit = await this.store.update(workflowId, (r) => {
         r.phase = "waiting_input";
         r.questions = result.questions;
         r.assumptions = result.assumptions;
+        if (model) r.plannerModel = model;
       }, { ignoreCancelled: false });
       return commit.record;
     }
     if (result.status === "ready" && result.planMarkdown?.trim()) {
+      // itemType is an audit/test field, NOT a ready gate: a ready plan may
+      // come from a `plan` item OR from an `agentMessage` item (native
+      // clarification/continue paths); the hard conditions above already
+      // guaranteed an non-empty, envelope-free, complete visible reply, and
+      // the ephemeral normalization verified this is a ready plan.
       const planMarkdown = ensurePlanBlock(result.planMarkdown);
       const commit = await this.store.update(workflowId, (r) => {
         r.phase = "executing";
@@ -1616,15 +2459,31 @@ export class WorkflowManager {
         r.assumptions = result.assumptions;
         r.questions = [];
         r.pendingInput = undefined;
+        if (model) r.plannerModel = model;
       }, { ignoreCancelled: false });
       if (!commit.suppressed) exec.deferContext(pluginMessage(executionPrompt(commit.record)));
       return commit.record;
     }
+    // Explicit failed status (or a ready that lost its plan text): never write
+    // planMarkdown, never enter executing.
     const commit = await this.store.update(workflowId, (r) => {
       r.phase = "failed";
       r.error = result.message ?? "Codex planner did not return a usable plan";
     }, { ignoreCancelled: false });
     return commit.record;
+  }
+
+  /** Planner normalization failure is TERMINAL for the workflow: the readable
+   * visible reply is never accepted as a plan. The record is failed with the
+   * diagnostic; `start`/`continue` propagate so the caller sees the failure. */
+  private async failPlannerNormalization(workflowId: string, message: string): Promise<WorkflowRecord> {
+    const failed = await this.store.update(workflowId, (r) => {
+      if (r.phase === "cancelled") return;
+      r.phase = "failed";
+      r.error = message;
+    }, { ignoreCancelled: false });
+    if (failed.suppressed) return failed.record;
+    throw new Error(message);
   }
 
   private async owned(workflowId: string, exec: ToolRunContext): Promise<WorkflowRecord> {
@@ -1636,7 +2495,9 @@ export class WorkflowManager {
 
   private async assertNoActiveWorkflow(sessionId: string): Promise<void> {
     const active = await this.store.activeForSession(sessionId);
-    if (active) throw new Error(`session already has active Codex workflow ${active.id} (${active.phase})`);
+    if (active) {
+      throw new Error(`session already has active Codex workflow ${active.id} (${active.phase}); continue it or query codex_workflow_status instead of starting another`);
+    }
   }
 }
 
@@ -1647,12 +2508,77 @@ interface ReviewOutcome {
   noChangeReviewRounds?: number;
 }
 
-function plannerPrompt(task: string): string {
-  return `You are the planning gate in a DSH-controlled coding workflow. Inspect the current workspace read-only and produce a decision-complete implementation plan for the task below. Do not edit files. Ask user questions only when a missing product decision makes a safe plan impossible. Return only the requested JSON object. planMarkdown must contain a complete <proposed_plan> block.\n\nTASK:\n${task}`;
+export function plannerPrompt(task: string): string {
+  return `You are the planning gate in a DSH-controlled coding workflow. Inspect the current workspace read-only and produce a decision-complete implementation plan for the task below. Do not edit files. Ask user questions only when a missing product decision makes a safe plan impossible.
+
+Do not invent constraints the user did not state. In particular, DO NOT strengthen a requirement like "tests must cover A and B" into an exact test-COUNT restriction ("exactly two tests") unless the user explicitly limited the count. Any verification method the task names — automated tests, static checks, or real command verification — is acceptable evidence for a requirement; keep the planned verification as close to the task's own wording as possible.
+
+Your visible reply stays in Codex Desktop as a single complete, readable Markdown plan (goal, changes, files, verification) in the same language as the task; Codex renders Plan-mode output as a plan item. Do NOT output JSON.
+- When you need clarification, ask through the native input request whenever possible; if that is unavailable, reply ONLY with clear numbered questions, one per line (1. ... 2. ...), and nothing else.
+- When you cannot produce a plan, reply with a readable explanation of why.
+
+TASK:
+${task}`;
 }
 
 function resumedAnswerPrompt(answers: Record<string, string[]>): string {
-  return `Continue the existing plan using these user answers, then return the complete planner JSON result:\n${JSON.stringify(answers, null, 2)}`;
+  return `Continue the existing plan using these user answers, then reply exactly like the first planning turn did: a single complete, readable Markdown plan in the same language as the original task, or only numbered follow-up questions, or a readable failure explanation. Never JSON.\n${JSON.stringify(answers, null, 2)}`;
+}
+
+/** Conversion prompt for the EPHEMERAL fork of the Planner task: turns the
+ * visible plan (the persisted Plan-mode plan item / agentMessage) into the
+ * enforced PlannerResult JSON. Runs read-only with the planner output schema,
+ * so the fork emits exactly the structured result and nothing is ever written
+ * into the visible task history.
+ *
+ * READY is STRICTLY the current visible reply ITSELF being a complete,
+ * executable, decision-complete plan — never inferred from earlier history,
+ * never a confirmation/acknowledgement, a promise to plan later, a short
+ * summary or an answer-only reply. The plugin independently re-checks the
+ * same gate via `isPlausibleCompletePlan` (see acceptPlannerOutcome). */
+function plannerConvertPrompt(rawReply: string): string {
+  return `Convert the planner's visible reply below into the required JSON result. Output ONLY the JSON object matching the enforced output schema:
+- status "ready" ONLY when the visible reply ITSELF is a complete, executable, decision-complete plan (goal, changes, files, verification). Do NOT infer readiness from earlier history or from questions/answers: a reply that only confirms or acknowledges ("已确认…，后续将规划…"), promises to plan later, is a short summary, or merely answers earlier questions is NOT ready.
+- Only numbered questions -> status "needs_input" with one question entry per numbered item.
+- A readable failure explanation, or a confirmation/acknowledgement without an actual plan -> status "failed" with a clear message.
+- Preserve every assumption stated in the reply.
+
+Planner visible reply:
+${rawReply}`;
+}
+
+/** Minimum length below which a visible reply cannot plausibly BE a complete
+ * decision-complete plan. A confirmation/acknowledgement typically ends here
+ * (real sample: 77 Chinese characters). */
+const MIN_READY_PLAN_CHARS = 120;
+
+/** "The visible reply ITSELF is a complete plan" heuristic: non-trivial length
+ * plus at least one structured plan marker (markdown heading / bullet /
+ * numbered line). Confirmations and promises ("已确认部署目标…后续规划将…")
+ * fail it even when the conversion said ready. The heuristic NEVER fabricates
+ * a plan: its only effect is either one controlled completion turn on the same
+ * persistent Planner task, or a terminal failure without planMarkdown. */
+function isPlausibleCompletePlan(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length < MIN_READY_PLAN_CHARS) return false;
+  return /(^|\n)[ \t]*(#{1,6}[ \t]|[-*+][ \t]|\d{1,2}[.、)][ \t])/m.test(trimmed);
+}
+
+/** Prompt for the ONE controlled completion turn on the SAME persistent
+ * Planner task when the visible reply was not a complete plan: it demands the
+ * actual plan now, never an acknowledgement or a promise. */
+function plannerCompletionPrompt(previousReply: string): string {
+  return `The planner's previous visible reply did not contain the actual plan — it only confirmed, acknowledged or summarized:
+---
+${previousReply}
+---
+Now produce the COMPLETE decision-complete plan as your ONLY final visible message (goal, changes, files, verification), in the same language as the task. Do NOT acknowledge this instruction, do NOT promise to plan later, do NOT output JSON — write the plan now.`;
+}
+
+/** Discriminator for the planner conversion helper results (a suppressed
+ * cancelled/failed record vs a converted PlannerResult). */
+function isWorkflowRecord(value: unknown): value is WorkflowRecord {
+  return Boolean(value) && typeof (value as WorkflowRecord).phase === "string" && typeof (value as PlannerResult).status !== "string";
 }
 
 export function executionPrompt(record: WorkflowRecord): string {
@@ -1662,49 +2588,25 @@ export function executionPrompt(record: WorkflowRecord): string {
   return `Codex planning is complete for workflow ${record.id}. Implement the approved plan below in ${record.cwd}. You are the only mutation-capable executor: use normal DSH tools and approvals, keep scope faithful to the plan, run relevant verification, and then ${submit}.\n\n${record.planMarkdown}`;
 }
 
-function reviewInstructions(record: WorkflowRecord, input: ReviewInput): string {
-  const plan = record.planMarkdown ? `\n\nPLAN:\n${record.planMarkdown}` : "";
-  const task = record.mode === "review_only"
-    ? `\n\nREVIEW TASK:\n${record.task || "(no explicit task — review the current changes)"}`
+/** Shared readable review context for EVERY review path (DSH-led visible
+ * review AND the background Reviewer callback): workflow identity, original
+ * task, approved plan, implementation summary, changed files, test results,
+ * and the captured workspace evidence (status, bounded diff, truncation
+ * notice). Git and non-Git workspaces get the SAME contract. */
+function reviewContextBlock(record: WorkflowRecord, input: ReviewInput, evidence: ReviewEvidence): string {
+  const submission = record.origin === "codex_bridge"
+    ? `SUBMISSION: ${record.submissionId ?? "(unknown)"}\n`
     : "";
-  return `Review the current workspace read-only. Focus on correctness, regressions, security, and missing tests. Do not edit files. ${SILENT_REVIEW_PROMPT_BLOCK}${plan}${task}\n\nIMPLEMENTATION SUMMARY:\n${input.implementationSummary}\n\nCHANGED FILES:\n${(input.changedFiles ?? []).join("\n") || "not supplied"}\n\nTEST RESULTS:\n${input.testResults ?? "not supplied"}`;
-}
-
-function normalizeReviewPrompt(
-  record: WorkflowRecord,
-  input: ReviewInput,
-  rawReview: string,
-): string {
-  return `Convert the code review you just completed into the required JSON schema. For every finding set blocking to true only when it must be fixed before delivery: critical and high findings block by default; medium and low findings block only when they create an actual correctness, regression, security, or delivery-required test gap. Every entry in testGaps counts as blocking. verdict is pass only when there are no actionable correctness, regression, security, or material test findings. Preserve concrete file and line references.\n\nWorkflow: ${record.id}\nImplementation: ${input.implementationSummary}\nRaw review:\n${rawReview}`;
-}
-
-/** Prompt used by the fresh Reviewer task: it carries none of the originating
- * task's history, stays read-only and returns the verdict as its final
- * structured message. The verdict is captured by the plugin from stdout and
- * applied outside the sandbox; the reviewer never writes the bridge queue
- * itself.
- *
- * The full bounded evidence diff is embedded verbatim (already capped at
- * `reviewDiffMaxBytes` by evidence collection), and a truncation notice is
- * always shown whenever the diff was cut. The reviewer is explicitly allowed
- * to run READ-ONLY inspection commands and read files to see the parts beyond
- * the embedded evidence — but never to write/modify anything, create threads,
- * call DSH tools or the bridge CLI. */
-function callbackPrompt(record: WorkflowRecord, input: ReviewInput, evidence: ReviewEvidence): string {
-  return `You are the independent reviewer for a DSH-executed coding workflow. Review the implementation below against the original plan. Stay read-only: do not edit files, do not create replacement threads, and do not call any dsh tools. ${SILENT_REVIEW_PROMPT_BLOCK}
-
-WORKFLOW: ${record.id}
-SUBMISSION: ${record.submissionId ?? "(unknown)"}
-CWD: ${record.cwd}
+  return `WORKFLOW: ${record.id}
+${submission}CWD: ${record.cwd}
 REVIEW CYCLE: ${record.reviewCycles}
 
 ORIGINAL TASK:
-${record.task}
+${record.task || "(no explicit task — review the current changes)"}
 
-APPROVED PLAN:
-${record.planMarkdown}
-
-IMPLEMENTATION SUMMARY:
+${record.planMarkdown ? `APPROVED PLAN:\n${record.planMarkdown}\n\n` : ""}${record.latestReview ? `PREVIOUS APPLIED REVIEW (the findings DSH was asked to fix; the implementation summary below describes what changed since):
+${formatFindings(record.latestReview)}
+` : ""}IMPLEMENTATION SUMMARY (this round's changes since the previous review):
 ${input.implementationSummary}
 
 CHANGED FILES:
@@ -1716,15 +2618,115 @@ ${input.testResults ?? "not supplied"}
 WORKSPACE EVIDENCE (kind: ${evidence.kind}):
 ${evidence.status || "(empty)"}
 ${evidence.diffTruncated ? `[diff truncated by evidence collection, observed ${evidence.diffBytes} bytes; the full diff was too large to embed]` : `[full observed diff, ${evidence.diffBytes} bytes]`}
-${evidence.diff}
+${evidence.diff}`;
+}
+
+/** The readable visible-output contract shared by every review path: the
+ * reviewer's final message is a silent, readable Markdown review in the SAME
+ * language as the original task — never JSON (the structured verdict comes
+ * from the ephemeral conversion fork). */
+function visibleReviewContract(record: WorkflowRecord): string {
+  return `${SILENT_REVIEW_PROMPT_BLOCK}
+
+Reply in the same language as the original task. Your visible reply is what stays in Codex Desktop, so write it as readable Markdown with these sections, and NOT as JSON:
+VERDICT: pass | changes_requested
+FINDINGS: one entry per finding with severity, blocking (yes/no), title, body, and the concrete file:line reference when available
+TEST GAPS: one per line, or "none"
+SUMMARY: a short readable summary`;
+}
+
+/** Developer-instructions version of the review contract (includes the full
+ * per-round context). Injected into the durable Reviewer thread at creation
+ * and refreshed before every re-review as an AUXILIARY channel only — a
+ * native `review/start` turn may not reliably see hidden thread-settings
+ * instructions, so the complete context and the coverage gate always ride
+ * the custom target's instructions on every path (Git included). */
+function reviewContractInstructions(record: WorkflowRecord, input: ReviewInput, evidence: ReviewEvidence): string {
+  return `${visibleReviewContract(record)}
+
+${reviewContextBlock(record, input, evidence)}`;
+}
+
+/** The correctness-and-bounds rule shared by EVERY review path (the DSH-led
+ * `review/start` custom target AND the background Reviewer callback). The
+ * reviewer must independently observe the changes under review and check
+ * EVERY explicit requirement of ORIGINAL TASK / APPROVED PLAN one by one.
+ * Since 1.0.10 the verification evidence of a requirement follows the method
+ * the task/plan names (automated tests, static checks or real command
+ * verification); ordinary scope, test-count, dependency and
+ * verification-method conflicts resolve in the plan's favor, and only a
+ * REPRODUCIBLE critical/high defect may override the plan's ordinary bounds. */
+export function reviewRequirementGate(record: WorkflowRecord, git: boolean): string {
+  const scope = git
+    ? "Your review target is the CURRENT uncommitted workspace changes: staged, unstaged AND untracked files in this git repository. Independently confirm the exact changes with read-only `git status` and `git diff` (including `git diff --cached`) instead of trusting this summary."
+    : "Your review target is the changed files listed under CHANGED FILES below. Independently read those files in the workspace (read-only) instead of trusting this summary.";
+  const planRequirement = record.planMarkdown
+    ? "Check EVERY explicit requirement in ORIGINAL TASK and APPROVED PLAN above, one by one, against the changes you observed."
+    : "Check EVERY explicit requirement in ORIGINAL TASK above, one by one, against the changes you observed.";
+  return `REVIEW SCOPE:
+${scope}
+${AUTHORITY_HIERARCHY}
+ITEM-BY-ITEM COVERAGE:
+- ${planRequirement}
+- Every explicit requirement must be IMPLEMENTED in the observed changes; a missing implementation is a blocking finding.
+- Verification evidence follows the method the ORIGINAL TASK / APPROVED PLAN names: automated tests, STATIC CHECKS and REAL COMMAND verification are ALL formal evidence. Missing automated tests alone are blocking ONLY when the task/plan explicitly requires an automated test for the item or a concrete regression risk is demonstrated with reproducible code evidence; otherwise record them as non-blocking or accept the plan's own verification method.
+- Never demand changes that exceed the ORIGINAL TASK / APPROVED PLAN's explicit file count, test count, scope, dependency limits or manual acceptance method.
+- VERDICT: pass is allowed when every explicit requirement has implementation evidence (code) plus verification evidence of the kind the task/plan requires.`;
+}
+
+/** Instructions for the VISIBLE DSH-led review turn (`review/start` custom
+ * target) in EVERY workspace — Git and non-Git alike. The custom target
+ * carries the full per-round context (original task, approved plan,
+ * implementation summary, changed files, test results, workspace evidence),
+ * the review scope and the item-by-item coverage gate directly into the
+ * review turn, so verdict correctness never depends on hidden
+ * thread-settings developer instructions. In Git repositories the scope pins
+ * the review to the current staged/unstaged/untracked changes and requires
+ * an independent read-only `git status`/`git diff` check. */
+function reviewInstructions(record: WorkflowRecord, input: ReviewInput, evidence: ReviewEvidence, git: boolean): string {
+  return `Review the current workspace read-only. Focus on correctness, regressions, security, and missing tests. Do not edit files. ${visibleReviewContract(record)}
+
+${reviewRequirementGate(record, git)}
+${reviewContextBlock(record, input, evidence)}`;
+}
+
+/** Conversion prompt for the EPHEMERAL fork of the Reviewer task: turns the
+ * visible readable review into the enforced verdict JSON. Runs read-only with
+ * the review output schema. The raw review preserves concrete file/line
+ * references, so the structured findings keep them. */
+export function reviewConversionPrompt(rawReview: string, workflowId: string): string {
+  return `Convert the readable code review below into the required JSON schema. Output ONLY the JSON object matching the enforced output schema:
+- verdict: pass only when there are no actionable correctness, regression, security, or material test findings.
+- For every finding set blocking to true only when it must be fixed before delivery: critical and high findings block by default; medium and low findings block only when they create an actual correctness, regression, security, or delivery-required test gap.
+- Every entry in testGaps counts as blocking.
+- Preserve concrete file and line references from the review.
+- Keep the review's summary as summary (same language as the original task).
+
+Workflow: ${workflowId}
+Raw review:
+${rawReview}`;
+}
+
+/** Prompt used for a visible background review appended to the originating
+ * workflow task (or to a legacy/review-only Reviewer task). It stays read-only;
+ * the structured verdict is derived later in an ephemeral fork and applied
+ * outside the sandbox. The reviewer never writes the bridge queue itself.
+ *
+ * The full bounded evidence diff is embedded verbatim (already capped at
+ * `reviewDiffMaxBytes` by evidence collection), and a truncation notice is
+ * always shown whenever the diff was cut. The reviewer is explicitly allowed
+ * to run READ-ONLY inspection commands and read files to see the parts beyond
+ * the embedded evidence — but never to write/modify anything, create threads,
+ * call DSH tools or the bridge CLI. */
+function callbackPrompt(record: WorkflowRecord, input: ReviewInput, evidence: ReviewEvidence): string {
+  return `You are the independent reviewer for a DSH-executed coding workflow. Review the implementation below against the original plan. Stay read-only: do not edit files, do not create replacement threads, and do not call any dsh tools. ${visibleReviewContract(record)}
+
+${reviewRequirementGate(record, evidence.kind === "git")}
+${reviewContextBlock(record, input, evidence)}
 
 You MAY run read-only inspection commands (for example \`git diff\`, \`git status\`, \`git show\`, reading any file under the workspace) to review parts of the workspace not fully covered above — the sandbox runs read-only and makes this safe. You MUST NOT write or modify any file, run anything that mutates the workspace, create a replacement thread, call any dsh tool, or invoke the bridge CLI.
 
-Return your verdict as the final message, as JSON matching the enforced output schema:
-{ "verdict": "pass" | "changes_requested", "findings": [{ "severity": "critical"|"high"|"medium"|"low", "blocking": boolean, "title": string, "body": string, "file": string|null, "line": integer|null }], "testGaps": string[], "summary": string }
-For every finding set blocking to true only when it must be fixed before delivery: critical and high findings block by default; medium and low findings block only when they create an actual correctness, regression, security, or delivery-required test gap. Every entry in testGaps counts as blocking.
-
-Your JSON verdict is collected automatically from this reply; never write it to disk or to any other channel.`;
+The structured verdict is derived from this review automatically by the plugin; never write JSON to disk or to any other channel.`;
 }
 
 const SUBMISSION_ACTIVE = new Set<SubmissionState>(["queued", "sending", "waiting_verdict", "retrying", "verdict_ready", "received"]);
@@ -1805,6 +2807,24 @@ function makeManagerLease(
 function isUnrecoverableEnqueueError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /already queued with a different command|already received a different command|invalid bridge command|invalid bridge request id|unsupported version/i.test(message);
+}
+
+/** True when the text IS the raw structured planner JSON envelope that must
+ * never appear in a visible reply (has both `status` and `planMarkdown`).
+ * Readable Markdown, JSON error payloads and plain JSON noise are not. */
+function isPlannerJsonEnvelope(text: string): boolean {
+  const trimmed = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  if (!trimmed.startsWith("{")) return false;
+  try {
+    const value = JSON.parse(trimmed) as unknown;
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const record = value as Record<string, unknown>;
+      return "status" in record && "planMarkdown" in record;
+    }
+  } catch {
+    // not JSON — readable text
+  }
+  return false;
 }
 
 function parsePlanner(text: string): PlannerResult {

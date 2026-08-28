@@ -349,7 +349,7 @@ test("show reports one workflow's stage/submission/review/evidence summary", asy
     const result = await runCli(["show", "--workflow", "wf-show", "--json"], "", home);
     assert.equal(result.code, 0, result.stderr);
     const parsed = JSON.parse(result.stdout) as Record<string, unknown>;
-    assert.equal(parsed.pluginVersion, "1.0.6");
+    assert.equal(parsed.pluginVersion, "1.0.10");
     assert.equal(parsed.phase, "fixing");
     assert.equal(parsed.originatingCodexTaskId, "codex-source-task");
     assert.equal(parsed.reviewerCodexTaskId, "codex-reviewer-task");

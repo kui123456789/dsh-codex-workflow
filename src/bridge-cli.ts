@@ -323,6 +323,20 @@ async function commandShow(args: ParsedArgs): Promise<void> {
     reviewerTurnId: optional("reviewerTurnId"),
     reviewCycles: record.reviewCycles ?? 0,
     noChangeReviewRounds: record.noChangeReviewRounds ?? 0,
+    // 1.0.10 review-authority audit: the unresolved-conflict streak and the
+    // most recent conflict (whether one reconciliation ran and resolved it).
+    reviewContractFailures: record.reviewContractFailures ?? 0,
+    latestReviewConflict: record.latestReviewConflict
+      ? (() => {
+        const conflict = record.latestReviewConflict as Record<string, unknown>;
+        return {
+          conflicts: Array.isArray(conflict.conflicts) ? (conflict.conflicts as unknown[]).length : 0,
+          reconciled: conflict.reconciled === true,
+          resolved: conflict.resolved === true,
+          at: conflict.at ?? null,
+        };
+      })()
+      : null,
     submission: optional("submissionId")
       ? {
         submissionId: optional("submissionId"),
