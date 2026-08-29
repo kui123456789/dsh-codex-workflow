@@ -7,6 +7,7 @@ All notable changes to `dsh-codex-workflow`.
 - **Orphan workflow recovery.** On a normal runtime refresh, workflows whose DSH session has disappeared are safely marked `cancelled` only after a two-lease grace period. Audit records are retained, live sessions are never touched, and active bridge submissions remain recoverable.
 - **Historical state is preserved.** Recovery re-checks each row before updating it, records a diagnostic reason, and does not delete coordination or audit data. Existing terminal workflows remain unchanged.
 - **Desktop is not interrupted.** The recovery path only updates the local coordination store; it does not open, refresh, navigate, focus, or restart Codex Desktop.
+- **npm CLI entrypoint is preserved.** The package `bin` path uses npm's normalized relative form, preventing npm 11 from stripping the `dsh-codex-workflow` command during publication.
 - Package and runtime version are now `1.0.12`; no WorkflowRecord or SQLite migration is required.
 
 ## [1.0.11] - 2026-08-29

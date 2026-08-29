@@ -26,7 +26,7 @@
   "main": "./lib/index.js",
   "types": "./lib/index.d.ts",
   "bin": {
-    "dsh-codex-workflow": "./lib/bridge-cli.js"
+    "dsh-codex-workflow": "lib/bridge-cli.js"
   },
   "exports": {
     ".": {
