@@ -1,4 +1,4 @@
-// REAL lifecycle acceptance for dsh-codex-workflow 1.0.11 (requires a Codex
+// REAL lifecycle acceptance for dsh-codex-workflow 1.0.12 (requires a Codex
 // login and a working app-server; this is the online acceptance the fake-server
 // unit tests cannot replace).
 //
@@ -26,7 +26,7 @@
 //     SAME task id -> pass within the fixed 3-round limit.
 //     Asserts reviewerThreadId === plannerThreadId at every round, persisted
 //     history holds plan + both reviews with no JSON envelopes, and
-//     `dsh-codex-workflow show --json` reports pluginVersion 1.0.11 with the
+//     `dsh-codex-workflow show --json` reports pluginVersion 1.0.12 with the
 //     same reviewer task id (runtime version probe).
 //   - Codex-bridge workflow: a REAL source task is created; startExternalPlan
 //     binds it as the originating task; submit drives the REAL background
@@ -663,7 +663,7 @@ try {
     if (liveTurns.length < 3) throw new Error(`expected plan + 2 review turns on the shared task, got ${liveTurns.length}`);
     assertNoJsonEnvelope(liveThread);
 
-    // RUNTIME version probe: the plugin's own CLI reports 1.0.11 and the SAME
+    // RUNTIME version probe: the plugin's own CLI reports 1.0.12 and the SAME
     // reviewer task id against the scratch DSH_HOME the segments wrote.
     const show = spawnSync(process.execPath, [CLI_PATH, "show", "--workflow", liveRecord.id, "--json"], {
       env: { ...process.env, DSH_HOME: homeLive },
@@ -677,7 +677,7 @@ try {
     } catch {
       throw new Error(`dsh-codex-workflow show produced no JSON: ${show.stdout.slice(0, 400)}`);
     }
-    if (showJson.pluginVersion !== "1.0.11") throw new Error(`pluginVersion is ${showJson.pluginVersion}, expected 1.0.11`);
+    if (showJson.pluginVersion !== "1.0.12") throw new Error(`pluginVersion is ${showJson.pluginVersion}, expected 1.0.12`);
     if (showJson.reviewerCodexTaskId !== taskId) throw new Error(`show reports reviewer task ${showJson.reviewerCodexTaskId}, expected the original planner task ${taskId}`);
     const cliArguments = assertCliAuditArguments(liveAuditInvocations, "planned workflow");
 

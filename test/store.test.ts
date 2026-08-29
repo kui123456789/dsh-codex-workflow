@@ -303,3 +303,44 @@ test("a failing update does not poison the per-workflow chain", async () => {
     await rmClosed(directory);
   }
 });
+
+test("abandonOrphaned cancels stale session-less workflows but preserves active submissions", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-orphan-recovery-"));
+  try {
+    const store = new WorkflowStore(directory);
+    const old = "2026-08-20T00:00:00.000Z";
+    const base = (id: string, session: string, phase: WorkflowRecord["phase"]): WorkflowRecord => ({
+      schemaVersion: 1,
+      id,
+      dshSessionId: session,
+      cwd: process.cwd(),
+      task: id,
+      mode: "planned",
+      origin: "dsh",
+      phase,
+      createdAt: old,
+      updatedAt: old,
+      assumptions: [],
+      questions: [],
+      reviewCycles: 0,
+      noChangeReviewRounds: 0,
+    });
+    await store.save(base("orphan-executing", "session-gone", "executing"));
+    await store.save({
+      ...base("orphan-retrying", "session-gone", "fixing"),
+      origin: "codex_bridge",
+      submissionId: "submission-1",
+      submissionState: "retrying",
+    });
+    await store.save(base("live-executing", "session-live", "executing"));
+
+    const abandoned = await store.abandonOrphaned(["session-live"], 60_000, Date.parse("2026-08-29T00:00:00.000Z"));
+    assert.deepEqual(abandoned, ["orphan-executing"]);
+    assert.equal((await store.load("orphan-executing"))?.phase, "cancelled");
+    assert.equal((await store.load("orphan-retrying"))?.phase, "fixing");
+    assert.equal((await store.load("live-executing"))?.phase, "executing");
+    assert.match((await store.load("orphan-executing"))?.error ?? "", /session-gone.*no longer live/);
+  } finally {
+    await rmClosed(directory);
+  }
+});

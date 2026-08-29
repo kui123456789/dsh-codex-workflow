@@ -1,6 +1,6 @@
-# Release checklist — dsh-codex-workflow 1.0.11
+# Release checklist — dsh-codex-workflow 1.0.12
 
-This is the operator checklist for shipping 1.0.11. It assumes the automated gates
+This is the operator checklist for shipping 1.0.12. It assumes the automated gates
 succeeded; this page is about the things automation cannot cover, plus the
 rollback story. It never authorizes touching user credentials or configuration
 outside `$DSH_HOME/storages/dsh-codex-workflow/`.
@@ -47,7 +47,7 @@ Run `pnpm release:check` twice in a row and confirm:
    - `dispatch` a plan and `codex_workflow_submit` it exactly once;
    - the readable review is appended to the exact source Codex task;
      `show --workflow <id>` reports matching source/review ids and version
-     `1.0.11` (an old workflow that already persisted a distinct Reviewer id
+     `1.0.12` (an old workflow that already persisted a distinct Reviewer id
      prefers that legacy task for resume, writer release and callback state);
    - **single-task history**: the source task contains the plan and every
      visible review round, and Codex Desktop shows no additional Reviewer task;
@@ -83,7 +83,7 @@ Run `pnpm release:check` twice in a row and confirm:
       ephemeral normalization sees (no second visible task; cancel/timeout
       terminates the exact CLI child). The plugin does not read, fork or
       re-subscribe the Desktop task after CLI completion;
-   - **review authority alignment (1.0.11 CLI path, 1.0.10 semantics)**: after each review round an
+   - **review authority alignment (1.0.12 CLI path, 1.0.10 semantics)**: after each review round an
       invisible ephemeral CLI alignment checks the verdict against the
       authority hierarchy (reproducible critical/high defect > original task >
       approved plan > previous applied findings > generic suggestions); an
@@ -147,9 +147,9 @@ Run `pnpm release:check` twice in a row and confirm:
 ## Rollback
 
 - The previous stable version `1.0.7` is a normal `pnpm` package; downgrading is
-  just reinstalling it. Its legacy file-queue data is still imported by 1.0.11, and the
+  just reinstalling it. Its legacy file-queue data is still imported by 1.0.12, and the
   import is one-way (the SQLite queue is authoritative once written).
-- If 1.0.11 must be pulled: stop the plugin/dispatch traffic first, restore the
+- If 1.0.12 must be pulled: stop the plugin/dispatch traffic first, restore the
   package, and verify with `pnpm doctor` before resuming. Record database and
   log state are not modified by a version change (only by `prune --commit`).
   Old workflow records need no migration (1.0.10 added only OPTIONAL fields
@@ -161,8 +161,8 @@ Run `pnpm release:check` twice in a row and confirm:
 
 - Do not push to user `$DSH_HOME` outside `storages/dsh-codex-workflow`.
 - Do not modify or rotate any credentials (this plugin never stores them).
-- Do not create a Git tag or GitHub Release in this pass — the originating Codex
-  review and the user decide on tagging.
+- Create the `v1.0.12` Git tag and corresponding GitHub Release only after all
+  automated and real-environment checks pass.
 - Do not commit or touch `docs/research/` or `docs/superpowers/` (untracked).
 
 ## Residual risk register

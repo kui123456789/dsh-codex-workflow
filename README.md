@@ -7,7 +7,7 @@ DeepSeek Harness plugin that gives Codex read-only planning/review roles while D
 
 No browser is opened or controlled anywhere in the product path; no network listener, MCP, hooks, or skills are involved. Browser clicking is a development-only workaround and is not part of the plugin.
 
-## Execution split (1.0.11)
+## Execution split (1.0.12)
 
 Planner turns continue to use the Codex App Server/Desktop. Reviewer turns, bridge callbacks, reconciliation, normalization, and authority alignment run through the backend `codex exec` CLI. Visible Markdown reviews are appended to the existing workflow task; the plugin never opens, refreshes, navigates, or focuses Codex Desktop after an audit completes.
 

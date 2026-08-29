@@ -136,6 +136,57 @@ export class WorkflowStore {
     );
   }
 
+  /**
+   * Mark abandoned workflows as cancelled without deleting their audit record.
+   *
+   * A DSH runtime can disappear while a workflow is in an intermediate phase.
+   * Those rows must not be treated as recoverable when their session is no
+   * longer live, but a short grace period is required so a normal runtime
+   * restart can re-register the same session before it is abandoned. Active
+   * bridge submissions are left untouched because their durable recovery state
+   * may still be valid if the session returns.
+   */
+  async abandonOrphaned(
+    liveSessionIds: Iterable<string>,
+    graceMs: number,
+    now = Date.now(),
+  ): Promise<string[]> {
+    const live = new Set(liveSessionIds);
+    const terminal = new Set<WorkflowPhase>(["passed", "blocked", "failed", "cancelled"]);
+    const activeSubmission = new Set([
+      "queued",
+      "sending",
+      "waiting_verdict",
+      "retrying",
+      "verdict_ready",
+      "received",
+    ]);
+    const cutoff = now - Math.max(0, graceMs);
+    const abandoned: string[] = [];
+    for (const candidate of await this.list()) {
+      if (terminal.has(candidate.phase) || live.has(candidate.dshSessionId)) continue;
+      const updatedAt = Date.parse(candidate.updatedAt);
+      if (!Number.isFinite(updatedAt) || updatedAt > cutoff) continue;
+      if (candidate.submissionState && activeSubmission.has(candidate.submissionState)) continue;
+      const outcome = await this.update(candidate.id, (record) => {
+        if (terminal.has(record.phase) || live.has(record.dshSessionId)) return;
+        const currentUpdatedAt = Date.parse(record.updatedAt);
+        if (!Number.isFinite(currentUpdatedAt) || currentUpdatedAt > cutoff) return;
+        if (record.submissionState && activeSubmission.has(record.submissionState)) return;
+        record.phase = "cancelled";
+        const reason = `DSH session ${record.dshSessionId} is no longer live; workflow abandoned by recovery`;
+        record.error = record.error ? `${record.error}; ${reason}` : reason;
+        if (record.submissionId && record.submissionState !== "failed" && record.submissionState !== "applied" && record.submissionState !== "delivered") {
+          record.submissionState = "failed";
+          record.submissionError = "workflow abandoned because its DSH session is no longer live";
+          record.callbackState = "failed";
+        }
+      }, { ignoreCancelled: true });
+      if (outcome.record.phase === "cancelled" && !abandoned.includes(candidate.id)) abandoned.push(candidate.id);
+    }
+    return abandoned;
+  }
+
   /** Bridge idempotency lookup: the workflow created for a dispatch request. */
   async byBridgeRequest(requestId: string): Promise<WorkflowRecord | undefined> {
     return (await this.list()).find((record) => record.bridgeRequestId === requestId);

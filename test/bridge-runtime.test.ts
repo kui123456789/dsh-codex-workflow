@@ -10,7 +10,7 @@ import { BridgeStore } from "../src/bridge-store.js";
 import { BridgeRuntime, BridgeCrashSimulationError, type AgentRegistryLike } from "../src/bridge-runtime.js";
 import { collectEvidence } from "../src/evidence.js";
 import { WorkflowStore } from "../src/store.js";
-import type { WorkflowConfig } from "../src/types.js";
+import type { WorkflowConfig, WorkflowRecord } from "../src/types.js";
 import { WorkflowManager, type CodexGateway } from "../src/workflow.js";
 import type { DesktopThreadOpener } from "../src/desktop-thread-opener.js";
 
@@ -1097,6 +1097,39 @@ test("the session registry stays fresh as sessions come and go", async () => {
     await waitFor(async () => live().includes("session-new"));
     h.registry.unregister("session-a");
     await waitFor(async () => !live().includes("session-a"));
+  } finally {
+    await h.runtime.stop();
+    await rmClosed(h.directory);
+  }
+});
+
+test("runtime startup preserves and cancels stale orphan workflows after the grace period", async () => {
+  const h = await harness(5, 1, 2, 100);
+  try {
+    const stale: WorkflowRecord = {
+      schemaVersion: 1,
+      id: "orphan-runtime",
+      dshSessionId: "session-gone",
+      cwd: "C:\\work",
+      task: "orphan",
+      mode: "planned",
+      origin: "dsh",
+      phase: "executing",
+      createdAt: "2026-08-20T00:00:00.000Z",
+      updatedAt: "2026-08-20T00:00:00.000Z",
+      assumptions: [],
+      questions: [],
+      reviewCycles: 0,
+      noChangeReviewRounds: 0,
+    };
+    await h.workflowStore.save(stale);
+    h.registry.register(makeAgent("session-live", "C:\\work"));
+    h.runtime.start();
+    await waitFor(async () => (await h.workflowStore.load(stale.id))?.phase === "cancelled");
+    const cancelled = await h.workflowStore.load(stale.id);
+    assert.equal(cancelled?.phase, "cancelled");
+    assert.match(cancelled?.error ?? "", /session-gone.*no longer live/);
+    assert.ok(await h.workflowStore.load(stale.id), "audit row is retained");
   } finally {
     await h.runtime.stop();
     await rmClosed(h.directory);

@@ -215,6 +215,14 @@ export class BridgeRuntime {
     if (!force && snapshot === this.sessionSnapshot) return;
     this.store.coordinationHandle.refreshOwnerSessions(this.claimOwner, rows, this.store.leaseMs, now);
     this.sessionSnapshot = snapshot;
+    // Preserve audit rows, but close old workflows whose owning DSH session has
+    // disappeared. A two-lease grace period lets a normal runtime restart
+    // re-register the same session before it is considered abandoned.
+    await this.options.workflowStore.abandonOrphaned(
+      rows.map((row) => row.sessionId),
+      this.store.leaseMs * 2,
+      now,
+    ).catch(() => undefined);
   }
 
   /**
