@@ -1,5 +1,6 @@
 import { APPENDED_READBACK_TIMEOUT_MS } from "./app-server.js";
-import { defineTool, type JsonValue, type ToolDefinition } from "@deepseek-ai/dsh-tools";
+import { defineTool, type ToolDefinition } from "@deepseek-ai/dsh-tools";
+import type { JsonValue } from "@deepseek-ai/dsh-util-values";
 import type { WorkflowConfig } from "./types.js";
 import type { WorkflowManager } from "./workflow.js";
 

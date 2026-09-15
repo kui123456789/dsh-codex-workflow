@@ -21,8 +21,8 @@ export const inject = ["tools", "agents", "systemPrompt"];
 export const Config = ConfigSchema;
 export type Config = RawConfig;
 
-export function apply(ctx: Context, raw: Config): void {
-  ctx.effect(async () => {
+export async function apply(ctx: Context, raw: Config): Promise<void> {
+  await ctx.effect(async () => {
     const config = resolveConfig(raw);
     const store = new WorkflowStore(config.storageDir);
     await store.init();

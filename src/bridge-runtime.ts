@@ -460,7 +460,7 @@ export class BridgeRuntime {
    * relay message with this exact identity (inbox insertions persist as
    * `agent/inbox/spliced` events carrying the full message). */
   private hasDeliveredMessage(agent: Agent, messageId: MessageId): boolean {
-    for (const event of agent.session.events) {
+    for (const event of agent.session.snapshotEvents()) {
       const type = (event as { type?: string }).type;
       if (type !== "agent/inbox/spliced") continue;
       const data = (event as { data?: { inserted?: Array<{ id?: string }> } }).data;

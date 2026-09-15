@@ -1,6 +1,6 @@
 {
   "name": "dsh-codex-workflow",
-  "version": "1.0.12",
+  "version": "1.0.14",
   "description": "DeepSeek Harness plugin that uses Codex to plan and review while DSH executes.",
   "keywords": [
     "deepseek-harness",
@@ -51,8 +51,10 @@
     "verify": "pnpm typecheck && pnpm test",
     "doctor": "pnpm build && node scripts/doctor.mjs",
     "doctor:offline": "pnpm build && node scripts/doctor.mjs --offline",
+    "host:check": "pnpm build && node scripts/host-compat-check.mjs",
     "lifecycle:accept": "pnpm build && node scripts/lifecycle-acceptance.mjs",
-    "release:check": "node scripts/release-check.mjs"
+    "release:check": "node scripts/release-check.mjs",
+    "review-only:accept": "pnpm build && node scripts/review-only-acceptance.mjs"
   },
   "dsh": {
     "bundle": {
@@ -64,18 +66,25 @@
     "cross-spawn": "^7.0.6"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-agent": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-llm": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-system-prompt": ">=0.1.0-rc.6 <0.2.0",
-    "@deepseek-ai/dsh-tools": "0.1.0-rc.6"
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-agent": "^0.1.5-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.1.5-rc.1",
+    "@deepseek-ai/dsh-system-prompt": "^0.1.5-rc.1",
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.1",
+    "@deepseek-ai/dsh-util-values": "^0.1.5-rc.1"
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-agent": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-llm": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-system-prompt": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-tools": "0.1.0-rc.6",
+    "@deepseek-ai/cordis": "4.0.2",
+    "@deepseek-ai/dsh-agent": "0.1.5-rc.1",
+    "@deepseek-ai/dsh-code-runtime": "0.1.5-rc.1",
+    "@deepseek-ai/dsh-invariants": "0.1.5-rc.1",
+    "@deepseek-ai/dsh-llm": "0.1.5-rc.1",
+    "@deepseek-ai/dsh-scope": "0.1.5-rc.1",
+    "@deepseek-ai/dsh-session": "0.1.5-rc.1",
+    "@deepseek-ai/dsh-system-prompt": "0.1.5-rc.1",
+    "@deepseek-ai/dsh-tools": "0.1.5-rc.1",
+    "@deepseek-ai/dsh-user-approval": "0.1.5-rc.1",
+    "@deepseek-ai/dsh-util-values": "0.1.5-rc.1",
     "@types/cross-spawn": "^6.0.6",
     "@types/node": "^24.0.0",
     "tsx": "^4.20.6",
@@ -85,7 +94,9 @@
     "node": "^22.19.0 || >=24.0.0"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild"]
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   },
   "license": "MIT"
 }

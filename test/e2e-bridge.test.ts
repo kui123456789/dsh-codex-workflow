@@ -77,7 +77,7 @@ function makeAgent(id: string, cwd: string): { agent: Agent; followups: Array<{ 
   const events: Array<Record<string, unknown>> = [];
   const agent = {
     id,
-    session: { header: { cwd }, events },
+    session: { header: { cwd }, snapshotEvents: () => events.slice() },
     followup: (message: { id: string; content: Array<{ type: string; text?: string }> }) => {
       followups.push({ text: message.content[0]?.text ?? "" });
       events.push({

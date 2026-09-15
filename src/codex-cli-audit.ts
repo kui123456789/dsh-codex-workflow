@@ -25,7 +25,12 @@ export interface CodexCliAuditOptions {
   retryBaseMs?: number;
 }
 
+export type NewCliReviewRequest = Omit<CodexCallbackRequest, "codexThreadId" | "reviewerThreadId" | "onThread"> & {
+  onThread: (threadId: string) => Promise<void> | void;
+};
+
 export interface CodexCliAuditGateway {
+  createReview(request: NewCliReviewRequest, signal?: AbortSignal): Promise<CodexCallbackResult & { kind: "verdict"; visibleText: string; threadId: string }>;
   review(request: CodexCallbackRequest, signal?: AbortSignal): Promise<CodexCallbackResult & { kind: "verdict"; visibleText: string; threadId: string }>;
   normalize(input: { visibleText: string; cwd: string; workflowId: string; submissionId?: string; model?: string }, signal?: AbortSignal): Promise<ReviewResult>;
   align(input: { result: ReviewResult; task: string; planMarkdown?: string; previousReview?: ReviewResult; fixSummary?: string; cwd: string; workflowId: string; submissionId?: string; model?: string; prompt: string }, signal?: AbortSignal): Promise<AlignmentOutcome>;
@@ -85,15 +90,37 @@ export class CodexCliAuditDispatcher implements CodexCliAuditGateway {
   }
 
   async review(request: CodexCallbackRequest, signal?: AbortSignal): Promise<CodexCallbackResult & { kind: "verdict"; visibleText: string; threadId: string }> {
+    const result = await this.runReviewWithRetry(request, signal);
+    return this.finishReview(request, result, signal);
+  }
+
+  /** The first review-only turn must create its own durable CLI task. An empty
+   * App Server thread has no rollout for `exec resume` to load. Bind the CLI
+   * identity before normalization so a failed round can resume the same task. */
+  async createReview(request: NewCliReviewRequest, signal?: AbortSignal) {
+    let threadId: string | undefined;
+    const result = await this.run(request.workflowId, request.submissionId,
+      this.buildArgs({ cwd: request.cwd, model: request.model, effort: request.effort }),
+      request.prompt, signal, undefined, async (id) => {
+        threadId = id;
+        await request.onThread(id);
+      });
+    if (!threadId) {
+      if (result.code !== 0) this.throwProcess("new review", result.stdout, result.stderr, result.code);
+      throw new CodexNoVerdictError("new CLI review did not report a thread.started identity");
+    }
+    return this.finishReview({ ...request, codexThreadId: threadId, onThread: undefined }, result, signal);
+  }
+
+  private async finishReview(request: CodexCallbackRequest, result: { code: number | null; stdout: string; stderr: string }, signal?: AbortSignal) {
     const visibleThreadId = this.visibleThreadId(request);
-    let result = await this.runReviewWithRetry(request, signal);
     if (result.code !== 0) this.throwProcess(visibleThreadId, result.stdout, result.stderr, result.code);
     let visibleText = extractAgentMessage(result.stdout);
     if (!visibleText) throw new CodexNoVerdictError("no final agent message found in CLI review output");
     visibleText = await this.ensureVisibleContract(request, visibleText, signal, "review");
     const verdict = await this.normalize({ visibleText, cwd: request.cwd, workflowId: request.workflowId, submissionId: request.submissionId, model: request.model }, signal);
     await request.onThread?.(visibleThreadId);
-    return { kind: "verdict", verdict, visibleText, threadId: visibleThreadId };
+    return { kind: "verdict" as const, verdict, visibleText, threadId: visibleThreadId };
   }
 
   private async runReviewWithRetry(request: CodexCallbackRequest, signal?: AbortSignal) {
@@ -215,6 +242,7 @@ export class CodexCliAuditDispatcher implements CodexCliAuditGateway {
     prompt: string,
     signal?: AbortSignal,
     threadId?: string,
+    onNewThread?: (threadId: string) => Promise<void>,
   ): Promise<{ code: number | null; stdout: string; stderr: string }> {
     if (this.stopped) throw new Error("codex CLI audit dispatcher is stopped");
     if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("codex CLI audit aborted");
@@ -240,7 +268,39 @@ export class CodexCliAuditDispatcher implements CodexCliAuditGateway {
       timer.unref();
       const onAbort = () => abort(signal?.reason instanceof Error ? signal.reason : new Error("codex CLI audit aborted"));
       signal?.addEventListener("abort", onAbort, { once: true });
-      child.stdout?.on("data", (chunk: Buffer) => { stdout += outDecoder.write(chunk); if (Buffer.byteLength(stdout) > max) abort(new CodexNoVerdictError("CLI output exceeded retention bound")); });
+      let identityBuffer = "";
+      let newThreadId: string | undefined;
+      let binding: Promise<void> = Promise.resolve();
+      const readIdentity = (text: string, flush = false) => {
+        if (!onNewThread) return;
+        identityBuffer += text;
+        const lines = identityBuffer.split("\n");
+        identityBuffer = flush ? "" : lines.pop()!;
+        for (const line of lines) {
+          let event: { type?: string; thread_id?: unknown };
+          try { event = JSON.parse(line); } catch { continue; }
+          if (event?.type !== "thread.started") continue;
+          const id = event.thread_id;
+          if (typeof id !== "string" || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(id)
+            || (newThreadId !== undefined && newThreadId !== id)) {
+            abort(new CodexNoVerdictError("invalid or conflicting CLI thread.started identity"));
+            return;
+          }
+          if (newThreadId) continue;
+          newThreadId = id;
+          const entry = this.children.get(key);
+          if (entry) entry.threadId = id;
+          binding = Promise.resolve().then(() => onNewThread(id)).catch((error) => {
+            abort(error instanceof Error ? error : new Error(String(error)));
+          });
+        }
+      };
+      child.stdout?.on("data", (chunk: Buffer) => {
+        const text = outDecoder.write(chunk);
+        stdout += text;
+        if (Buffer.byteLength(stdout) > max) { abort(new CodexNoVerdictError("CLI output exceeded retention bound")); return; }
+        readIdentity(text);
+      });
       child.stderr?.on("data", (chunk: Buffer) => { stderr += errDecoder.write(chunk); if (Buffer.byteLength(stderr) > max) stderr = stderr.slice(-max); });
       child.once("error", (error) => {
         if (child.pid === undefined) {
@@ -257,14 +317,20 @@ export class CodexCliAuditDispatcher implements CodexCliAuditGateway {
         clearTimeout(timer);
         for (const killTimer of killTimers) clearTimeout(killTimer);
         signal?.removeEventListener("abort", onAbort);
-        this.children.delete(key);
-        resolveDone();
         if (settled) return;
         settled = true;
-        stdout += outDecoder.end();
+        const tail = outDecoder.end();
+        stdout += tail;
+        readIdentity(tail, true);
         stderr += errDecoder.end();
-        if (pendingError) reject(pendingError);
-        else resolve({ code, stdout, stderr });
+        void binding.then(() => {
+          // Stop/retry must also wait for the new task identity to be durable.
+          for (const killTimer of killTimers) clearTimeout(killTimer);
+          this.children.delete(key);
+          resolveDone();
+          if (pendingError) reject(pendingError);
+          else resolve({ code, stdout, stderr });
+        });
       });
       if (!child.stdin || !child.stdout || !child.stderr) {
         abort(new Error("codex CLI audit child streams unavailable"));

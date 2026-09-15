@@ -2,6 +2,21 @@
 
 All notable changes to `dsh-codex-workflow`.
 
+## [1.0.14] - 2026-09-14
+
+- **Fix first review-only task creation.** The first visible CLI audit now runs a persistent `codex exec --json` turn directly instead of creating an empty App Server task that `exec resume` cannot find.
+- Persist the validated `thread.started` identity before normalization, including when the first CLI process fails. Later reviews and display rewrites resume that exact task; existing Planner, bridge and legacy Reviewer identities are never replaced.
+- Reject missing, invalid or conflicting creation identities and stop if task persistence fails or cancellation wins. Teardown waits for both child exit and the identity write before returning.
+- Add regression coverage for creation, split JSONL events, retries, cancellation and teardown, plus `pnpm review-only:accept` for real CLI creation → changes_requested → repair → same-task pass.
+
+## [1.0.13] - 2026-09-13
+
+- **DSH 0.1.5 compatibility.** Raise the host peer baseline to `0.1.5-rc.1` and Cordis `4.0.2`, and align development peers so old core modules cannot silently remain in the test dependency tree.
+- Read durable inbox history through `Session.snapshotEvents()`; the removed `Session.events` property caused dispatch and verdict delivery to retry instead of reaching the original session. Crash-replay deduplication now runs against real DSH Session objects in the regression suite.
+- Import `JsonValue` from its current public package, `@deepseek-ai/dsh-util-values`.
+- Await asynchronous plugin initialization so Cordis activation resolves only after all eight tools and the bridge runtime are registered. Add a real Cordis/SystemPrompt/ToolRuntime activation and unload regression test.
+- No workflow or SQLite migration is required. Existing plans, audit history, session bindings and user configuration remain compatible; DSH versions below the new baseline are no longer supported by this release.
+
 ## [1.0.12] - 2026-08-29
 
 - **Orphan workflow recovery.** On a normal runtime refresh, workflows whose DSH session has disappeared are safely marked `cancelled` only after a two-lease grace period. Audit records are retained, live sessions are never touched, and active bridge submissions remain recoverable.

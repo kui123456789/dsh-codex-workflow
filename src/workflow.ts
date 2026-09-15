@@ -2046,35 +2046,41 @@ export class WorkflowManager {
     let current = seed;
     const reviewerModel = current.reviewerModel || this.config.reviewerModel;
     let threadId = current.reviewerThreadId || current.plannerThreadId;
-    if (!threadId) {
-      if (!this.codex.startReviewerThread) throw new Error("review-only CLI audit requires a visible review task");
-      threadId = await this.codex.startReviewerThread({ cwd: current.cwd, name: `DSH Reviewer: ${workflowId}`, ...(reviewerModel ? { model: reviewerModel } : {}) }, exec.signal);
-      const commit = await this.store.update(workflowId, (r) => { r.reviewerThreadId = threadId!; }, { ignoreCancelled: false });
-      if (commit.suppressed) return commit.record;
-      current = commit.record;
-    } else if (current.reviewerThreadId !== threadId) {
-      // CLI audits reuse the existing planner/source task. Persist that
-      // identity just like the App Server review path so cancellation,
-      // recovery, status and bridge compatibility all report the same visible
-      // task instead of leaving reviewerThreadId undefined.
-      const commit = await this.store.update(workflowId, (r) => { r.reviewerThreadId = threadId!; }, { ignoreCancelled: false });
-      if (commit.suppressed) return commit.record;
-      current = commit.record;
-    }
-    const prompt = reviewInstructions(current, input, evidence, await isGitRepository(current.cwd));
-    if (this.codex.releaseThreadForExternal) await this.codex.releaseThreadForExternal(threadId, exec.signal);
-    else await this.codex.unsubscribeThread?.(threadId, exec.signal);
-    const review = await this.audit!.review({
+    const request = {
       workflowId,
       submissionId: `review-${Date.now()}`,
-      codexThreadId: threadId,
       cwd: current.cwd,
-      prompt,
+      prompt: reviewInstructions(current, input, evidence, await isGitRepository(current.cwd)),
       task: current.task,
       planMarkdown: current.planMarkdown,
       ...(reviewerModel ? { model: reviewerModel } : {}),
       effort: current.reviewerEffort ?? this.config.reviewerEffort,
-    }, exec.signal);
+    };
+    let review;
+    if (!threadId) {
+      review = await this.audit!.createReview({
+        ...request,
+        onThread: async (id) => {
+          const commit = await this.store.update(workflowId, (r) => {
+            if (r.reviewerThreadId && r.reviewerThreadId !== id) throw new Error("review task identity changed");
+            r.reviewerThreadId = id;
+          }, { ignoreCancelled: false });
+          if (commit.suppressed) throw new Error("workflow cancelled during CLI task creation");
+          threadId = id;
+          current = commit.record;
+        },
+      }, exec.signal);
+    } else {
+      if (current.reviewerThreadId !== threadId) {
+        const commit = await this.store.update(workflowId, (r) => { r.reviewerThreadId = threadId!; }, { ignoreCancelled: false });
+        if (commit.suppressed) return commit.record;
+        current = commit.record;
+      }
+      if (this.codex.releaseThreadForExternal) await this.codex.releaseThreadForExternal(threadId, exec.signal);
+      else await this.codex.unsubscribeThread?.(threadId, exec.signal);
+      review = await this.audit!.review({ ...request, codexThreadId: threadId }, exec.signal);
+    }
+    if (review.threadId !== threadId) throw new Error("CLI review returned a different task identity");
     if (review.kind !== "verdict") throw new Error("CLI audit did not return a verdict");
     current = (await this.store.load(workflowId)) ?? current;
     if (current.phase === "cancelled") return current;

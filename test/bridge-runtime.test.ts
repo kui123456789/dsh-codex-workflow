@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { Agent } from "@deepseek-ai/dsh-agent";
+import { Session, SessionId } from "@deepseek-ai/dsh-session";
+import type { UserMessage } from "@deepseek-ai/dsh-llm";
 import { closeCoordinationStoresForDirectory } from "../src/coordination.js";
 import { newRequestId, type DispatchPlanCommand, type SubmissionNoticeCommand, type SubmitVerdictCommand } from "../src/bridge-protocol.js";
 import { BridgeStore } from "../src/bridge-store.js";
@@ -93,13 +95,11 @@ function makeAgent(id: string, cwd: string, followupThrows = 0, hangAfterFollowu
   };
   // The durable session event log: inbox insertions persist as
   // agent/inbox/spliced events carrying the full message with its stable id.
-  const events: Array<Record<string, unknown>> = [];
+  const emptySession = Session.create(SessionId(id));
+  const session = Session.create(SessionId(id), [], { ...emptySession.header, cwd });
   fake.agent = {
     id,
-    session: {
-      header: { cwd },
-      events,
-    },
+    session,
     get status() { return fake.status; },
     whenIdle: () => fake.status === "idle"
       ? Promise.resolve()
@@ -108,18 +108,14 @@ function makeAgent(id: string, cwd: string, followupThrows = 0, hangAfterFollowu
       fake.cancels.push({ cause, options });
       fake.finishActivity();
     },
-    followup: (message: { id: string; content: Array<{ type: string; text?: string }> }) => {
+    followup: (message: UserMessage) => {
       if (followupThrows > 0) {
         followupThrows -= 1;
         throw new Error("session followup temporarily unavailable");
       }
-      fake.followups.push({ text: message.content[0]?.text ?? "" });
-      events.push({
-        type: "agent/inbox/spliced",
-        seq: events.length,
-        time: Date.now(),
-        data: { target: "next-turn", start: 0, deleteCount: 0, inserted: [message] },
-      });
+      const first = message.content[0];
+      fake.followups.push({ text: first?.type === "text" ? first.text : "" });
+      session.append("agent/inbox/spliced", { target: "next-turn", start: 0, inserted: [message] });
       if (hangAfterFollowup) fake.startActivity();
     },
   } as unknown as Agent;

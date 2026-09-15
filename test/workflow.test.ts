@@ -443,6 +443,13 @@ class GatedCallback extends FakeCallback {
 
 class FakeCliAudit implements CodexCliAuditGateway {
   reviewRequests: CodexCallbackRequest[] = [];
+  creations = 0;
+
+  async createReview(request: Omit<CodexCallbackRequest, "codexThreadId">) {
+    this.creations += 1;
+    await request.onThread?.("cli-created-reviewer");
+    return this.review({ ...request, codexThreadId: "cli-created-reviewer", onThread: undefined });
+  }
 
   async review(request: CodexCallbackRequest): Promise<{ kind: "verdict"; verdict: ReviewResult; visibleText: string; threadId: string }> {
     this.reviewRequests.push(request);
@@ -2593,6 +2600,56 @@ test("planned workflow with a legacy distinct reviewerThreadId keeps using that 
   } finally {
     await rmClosed(directory);
   }
+});
+
+test("CLI review-only creates its first task directly and retains it after review failure", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-cli-first-review-"));
+  try {
+    const gateway = new FakeGateway();
+    gateway.startReviewerThread = async () => { throw new Error("empty App Server tasks cannot be resumed by CLI"); };
+    const audit = new FakeCliAudit();
+    const normalReview = audit.review.bind(audit);
+    let fail = true;
+    audit.review = async (request) => {
+      if (fail) { fail = false; throw new Error("normalization unavailable"); }
+      return normalReview(request);
+    };
+    const instance = manager(directory, gateway, {}, undefined, undefined, audit);
+    const exec = fakeExec("cli-first-review", directory, []);
+    await changedFile(directory);
+    await assert.rejects(instance.reviewOnly({ implementationSummary: "Changed", changedFiles: ["a.txt"] }, exec), /normalization unavailable/);
+    const store = new WorkflowStore(directory);
+    const [record] = await store.list();
+    assert.equal(record?.reviewerThreadId, "cli-created-reviewer");
+    assert.equal(record?.reviewCycles, 0);
+    const retry = await instance.review(record!.id, { implementationSummary: "Retry", changedFiles: ["a.txt"] }, exec);
+    assert.equal(retry.phase, "passed");
+    assert.equal(retry.reviewerThreadId, "cli-created-reviewer");
+    assert.equal(audit.creations, 1);
+    assert.equal(audit.reviewRequests[0]?.codexThreadId, "cli-created-reviewer");
+    await instance.stop();
+  } finally { await rmClosed(directory); }
+});
+
+test("cancel during first CLI review creation cannot bind or apply a late result", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-cli-create-cancel-"));
+  try {
+    const audit = new FakeCliAudit();
+    const instance = manager(directory, new FakeGateway(), {}, undefined, undefined, audit);
+    const exec = fakeExec("cancel-first-cli", directory, []);
+    audit.createReview = async (request) => {
+      await instance.cancel(request.workflowId, exec);
+      await request.onThread?.("late-cli-task");
+      throw new Error("cancelled creation must not continue");
+    };
+    await changedFile(directory);
+    const result = await instance.reviewOnly({ implementationSummary: "Changed", changedFiles: ["a.txt"] }, exec);
+    assert.equal(result.phase, "cancelled");
+    assert.equal(result.reviewerThreadId, undefined);
+    assert.equal(result.latestReview, undefined);
+    assert.equal(result.reviewCycles, 0);
+    await instance.stop();
+  } finally { await rmClosed(directory); }
 });
 
 test("CLI planned review releases and resumes the legacy distinct Reviewer task", async () => {

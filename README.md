@@ -7,15 +7,31 @@ DeepSeek Harness plugin that gives Codex read-only planning/review roles while D
 
 No browser is opened or controlled anywhere in the product path; no network listener, MCP, hooks, or skills are involved. Browser clicking is a development-only workaround and is not part of the plugin.
 
-## Execution split (1.0.12)
+## Execution split (1.0.14)
 
 Planner turns continue to use the Codex App Server/Desktop. Reviewer turns, bridge callbacks, reconciliation, normalization, and authority alignment run through the backend `codex exec` CLI. Visible Markdown reviews are appended to the existing workflow task; the plugin never opens, refreshes, navigates, or focuses Codex Desktop after an audit completes.
 
 ## Requirements
 
-- DeepSeek Harness `0.1.0-rc.6`
+- DeepSeek Harness `0.1.5-rc.1` (minimum supported version; this release updates the host API baseline)
 - Node.js `^22.19.0` or `>=24`
 - Codex CLI with a valid ChatGPT login and App Server support (verified by `pnpm doctor`)
+
+### Upgrading after a DSH update
+
+Version 1.0.14 targets DSH `0.1.5-rc.1` and newer compatible 0.1.x releases.
+Older DSH versions need the older plugin release. Source installs must refresh
+their local dependencies with `pnpm install --frozen-lockfile` and rebuild;
+upgrading the host alone does not update a linked plugin's `node_modules`.
+
+Run `pnpm host:check` to load and unload the built plugin using the actual DSH
+core packages installed under `$DSH_HOME/profiles`. It checks that all eight
+tools exist when activation resolves and disappear on unload, using temporary
+storage and an empty agent registry. It does not restart the live profile or
+perform a model call. For another installation, set
+`DSH_CODEX_HOST_PACKAGE_JSON` to its `@deepseek-ai/dsh/package.json` path.
+After the checks, load the new build through the normal operator-controlled
+DSH profile restart; existing workflow storage requires no migration.
 
 ## Install
 
@@ -100,6 +116,18 @@ The verdict is applied in the original DSH session with the same blocking/non-bl
 The bridge never invents the source task id. `dispatch`/`respond` default `--codex-thread` from `CODEX_THREAD_ID` and fail with a paste-ready explanation when it is absent. On the first review the callback validates and resumes that id, persists it as the workflow's review task id, and reuses it on later cycles.
 
 ## DSH-led flow (legacy, compatible)
+
+For `review_only`, the first audit creates its persistent task directly with
+`codex exec --json`; its `thread.started` identity is saved before converting
+the review. Subsequent audits resume that task, even if normalization of the
+first round failed. An existing task that cannot be loaded still fails instead
+of being silently replaced. This avoids resuming an empty App Server task with
+no durable history.
+
+`pnpm review-only:accept` exercises real CLI first-task creation and a repair
+review on the same task using temporary workspace/storage and a fixture DSH
+tool context. It requires the local Codex login; `DSH_CODEX_LIFECYCLE_MODEL`
+optionally pins the test model. It does not restart the formal DSH profile.
 
 In a DSH conversation:
 
