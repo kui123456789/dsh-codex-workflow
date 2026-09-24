@@ -126,9 +126,21 @@ export class CodexCliAuditDispatcher implements CodexCliAuditGateway {
     return this.finishReview(request, result, signal);
   }
 
-  /** The first review-only turn must create its own durable CLI task. An empty
-   * App Server thread has no rollout for `exec resume` to load. Bind the CLI
-   * identity before normalization so a failed round can resume the same task. */
+  /**
+   * COMPATIBILITY ONLY since 1.1.2 — NOT reachable from a workflow any more.
+   *
+   * A task created here is stored with `source='exec'`, and the App Server's
+   * `thread/list` (the Codex Desktop sidebar source) only ever returns
+   * `source='vscode'` tasks: measured 0 of 15 `exec` tasks listed versus 62 of
+   * 72 `vscode` tasks, and neither `thread/name/set` nor
+   * `--thread-source vscode` changes the `source` column. The visible review
+   * turn therefore moved to the App Server (`WorkflowManager.reviewOnce` /
+   * `AppServerCodexCallbackDispatcher`), and `workflow.ts` no longer calls
+   * `createReview`/`review` at all. Both stay functional for embedders that
+   * use this dispatcher as a standalone `CodexCallback`, and for the CLI
+   * audit's REAL conversions (`normalize`, `align`, `reconcile`), which run
+   * `--ephemeral` and create no durable task.
+   */
   async createReview(request: NewCliReviewRequest, signal?: AbortSignal) {
     let threadId: string | undefined;
     const result = await this.runWithTransientRetry({

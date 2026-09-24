@@ -4,6 +4,7 @@ import type { Context } from "@deepseek-ai/cordis";
 import { writeFile, mkdir } from "node:fs/promises";
 import { registerAutoTriggerPrompt } from "./auto-trigger.js";
 import { CodexAppServerClient } from "./app-server.js";
+import { AppServerCodexCallbackDispatcher } from "./app-server-callback.js";
 import { CodexCliAuditDispatcher } from "./codex-cli-audit.js";
 import { BridgeStore } from "./bridge-store.js";
 import { BridgeRuntime } from "./bridge-runtime.js";
@@ -59,7 +60,15 @@ export async function apply(ctx: Context, raw: Config): Promise<void> {
       // contexts to complete instead of truncating at the unit-test default.
       maxOutputBytes: 4 * 1024 * 1024,
     });
-    const manager = new WorkflowManager(store, codex, config, audit, bridgeStore, audit);
+    // 1.1.2: the VISIBLE review path is the APP SERVER dispatcher. A task created
+    // by `codex exec` is stored with `source='exec'` and is never returned by
+    // `thread/list` (measured: 0 of 15 exec tasks listed, versus 62 of 72 App
+    // Server tasks), so every CLI-produced review landed in a task Codex Desktop
+    // cannot render. The CLI dispatcher stays injected as the AUDIT gateway for
+    // the internal normalize/align/reconcile conversions only — those run
+    // `--ephemeral` and create no durable task.
+    const callback = new AppServerCodexCallbackDispatcher(codex);
+    const manager = new WorkflowManager(store, codex, config, callback, bridgeStore, audit);
     const autoTriggerDisposer = registerAutoTriggerPrompt(ctx.systemPrompt, config.autoTriggerMode);
     const runtime = new BridgeRuntime(bridgeStore, ctx.agents, {
       pollMs: config.bridgePollMs,
@@ -90,6 +99,7 @@ export async function apply(ctx: Context, raw: Config): Promise<void> {
       // Manager teardown blocks new callback sends, aborts in-flight recovery
       // and its backoff, then cancels and awaits every Reviewer operation.
       await manager.stop();
+      await callback.stop();
       await audit.stop();
       await codex.stop();
       bridgeStore.close();

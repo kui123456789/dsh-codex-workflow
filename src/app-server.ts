@@ -335,6 +335,19 @@ export class CodexAppServerClient {
     return object(response.thread);
   }
 
+  /**
+   * 1.1.2: set a thread's DISPLAY NAME.
+   *
+   * Verified on codex-cli 0.154.0: `thread/name/set` succeeds on a thread that
+   * is NOT loaded, so this needs no `thread/resume` and therefore never takes
+   * the writer lock of a thread another process (Codex Desktop) may hold. Used
+   * to give a readable title to threads the plugin created — an untitled task
+   * is hard to find in the Desktop UI.
+   */
+  async nameThread(threadId: string, name: string, signal?: AbortSignal): Promise<void> {
+    await this.request("thread/name/set", { threadId, name }, signal);
+  }
+
   async resumeThread(threadId: string, cwd: string, signal?: AbortSignal): Promise<void> {
     await this.request("thread/resume", {
       threadId,

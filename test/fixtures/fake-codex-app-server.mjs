@@ -77,6 +77,15 @@ function sourceBusy(threadId) {
   return sourceHasActiveWriter && sourceThreadForWriter && threadId === sourceThreadForWriter;
 }
 
+// 1.1.2: model the real constraint that pushed Reviewer creation to the CLI in
+// 1.0.14 — a task that has never run a turn has NO rollout, so resuming it is
+// rejected while resuming one that ran a turn succeeds. Opt-in, so the default
+// fixture keeps its permissive resume semantics for every other test.
+const rolloutRequired = process.env.FAKE_CODEX_ROLLOUT_REQUIRED === "1";
+function missingRollout(threadId) {
+  return rolloutRequired && (threadTurnHistory.get(threadId) ?? []).length === 0;
+}
+
 function send(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
 }
@@ -103,7 +112,15 @@ function complete(threadId, turnId, text, status = "completed") {
   if (text !== null && text !== undefined) {
     send({ method: "item/completed", params: { threadId, turnId, completedAtMs: Date.now(), item: { type: "agentMessage", id: `item-${turnId}`, text, phase: "final_answer", memoryCitation: null } } });
   }
-  send({ method: "turn/completed", params: { threadId, turn: { id: turnId, items: [], itemsView: "full", status, error: null, startedAt: 1, completedAt: 2, durationMs: 1 } } });
+  send({ method: "turn/completed", params: { threadId, turn: { id: turnId, items: [], itemsView: "full", status, error: turnError(), startedAt: 1, completedAt: 2, durationMs: 1 } } });
+}
+
+/** 1.1.2: an explicitly injected turn failure (e.g. the upstream
+ * "Selected model is at capacity" overload) so the transient-retry contract of
+ * a FAILED turn can be asserted end to end. Default: no error. */
+function turnError() {
+  const message = process.env.FAKE_CODEX_TURN_ERROR || "";
+  return message ? { message } : null;
 }
 
 function provisionalTexts() {
@@ -211,6 +228,9 @@ function handleClientRequest(message) {
     if (method === "thread/resume" && sourceBusy(params.threadId)) {
       return send({ id, error: { code: -32000, message: `thread-store conflict: thread ${params.threadId} already has an active writer` } });
     }
+    if (method === "thread/resume" && missingRollout(params.threadId)) {
+      return send({ id, error: { code: -32600, message: `no rollout found for thread id ${params.threadId}` } });
+    }
     if (method === "thread/resume") {
       subscribed.add(params.threadId);
       knownThreads.add(params.threadId);
@@ -276,7 +296,12 @@ function handleClientRequest(message) {
     // Interrupted/failed turns carry NO final agent message: a provisional pass
     // alone must never become a verdict.
     const emission = !reviewSchema || finalStatus === "completed" ? finalText : null;
-    return setTimeout(() => complete(params.threadId, turnId, emission, reviewSchema ? finalStatus : "completed"), delay);
+    // A VISIBLE turn is normally reported `completed` (only schema-bearing
+    // conversion forks follow FAKE_CODEX_TURN_STATUS); an explicitly injected
+    // turn error means the visible turn FAILED, so the transient-retry contract
+    // can be asserted on it too.
+    const visibleStatus = turnError() ? "failed" : "completed";
+    return setTimeout(() => complete(params.threadId, turnId, emission, reviewSchema ? finalStatus : visibleStatus), delay);
   }
   if (method === "review/start") {
     const turnId = `turn-${++turnCounter}`;

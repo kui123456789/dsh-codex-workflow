@@ -21,6 +21,10 @@
         transientRetryMaxMs: 60000
         transientRetryBudgetMs: 1200000
         transientRetryJitterRatio: 0.25
+        # 1.1.2 review progress: DSH-owned heartbeat period and the age at which
+        # a review with no fresh heartbeat is reported as `stale`.
+        reviewHeartbeatMs: 15000
+        reviewStaleMs: 60000
         turnTimeoutMs: 600000
         idleProcessMs: 5000
         terminalRelayTimeoutMs: 60000

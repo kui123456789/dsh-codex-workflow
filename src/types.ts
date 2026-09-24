@@ -177,6 +177,21 @@ export interface WorkflowRecord {
    * workflows); kept for diagnostics and restart recovery. */
   sourceThreadId?: string;
   reviewerThreadId?: string;
+  /**
+   * 1.1.2: which side created `reviewerThreadId`.
+   *
+   * `"app-server"` = created through `thread/start` on the App Server, which is
+   * the ONLY kind Codex Desktop can render: the App Server stores it with
+   * `source='vscode'` and returns it from `thread/list`. A thread created by
+   * `codex exec` is stored with `source='exec'`, is NEVER returned by
+   * `thread/list` (measured: 0/15 listed, versus 62/72 `vscode` threads) and
+   * therefore cannot be opened in the Desktop UI at all — it also carries no
+   * name. Records without this marker (everything written before 1.1.2) are
+   * migrated lazily: the next review creates a visible Reviewer and replaces
+   * the id, leaving the old thread untouched. Internal only — never surfaced
+   * through `show --json`.
+   */
+  reviewerThreadOrigin?: "app-server" | "cli";
   reviewerTurnId?: string;
   /** Effective reviewer model/effort, persisted so review-only overrides
    * survive into later repair rounds. Optional for old records. */

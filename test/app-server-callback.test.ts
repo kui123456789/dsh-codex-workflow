@@ -43,6 +43,124 @@ async function waitForFileText(path: string, timeoutMs = 10_000): Promise<string
   }
 }
 
+/** 1.1.2 (1.1.1 parity): this dispatcher is now the DEFAULT visible review path,
+ * so a TRANSIENT upstream failure inside its turn must stay retryable with the
+ * shared backoff instead of ending the submission as a terminal callback
+ * failure — exactly the treatment the CLI dispatcher gives `codex exec`. */
+test("a transient upstream failure inside the visible review turn is retryable, never terminal", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-app-server-callback-transient-"));
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: {
+      ...process.env,
+      FAKE_CODEX_TURN_STATUS: "failed",
+      FAKE_CODEX_TURN_ERROR: "Selected model is at capacity. Please try a different model.",
+    },
+  });
+  const callback = new AppServerCodexCallbackDispatcher(codex);
+  try {
+    const outcome = await callback.send({
+      workflowId: "workflow-transient",
+      submissionId: "submission-transient",
+      codexThreadId: "origin-task-transient",
+      cwd: directory,
+      prompt: "Review this implementation.",
+    });
+    assert.deepEqual(outcome, { kind: "retryable_busy", reason: "overloaded" });
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a non-transient visible review turn failure stays terminal", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-app-server-callback-hardfail-"));
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: {
+      ...process.env,
+      FAKE_CODEX_TURN_STATUS: "failed",
+      FAKE_CODEX_TURN_ERROR: "reviewer workspace is unreadable",
+    },
+  });
+  const callback = new AppServerCodexCallbackDispatcher(codex);
+  try {
+    await assert.rejects(
+      callback.send({
+        workflowId: "workflow-hardfail",
+        submissionId: "submission-hardfail",
+        codexThreadId: "origin-task-hardfail",
+        cwd: directory,
+        prompt: "Review this implementation.",
+      }),
+      CodexCallbackProcessError,
+    );
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a NEWLY created Reviewer whose resume fails is released; a pre-existing one never is", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-app-server-callback-orphan-"));
+  const marker = join(directory, "calls.jsonl");
+  // `FAKE_CODEX_ROLLOUT_REQUIRED` makes `thread/resume` fail for any task that
+  // never ran a turn — the real "no rollout found for thread id" condition.
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: { ...process.env, FAKE_CODEX_THREAD_PARAMS_MARKER: marker, FAKE_CODEX_ROLLOUT_REQUIRED: "1" },
+  });
+  const callback = new AppServerCodexCallbackDispatcher(codex);
+  const readCalls = async () => (await readFile(marker, "utf8")).trim().split("\n").filter(Boolean)
+    .map((line) => JSON.parse(line) as { method: string; params: Record<string, any> });
+  try {
+    // (a) The task THIS invocation created could not be resumed: it is bound to
+    // nothing and owned by nobody, so its hold is released — no orphan.
+    await assert.rejects(callback.send({
+      workflowId: "workflow-orphan",
+      submissionId: "submission-orphan",
+      codexThreadId: "origin-task-orphan",
+      cwd: directory,
+      prompt: "Review this implementation.",
+    }));
+    const created = await readCalls();
+    assert.equal(created.filter((call) => call.method === "thread/start").length, 1, "the review created its own Reviewer");
+    const unsubs = created.filter((call) => call.method === "thread/unsubscribe");
+    assert.equal(unsubs.length, 1, "the orphaned created task is released exactly once");
+    assert.ok(unsubs[0]!.params.threadId, "the released task is the one that was created");
+
+    // (b) An ALREADY BOUND Reviewer that fails to resume belongs to a workflow
+    // (possibly another concurrent review): it is NEVER released here, because
+    // resume is what claims the subscription and a failed resume must not
+    // decrement another review's hold.
+    await rm(marker, { force: true });
+    await assert.rejects(callback.send({
+      workflowId: "workflow-existing",
+      submissionId: "submission-existing",
+      codexThreadId: "origin-task-existing",
+      reviewerThreadId: "existing-reviewer-1",
+      cwd: directory,
+      prompt: "Review this implementation.",
+    }));
+    const existing = await readCalls();
+    assert.equal(existing.filter((call) => call.method === "thread/start").length, 0, "no task is created for a bound Reviewer");
+    assert.equal(existing.filter((call) => call.method === "thread/unsubscribe").length, 0,
+      "a pre-existing Reviewer is never released by a failed resume");
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("creates and reuses a dedicated Reviewer task for every background review, never touching the origin task", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-app-server-callback-"));
   const marker = join(directory, "calls.jsonl");

@@ -8,6 +8,7 @@ import {
   type CodexCallbackResult,
 } from "./codex-callback.js";
 import { REVIEW_OUTPUT_SCHEMA } from "./schemas.js";
+import { transientReason } from "./transient-retry.js";
 import { reviewConversionPrompt } from "./workflow.js";
 import { reviewDisplayError, reviewRewritePrompt } from "./review-contract.js";
 
@@ -144,7 +145,17 @@ export class AppServerCodexCallbackDispatcher {
           name: request.reviewerName ?? `DSH Reviewer: ${request.workflowId}`,
         }, signal);
       }
-      await this.codex.resumeThread(reviewerThreadId, request.cwd, signal);
+      try {
+        await this.codex.resumeThread(reviewerThreadId, request.cwd, signal);
+      } catch (error) {
+        // 1.1.2: a task THIS invocation just created, whose resume failed, is
+        // bound to nothing and owned by nobody — release its hold instead of
+        // leaving an orphaned subscription behind. A PRE-EXISTING Reviewer is
+        // deliberately NOT released: resume is what claims the subscription, so
+        // a failed resume must never decrement another review's hold.
+        if (created) await this.codex.unsubscribeThread(reviewerThreadId).catch(() => undefined);
+        throw error;
+      }
       this.trackThreadRef(reviewerThreadId, 1);
       claimed = true;
       if (created) {
@@ -200,9 +211,21 @@ export class AppServerCodexCallbackDispatcher {
           this.interruptOrigins.delete(key);
           return { kind: "retryable_busy", reason: origin };
         }
-        throw new CodexCallbackProcessError(
-          `reviewer turn ${result.turnId} failed${result.error ? `: ${result.error}` : ""}${result.reason ? ` (${result.reason})` : ""}`,
-        );
+        const detail = `reviewer turn ${result.turnId} failed${result.error ? `: ${result.error}` : ""}${result.reason ? ` (${result.reason})` : ""}`;
+        // 1.1.2: this dispatcher is now the DEFAULT visible review path (the CLI
+        // can only create `source='exec'` tasks, which Codex Desktop never
+        // renders), so the 1.1.1 transient contract must hold here too: a
+        // temporary upstream failure inside the turn (server_overloaded / at
+        // capacity / 429 / 5xx / dropped stream / a writer held elsewhere) stays
+        // RETRYABLE with the shared backoff instead of ending the submission as
+        // a terminal callback failure. Only a genuinely non-transient failure
+        // stays terminal.
+        const transient = transientReason(detail);
+        if (transient) {
+          this.interruptOrigins.delete(key);
+          return { kind: "retryable_busy", reason: transient };
+        }
+        throw new CodexCallbackProcessError(detail);
       }
       // The visible turn has COMPLETED: it is no longer a valid interrupt
       // target. Remove it from the active map NOW, so a cancel arriving in

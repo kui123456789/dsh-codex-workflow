@@ -90,6 +90,9 @@ export interface CodexGateway {
     detached: boolean;
     onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
   }, signal?: AbortSignal): Promise<{ threadId: string; result: TurnWaitResult }>;
+  /** 1.1.2: set a thread's display name. Works on a thread that is NOT loaded,
+   * so it never takes the writer lock. Optional: limited gateways may omit it. */
+  nameThread?(threadId: string, name: string, signal?: AbortSignal): Promise<void>;
   interrupt(threadId: string, turnId: string, signal?: AbortSignal): Promise<void>;
   unsubscribeThread?(threadId: string, signal?: AbortSignal): Promise<unknown>;
   releaseThreadForExternal?(threadId: string, signal?: AbortSignal): Promise<void>;
@@ -172,6 +175,22 @@ function isSharedReviewerAlias(record: WorkflowRecord): boolean {
   if (!record.reviewerThreadId) return false;
   return record.reviewerThreadId === record.plannerThreadId
     || record.reviewerThreadId === record.codexThreadId;
+}
+
+/**
+ * 1.1.1 retry criterion, shared by EVERY visible turn (planner, completion,
+ * visible review, display rewrite, reconciliation).
+ *
+ * A turn is retryable ONLY when it ended NOT completed AND produced no visible
+ * text — nothing was persisted that a retry could duplicate — and its diagnostic
+ * is a TRANSIENT upstream condition. Terminal failures (invalid thread,
+ * approval denial, schema/display-contract violation) are never retried: they
+ * are returned unchanged so the caller classifies them.
+ */
+function transientTurnReason(outcome: TurnWaitResult): string | undefined {
+  if (outcome.kind !== "completed") return undefined;
+  const failedWithoutOutput = outcome.status !== "completed" && (outcome.text ?? "").trim().length === 0;
+  return failedWithoutOutput ? transientReason(`${outcome.error ?? ""} ${outcome.reason ?? ""}`) : undefined;
 }
 
 /** Resumable Reviewer callback injected by the host. */
@@ -396,16 +415,45 @@ export class WorkflowManager {
     options: Parameters<CodexGateway["startTurn"]>[1],
     signal?: AbortSignal,
   ): Promise<TurnWaitResult> {
+    return this.retryTransientTurn(
+      () => this.codex.startTurn(threadId, options, signal),
+      transientTurnReason,
+      signal,
+    );
+  }
+
+  /**
+   * 1.1.2: the VISIBLE `review/start` turn gets the SAME treatment as every
+   * other visible turn.
+   *
+   * The 1.1.1 CLI audit retried its visible review turn inside the tool
+   * (`runWithTransientRetry`); when the visible turn moved to the App Server in
+   * 1.1.2 that protection had to move with it, otherwise a transient
+   * `server_overloaded` would fail the whole review round and force the user to
+   * run the tool again — exactly the incident 1.1.1 fixed.
+   */
+  private async startReviewWithTransientRetry(
+    options: Parameters<CodexGateway["startReview"]>[0],
+    signal?: AbortSignal,
+  ): Promise<{ threadId: string; result: TurnWaitResult }> {
+    return this.retryTransientTurn(
+      () => this.codex.startReview(options, signal),
+      (outcome) => transientTurnReason(outcome.result),
+      signal,
+    );
+  }
+
+  /** The shared 1.1.1 retry loop for one visible turn. */
+  private async retryTransientTurn<T>(
+    run: () => Promise<T>,
+    retryableReason: (outcome: T) => string | undefined,
+    signal?: AbortSignal,
+  ): Promise<T> {
     const policy = this.retryPolicy();
     const deadline = this.retryNow() + policy.budgetMs;
     for (let attempt = 0; ; attempt += 1) {
-      const outcome = await this.codex.startTurn(threadId, options, signal);
-      const failedWithoutOutput = outcome.kind === "completed"
-        && outcome.status !== "completed"
-        && (outcome.text ?? "").trim().length === 0;
-      const reason = failedWithoutOutput
-        ? transientReason(`${outcome.error ?? ""} ${outcome.reason ?? ""}`)
-        : undefined;
+      const outcome = await run();
+      const reason = retryableReason(outcome);
       if (!reason || !(policy.budgetMs > 0)) return outcome;
       const delayMs = backoffDelayMs(attempt, policy, this.retryRandom);
       if (this.retryNow() + delayMs > deadline) return outcome;
@@ -1185,9 +1233,18 @@ export class WorkflowManager {
           // (an external writer holding it must never block a review), and a
           // legacy shared alias is not resumed at all — the dispatcher binds a
           // dedicated Reviewer instead.
-          const boundReviewer = current.reviewerThreadId && !isSharedReviewerAlias(current)
+          // 1.1.2: only an App Server-created Reviewer can be rendered in Codex
+          // Desktop. A legacy CLI-created task (`source='exec'`) is handed over
+          // as UNBOUND so the dispatcher creates a visible replacement; the old
+          // task is left intact and merely renamed for humans.
+          const boundReviewer = current.reviewerThreadId
+            && !isSharedReviewerAlias(current)
+            && current.reviewerThreadOrigin === "app-server"
             ? current.reviewerThreadId
             : undefined;
+          // The helper owns the "may this be renamed?" rule (dedicated, legacy
+          // only — never the Planner/origin task), so it is simply called.
+          if (!boundReviewer) await this.renameLegacyReviewer(current, workflowId);
           if (boundReviewer) {
             if (this.codex.releaseThreadForExternal) await this.codex.releaseThreadForExternal(boundReviewer, signal);
             else await this.codex.unsubscribeThread?.(boundReviewer, signal);
@@ -1215,6 +1272,7 @@ export class WorkflowManager {
             onThread: async (threadId) => {
               const registered = await updateCurrent((r) => {
                 r.reviewerThreadId = threadId;
+                r.reviewerThreadOrigin = "app-server";
               });
               if (registered.reviewerThreadId !== threadId) {
                 throw new Error("submission no longer owns the reviewer thread");
@@ -1223,6 +1281,7 @@ export class WorkflowManager {
             onStarted: async ({ threadId, turnId }) => {
               const registered = await updateCurrent((r) => {
                 r.reviewerThreadId = threadId;
+                r.reviewerThreadOrigin = "app-server";
                 r.reviewerTurnId = turnId;
                 r.activeTurnId = turnId;
                 r.lastProgressAt = new Date().toISOString();
@@ -2008,9 +2067,14 @@ export class WorkflowManager {
       if (evidenceCommit.suppressed) return evidenceCommit.record;
       current = evidenceCommit.record;
 
-      if (this.audit) {
-        return await this.reviewOnceViaCli(workflowId, current, input, evidence, exec, priorPhase);
-      }
+      // 1.1.2: the VISIBLE review turn ALWAYS runs on the App Server now, even
+      // when a CLI audit is configured. A Reviewer task created by
+      // `codex exec` is stored with `source='exec'`, is never returned by
+      // `thread/list` (measured 0/15, versus 62/72 App Server threads) and
+      // therefore cannot be rendered in Codex Desktop at all — the readable
+      // review was landing in a task the user could not open. The CLI keeps
+      // only the internal conversions (normalize/align), which run in
+      // independent `--ephemeral` sessions and never create a durable thread.
 
       // The durable visible REVIEWER task (1.1.0). A review always runs on a
       // DEDICATED Reviewer thread — never the Planner task, never the bridge
@@ -2034,10 +2098,19 @@ export class WorkflowManager {
         || undefined;
       const contract = reviewContractInstructions(current, input, evidence);
       let reviewerThreadId = current.reviewerThreadId;
-      // 1.1.0: a legacy shared identity (Reviewer === Planner/origin task) is
-      // migrated lazily — a dedicated Reviewer task is created below instead of
-      // resuming a task an external writer may hold.
-      if (reviewerThreadId && isSharedReviewerAlias(current)) reviewerThreadId = undefined;
+      // 1.1.0/1.1.2: a Reviewer is reused only when it is a DEDICATED thread the
+      // App Server created. A legacy shared alias (1.1.0) or a legacy CLI task
+      // (1.1.2: `source='exec'`, invisible in Desktop, no name) is migrated
+      // lazily: the old thread is left untouched (best-effort renamed) and a
+      // visible Reviewer is created below.
+      const legacyReviewer = reviewerThreadId
+        && (isSharedReviewerAlias(current) || current.reviewerThreadOrigin !== "app-server")
+        ? reviewerThreadId
+        : undefined;
+      if (legacyReviewer) {
+        await this.renameLegacyReviewer(current, workflowId);
+        reviewerThreadId = undefined;
+      }
       if (!reviewerThreadId) {
         if (!this.codex.startReviewerThread) throw new Error("codex gateway has no startReviewerThread");
         reviewerThreadId = await this.codex.startReviewerThread({
@@ -2046,13 +2119,29 @@ export class WorkflowManager {
           ...(reviewerModel ? { model: reviewerModel } : {}),
           developerInstructions: contract,
         }, exec.signal);
-        const threadCommit = await this.store.update(workflowId, (r) => {
-          r.reviewerThreadId = reviewerThreadId!;
-          r.reviewStep = "review_native_turn";
-          r.lastProgressAt = new Date().toISOString();
-          r.lastProgressMessage = "Running Reviewer turn";
-        }, { ignoreCancelled: false });
-        if (threadCommit.suppressed) return threadCommit.record;
+        let threadCommit;
+        try {
+          threadCommit = await this.store.update(workflowId, (r) => {
+            r.reviewerThreadId = reviewerThreadId!;
+            r.reviewStep = "review_native_turn";
+            r.lastProgressAt = new Date().toISOString();
+            r.lastProgressMessage = "Running Reviewer turn";
+            // 1.1.2 visibility marker: only App Server threads are renderable.
+            r.reviewerThreadOrigin = "app-server";
+          }, { ignoreCancelled: false });
+        } catch (error) {
+          // The created task could not be bound: release its hold before the
+          // failure propagates, so a failed round cannot leave it loaded.
+          await this.releaseUnboundReviewer(reviewerThreadId);
+          throw error;
+        }
+        if (threadCommit.suppressed) {
+          // A concurrent cancel won the CAS: the task is never bound, so it is
+          // released here instead of being left subscribed under a cancelled
+          // workflow (the task remains in the Codex store, unbound).
+          await this.releaseUnboundReviewer(reviewerThreadId);
+          return threadCommit.record;
+        }
         current = threadCommit.record;
       } else {
         await this.codex.resumeThread(reviewerThreadId, current.cwd, exec.signal);
@@ -2079,7 +2168,11 @@ export class WorkflowManager {
       // evidence). The baseline read is metadata-only and never touches the
       // thread's writer.
       const reviewBaseline = await this.codex.captureTurnBaseline?.(reviewerThreadId, exec.signal);
-      const review = await this.codex.startReview({
+      // 1.1.2: the visible review turn runs through the SAME transient-retry
+      // wrapper as every other visible turn (1.1.1 parity on the App Server
+      // path). A retried attempt re-registers its own turn, so the active-turn
+      // mapping always points at the newest turn.
+      const review = await this.startReviewWithTransientRetry({
         threadId: reviewerThreadId,
         cwd: current.cwd,
         detached: false,
@@ -2121,7 +2214,10 @@ export class WorkflowManager {
       // failure falls back to the retryable phase without consuming a cycle.
       if (review.result.kind !== "completed" || review.result.status !== "completed") {
         if (review.result.kind !== "completed") throw new Error("review unexpectedly requested user input");
-        throw new Error(review.result.reason ?? `review turn ${review.result.status}`);
+        // Keep the UPSTREAM diagnostic in the message: `reason` alone is just
+        // "turn failed", which hides why the round failed (the 1.1.1 lesson).
+        const detail = review.result.error ? `: ${review.result.error}` : "";
+        throw new Error(`${review.result.reason ?? `review turn ${review.result.status}`}${detail}`);
       }
 
       // 1.0.7 display contract, ENFORCED ON THE PERSISTED HISTORY. The
@@ -2202,32 +2298,46 @@ export class WorkflowManager {
       // config, or the resolved server default) so it never drifts to a
       // different default. The authoritative text is the rewrite turn's final
       // message when a display-rewrite ran, otherwise the native review text.
-      let normalized: TurnWaitResult;
-      await this.markReviewProgress(workflowId, "review_conversion", "Converting Reviewer result", null);
-      try {
-        normalized = await this.codex.normalizeInFork({
-          threadId: review.threadId,
+      // 1.1.2: with a CLI audit configured, the STRUCTURED CONVERSION stays on
+      // the CLI. `--ephemeral` means it neither creates nor resumes a durable
+      // thread, so it cannot pollute the Codex task list the way the visible
+      // review turn used to. Only the visible turn moved to the App Server.
+      let result: ReviewResult;
+      if (this.audit) {
+        result = applyReviewConsistency(await this.audit.normalize({
+          visibleText: authoritativeText,
           cwd: current.cwd,
-          prompt: reviewConversionPrompt(authoritativeText, workflowId),
+          workflowId,
           ...(reviewerModel ? { model: reviewerModel } : {}),
-          outputSchema: REVIEW_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
-          // The ephemeral conversion fork becomes the active reviewer turn for
-          // cancellation (in-process only — the fork id is never persisted, so
-          // reviewerThreadId keeps pointing at the durable workflow task).
-          onStarted: (started) => this.registerEphemeralTurn(workflowId, started.threadId, started.turnId, "reviewer"),
-        }, exec.signal);
-      } finally {
-        this.activeTurns.delete(workflowId);
-      }
-      const afterNormalize = await this.store.load(workflowId);
-      if (!afterNormalize || afterNormalize.phase === "cancelled") return afterNormalize!;
-      current = afterNormalize;
-      if (normalized.kind !== "completed") throw new Error("review normalization unexpectedly requested user input");
-      if (normalized.status !== "completed") {
-        throw new Error(normalized.reason ?? `review normalization turn ${normalized.status}`);
-      }
+        }, exec.signal));
+      } else {
+        await this.markReviewProgress(workflowId, "review_conversion", "Converting Reviewer result", null);
+        let normalized: TurnWaitResult;
+        try {
+          normalized = await this.codex.normalizeInFork({
+            threadId: review.threadId,
+            cwd: current.cwd,
+            prompt: reviewConversionPrompt(authoritativeText, workflowId),
+            ...(reviewerModel ? { model: reviewerModel } : {}),
+            outputSchema: REVIEW_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+            // The ephemeral conversion fork becomes the active reviewer turn for
+            // cancellation (in-process only — the fork id is never persisted, so
+            // reviewerThreadId keeps pointing at the durable workflow task).
+            onStarted: (started) => this.registerEphemeralTurn(workflowId, started.threadId, started.turnId, "reviewer"),
+          }, exec.signal);
+        } finally {
+          this.activeTurns.delete(workflowId);
+        }
+        const afterNormalize = await this.store.load(workflowId);
+        if (!afterNormalize || afterNormalize.phase === "cancelled") return afterNormalize!;
+        current = afterNormalize;
+        if (normalized.kind !== "completed") throw new Error("review normalization unexpectedly requested user input");
+        if (normalized.status !== "completed") {
+          throw new Error(normalized.reason ?? `review normalization turn ${normalized.status}`);
+        }
 
-      const result = applyReviewConsistency(parseReview(normalized.text));
+        result = applyReviewConsistency(parseReview(normalized.text));
+      }
       // 1.0.10 REVIEW AUTHORITY ALIGNMENT: after the visible review is
       // normalized into the public ReviewResult, an INVISIBLE ephemeral fork
       // checks every finding/test gap against the authority hierarchy
@@ -2344,121 +2454,48 @@ export class WorkflowManager {
     }
   }
 
-  private async reviewOnceViaCli(
-    workflowId: string,
-    seed: WorkflowRecord,
-    input: ReviewInput,
-    evidence: ReviewEvidence,
-    exec: ToolRunContext,
-    priorPhase: WorkflowPhase,
-  ): Promise<WorkflowRecord> {
-    let current = seed;
-    const reviewerModel = current.reviewerModel || this.config.reviewerModel;
-    // 1.1.0: the Reviewer runs on a DEDICATED task. It is never the Planner
-    // task (nor the bridge origin): an external writer holding that task would
-    // otherwise block every review with "already has an active writer". A
-    // legacy shared identity is migrated lazily — `createReview` below binds
-    // the dedicated Reviewer and the persisted alias is replaced.
-    let threadId = current.reviewerThreadId;
-    if (threadId && isSharedReviewerAlias(current)) threadId = undefined;
-    const request = {
-      workflowId,
-      submissionId: `review-${Date.now()}`,
-      cwd: current.cwd,
-      prompt: reviewInstructions(current, input, evidence, await isGitRepository(current.cwd)),
-      task: current.task,
-      planMarkdown: current.planMarkdown,
-      ...(reviewerModel ? { model: reviewerModel } : {}),
-      effort: current.reviewerEffort ?? this.config.reviewerEffort,
-    };
-    let review;
-    if (!threadId) {
-      await this.markReviewProgress(workflowId, "review_native_turn", "Starting CLI Reviewer turn");
-      review = await this.audit!.createReview({
-        ...request,
-        onThread: async (id) => {
-          const commit = await this.store.update(workflowId, (r) => {
-            // A dedicated Reviewer is bound exactly ONCE. The single exception
-            // is the lazy migration of a legacy shared identity (the persisted
-            // reviewerThreadId still aliasing the Planner/origin task): that
-            // alias is replaced, never a previously bound dedicated Reviewer.
-            if (r.reviewerThreadId && r.reviewerThreadId !== id && !isSharedReviewerAlias(r)) {
-              throw new Error("review task identity changed");
-            }
-            r.reviewerThreadId = id;
-          }, { ignoreCancelled: false });
-          if (commit.suppressed) throw new Error("workflow cancelled during CLI task creation");
-          threadId = id;
-          current = commit.record;
-        },
-      }, exec.signal);
-    } else {
-      await this.markReviewProgress(workflowId, "review_native_turn", "Resuming CLI Reviewer turn");
-      if (current.reviewerThreadId !== threadId) {
-        const commit = await this.store.update(workflowId, (r) => { r.reviewerThreadId = threadId!; }, { ignoreCancelled: false });
-        if (commit.suppressed) return commit.record;
-        current = commit.record;
-      }
-      if (this.codex.releaseThreadForExternal) await this.codex.releaseThreadForExternal(threadId, exec.signal);
-      else await this.codex.unsubscribeThread?.(threadId, exec.signal);
-      review = await this.audit!.review({ ...request, codexThreadId: threadId }, exec.signal);
+  /**
+   * 1.1.2 visibility repair, best-effort: give a LEGACY, DEDICATED Reviewer task
+   * a readable title.
+   *
+   * A thread created by `codex exec` is stored by the App Server with
+   * `source='exec'`, is never returned by `thread/list` (measured: 0 of 15 exec
+   * threads listed, versus 62 of 72 App Server threads) and therefore cannot be
+   * rendered in Codex Desktop — renaming cannot change that, only a newly
+   * created App Server Reviewer can. This call exists purely so a human reading
+   * the task store can tell what the orphan was; it must NEVER block or fail the
+   * migration that replaces it. `thread/name/set` works on a thread that is not
+   * loaded, so it takes no writer lock.
+   *
+   * The record — not a bare id — decides whether a rename is allowed at all:
+   *   - an id that still ALIASES the Planner/origin task is that task's own
+   *     title and must never be overwritten (the 1.1.0 alias migration never
+   *     renamed it either);
+   *   - an App Server Reviewer is already visible and keeps its real name.
+   */
+  private async renameLegacyReviewer(record: WorkflowRecord, workflowId: string): Promise<void> {
+    const threadId = record.reviewerThreadId;
+    if (!threadId || !this.codex.nameThread) return;
+    if (isSharedReviewerAlias(record)) return;
+    if (record.reviewerThreadOrigin === "app-server") return;
+    await this.codex
+      .nameThread(threadId, `DSH Reviewer (legacy, not renderable in Desktop): ${workflowId}`)
+      .catch(() => undefined);
+  }
+
+  /** 1.1.2: release the App Server hold on a Reviewer task that could NOT be
+   * bound to its workflow — the binding write was suppressed by a concurrent
+   * cancel, or it failed. The task itself stays in the Codex store (a thread
+   * cannot be deleted); only the plugin's own subscription/writer hold is
+   * released, so a cancelled round cannot leave a task loaded under it. Always
+   * best-effort: the caller's original outcome must never be masked. */
+  private async releaseUnboundReviewer(threadId: string, signal?: AbortSignal): Promise<void> {
+    try {
+      if (this.codex.releaseThreadForExternal) await this.codex.releaseThreadForExternal(threadId, signal);
+      else await this.codex.unsubscribeThread?.(threadId, signal);
+    } catch {
+      // A failed release never changes the workflow's outcome.
     }
-    if (review.threadId !== threadId) throw new Error("CLI review returned a different task identity");
-    if (review.kind !== "verdict") throw new Error("CLI audit did not return a verdict");
-    await this.markReviewProgress(workflowId, "review_readback", "Reading CLI Reviewer result");
-    current = (await this.store.load(workflowId)) ?? current;
-    if (current.phase === "cancelled") return current;
-    const displayError = reviewDisplayError(review.visibleText, current);
-    if (displayError) throw new Error(`CLI review violates the display contract: ${displayError}`);
-    let applied: ReviewResult | undefined;
-    let conflictInfo: ReviewConflictInfo | undefined;
-    await this.markReviewProgress(workflowId, "review_alignment", "Checking Review authority alignment");
-    const alignment = await this.alignReview(current, review.verdict, exec.signal, input);
-    if (alignment.aligned) applied = review.verdict;
-    else {
-      await this.markReviewProgress(workflowId, "review_reconciliation", "Reconciling Review findings", null);
-      const reconciled = await this.reconcileReview(current, review.verdict, alignment.conflicts, exec.signal, input);
-      conflictInfo = { conflicts: alignment.conflicts, reconciled: true, resolved: reconciled.aligned, at: new Date().toISOString() };
-      if (reconciled.aligned) applied = reconciled.result;
-    }
-    if (!applied) {
-      const commit = await this.store.update(workflowId, (r) => {
-        if (r.phase !== "reviewing") return;
-        r.latestReviewConflict = conflictInfo;
-        r.reviewContractFailures = (r.reviewContractFailures ?? 0) + 1;
-        const blocked = r.reviewContractFailures >= 2;
-        r.phase = blocked ? "blocked" : priorPhase;
-        r.error = blocked ? "reviewer contract failure: unresolved CLI review authority conflict" : "review contract conflict: CLI review requires reconciliation";
-        r.processState = blocked ? "completed" : "failed";
-        r.activeTurnId = undefined;
-        r.lastProgressAt = new Date().toISOString();
-        r.lastProgressMessage = blocked ? "Review completed with a contract block" : "Review failed; retry is available";
-      }, { ignoreCancelled: false });
-      return commit.record;
-    }
-    let message: string | undefined;
-    await this.markReviewProgress(workflowId, "review_finalizing", "Finalizing Review status", null);
-    const commit = await this.store.update(workflowId, (r) => {
-      r.latestReview = applied!;
-      r.reviewCycles += 1;
-      r.reviewContractFailures = 0;
-      if (conflictInfo) r.latestReviewConflict = { ...conflictInfo, resolved: true };
-      const outcome = this.computeReviewOutcome(r, applied!);
-      message = outcome.message;
-      r.noChangeReviewRounds = outcome.noChangeReviewRounds ?? r.noChangeReviewRounds;
-      r.phase = outcome.phase;
-      r.error = outcome.error;
-      r.processState = "completed";
-      r.activeTurnId = undefined;
-      r.lastProgressAt = new Date().toISOString();
-      r.lastProgressMessage = "Review completed";
-      if (r.reviewStartedAt) {
-        const started = Date.parse(r.reviewStartedAt);
-        if (Number.isFinite(started)) r.reviewElapsedMs = Math.max(0, Date.now() - started);
-      }
-    }, { ignoreCancelled: false });
-    if (message) exec.deferContext(pluginMessage(message));
-    return commit.record;
   }
 
   /** Fail-closed read-back of the turn appended to the durable Reviewer thread

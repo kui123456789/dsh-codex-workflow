@@ -559,6 +559,114 @@ test("uses strict Codex-compatible object schemas", () => {
   assertStrictObjectSchema(REVIEW_OUTPUT_SCHEMA);
 });
 
+/** 1.1.2: the Reviewer task must be created by the APP SERVER — `source` is
+ * fixed by the creation path, and `thread/list` (the Codex Desktop sidebar
+ * source) only ever returns `source='vscode'` tasks. Measured on this host:
+ * 62 of 72 non-archived `vscode` rows are listed, 0 of 15 `codex exec` rows are
+ * — which is exactly why the plugin's CLI-created reviewers never rendered. */
+test("1.1.2: a Reviewer task is created on the App Server path and named without a resume", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-reviewer-visible-"));
+  const callsFile = join(directory, "calls.jsonl");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: { ...process.env, FAKE_CODEX_THREAD_PARAMS_MARKER: callsFile },
+  });
+  const calls = async () => (await readFile(callsFile, "utf8")).trim().split("\n").filter(Boolean)
+    .map((line) => JSON.parse(line) as { method: string; params: Record<string, any> });
+  try {
+    const reviewerId = await codex.startReviewerThread({
+      cwd: directory,
+      name: "DSH Reviewer: wf-visible",
+      developerInstructions: "readable review contract",
+    });
+    const created = await calls();
+    assert.deepEqual(
+      created.slice(0, 3).map((call) => call.method),
+      ["thread/start", "thread/settings/update", "thread/name/set"],
+      "the visible Reviewer is created, configured and NAMED on the App Server",
+    );
+    const start = created.find((call) => call.method === "thread/start");
+    assert.equal(start?.params.ephemeral, false, "a durable, renderable task — never an ephemeral one");
+    assert.equal(start?.params.sandbox, "read-only");
+    const named = created.find((call) => call.method === "thread/name/set");
+    assert.equal(named?.params.threadId, reviewerId);
+    assert.equal(named?.params.name, "DSH Reviewer: wf-visible");
+
+    // 1.1.2 lazy migration: renaming an EXISTING task must never take its
+    // writer lock — `thread/resume` is the call that fails with "already has an
+    // active writer" while Codex Desktop holds the task.
+    await codex.nameThread(reviewerId, "DSH Reviewer (legacy, not renderable in Desktop): wf-old");
+    const after = await calls();
+    assert.equal(after.filter((call) => call.method === "thread/resume").length, 0, "a rename never resumes the task");
+    assert.equal(after.at(-1)?.method, "thread/name/set");
+    assert.equal(after.at(-1)?.params.threadId, reviewerId);
+    assert.equal(after.at(-1)?.params.name, "DSH Reviewer (legacy, not renderable in Desktop): wf-old");
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("1.1.2: a freshly created Reviewer has no rollout until its first turn runs on it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-reviewer-rollout-"));
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: { ...process.env, FAKE_CODEX_ROLLOUT_REQUIRED: "1" },
+  });
+  try {
+    // The 1.0.14 constraint, reproduced: `thread/start` creates a task WITHOUT a
+    // rollout, and resuming such a task is rejected (`no rollout found for
+    // thread id`) — which is exactly why the first visible review turn must run
+    // on the CREATING side instead of being handed to `codex exec resume`.
+    const reviewerId = await codex.startReviewerThread({ cwd: directory, name: "DSH Reviewer: wf-rollout" });
+    await assert.rejects(codex.resumeThread(reviewerId, directory), /no rollout found for thread id/);
+
+    const turn = await codex.startTurn(reviewerId, { prompt: "Review SILENTLY." });
+    assert.equal(turn.kind, "completed");
+    assert.equal(turn.threadId, reviewerId, "the first visible turn runs on the CREATED task");
+
+    // The turn produced the rollout, so the same task is resumable afterwards.
+    await codex.resumeThread(reviewerId, directory);
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("1.1.2: a Reviewer task whose NAME cannot be set is released, never left holding a writer", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-reviewer-namefail-"));
+  const callsFile = join(directory, "calls.jsonl");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: {
+      ...process.env,
+      FAKE_CODEX_THREAD_PARAMS_MARKER: callsFile,
+      FAKE_CODEX_FAIL_NAME: "1",
+    },
+  });
+  try {
+    await assert.rejects(
+      codex.startReviewerThread({ cwd: directory, name: "DSH Reviewer: wf-namefail" }),
+      /name set failed/,
+    );
+    const calls = (await readFile(callsFile, "utf8")).trim().split("\n").filter(Boolean)
+      .map((line) => JSON.parse(line) as { method: string; params: Record<string, any> });
+    assert.equal(calls.filter((call) => call.method === "thread/unsubscribe").length, 1, "the orphaned task is released exactly once");
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("interrupts an active Codex turn when DSH cancels", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-interrupt-"));
   const marker = join(directory, "interrupt.txt");

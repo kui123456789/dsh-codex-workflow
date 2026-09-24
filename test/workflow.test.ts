@@ -97,6 +97,9 @@ class FakeGateway implements CodexGateway {
   continueAnswers: Array<Record<string, string[]>> = [];
   interrupts: Array<{ threadId: string; turnId: string }> = [];
   releasedThreads: string[] = [];
+  /** 1.1.2: display names applied to LEGACY Reviewer tasks (best-effort rename
+   * of a task that can never become visible — see `renameLegacyReviewer`). */
+  renamedThreads: Array<{ threadId: string; name: string }> = [];
   /** Held before onStarted fires for review/start (ids known, not persisted). */
   beforeReviewOnStarted?: DeferredGate;
   /** Held after onStarted for review/start (review pending). */
@@ -138,6 +141,12 @@ class FakeGateway implements CodexGateway {
 
   async updateReviewerInstructions(threadId: string, cwd: string, instructions: string): Promise<void> {
     this.instructionCalls.push({ threadId, instructions });
+  }
+
+  /** 1.1.2: `thread/name/set` — works WITHOUT resuming, so a legacy task can be
+   * renamed even while another process (Codex Desktop) holds its writer. */
+  async nameThread(threadId: string, name: string): Promise<void> {
+    this.renamedThreads.push({ threadId, name });
   }
 
   async resolveDefaultModel(): Promise<string | undefined> {
@@ -432,6 +441,35 @@ class FlakyTurnGateway extends FakeGateway {
   }
 }
 
+/** Gateway whose N first VISIBLE review turns (`review/start`) fail with a
+ * scripted error. Mirrors the real client: a failed turn reports
+ * `reason: "turn failed"` plus the upstream `error` text. */
+class FlakyReviewGateway extends FakeGateway {
+  attempts = 0;
+  constructor(private readonly failure: { message: string; times: number }) { super(); }
+
+  override async startReview(options: Parameters<FakeGateway["startReview"]>[0]) {
+    this.attempts += 1;
+    if (this.attempts <= this.failure.times) {
+      const turnId = `failed-review-${this.attempts}`;
+      await options.onStarted?.({ threadId: options.threadId, turnId });
+      return {
+        threadId: options.threadId,
+        result: {
+          kind: "completed" as const,
+          threadId: options.threadId,
+          turnId,
+          status: "failed" as const,
+          text: "",
+          reason: "turn failed",
+          error: JSON.stringify({ message: this.failure.message }),
+        },
+      };
+    }
+    return super.startReview(options);
+  }
+}
+
 /**
  * 1.1.1 regression (the reported bug): an upstream `server_overloaded` reply
  * ("Selected model is at capacity. Please try a different model.") on a visible
@@ -505,6 +543,37 @@ test("review observability heartbeats independently during a long Reviewer turn"
   }
 });
 
+/**
+ * 1.1.2: the VISIBLE review turn must keep the 1.1.1 protection now that it runs
+ * on the App Server. The CLI audit used to retry it internally; without the
+ * shared wrapper a transient `server_overloaded` failed the whole review round
+ * and forced the user to re-run the tool — the incident 1.1.1 fixed.
+ */
+test("1.1.2: a transient failure on the VISIBLE review turn is retried inside the tool", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-transient-review-"));
+  try {
+    const gateway = new FlakyReviewGateway({
+      message: "Selected model is at capacity. Please try a different model.",
+      times: 1,
+    });
+    gateway.reviewResults = [{ verdict: "pass", findings: [], testGaps: [], summary: "ok" }];
+    const instance = manager(directory, gateway, {}, undefined, undefined, undefined, {
+      sleep: async () => undefined,
+      random: () => 0.5,
+    });
+    const exec = fakeExec("session-transient-review", directory, []);
+    const planned = await instance.start({ task: "Build it" }, exec);
+    const reviewed = await instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.ts"] }, exec);
+    assert.equal(reviewed.phase, "passed", "the round completes after the in-tool retry");
+    assert.equal(gateway.attempts, 2, "the overloaded visible review turn was retried ONCE inside the tool");
+    assert.equal(reviewed.reviewCycles, 1, "the in-tool retry is not a review cycle");
+    assert.equal(gateway.reviewerThreadCalls.length, 1, "the retry reuses the same Reviewer task");
+    assert.deepEqual(gateway.reviewStarts.at(-1), { threadId: "reviewer-thread", detached: false });
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
 test("status classifies a review with no recent heartbeat as stale", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-review-stale-"));
   try {
@@ -564,6 +633,29 @@ test("cancelling a review stops its heartbeat and records cancelled", async () =
   }
 });
 
+test("1.1.2: a TERMINAL visible-review failure is never retried", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-terminal-review-"));
+  try {
+    const gateway = new FlakyReviewGateway({ message: "codex thread 01a0 does not exist", times: 1 });
+    const instance = manager(directory, gateway, {}, undefined, undefined, undefined, {
+      sleep: async () => undefined,
+      random: () => 0.5,
+    });
+    const exec = fakeExec("session-terminal-review", directory, []);
+    const planned = await instance.start({ task: "Build it" }, exec);
+    await assert.rejects(
+      instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.ts"] }, exec),
+      /turn failed/,
+    );
+    assert.equal(gateway.attempts, 1, "a terminal review failure fails fast");
+    const record = (await new WorkflowStore(directory).load(planned.id))!;
+    assert.equal(record.phase, "executing", "the round stays retryable, with no cycle consumed");
+    assert.equal(record.reviewCycles, 0);
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
 /** Deterministic callback double: queue results; record every resume request. */
 class FakeCallback implements CodexCallback {
   results: Array<CodexCallbackResult | Error> = [];
@@ -616,6 +708,8 @@ class GatedCallback extends FakeCallback {
 class FakeCliAudit implements CodexCliAuditGateway {
   reviewRequests: CodexCallbackRequest[] = [];
   creations = 0;
+  /** 1.1.2: the CLI keeps ONLY the internal structured conversions. */
+  normalizeCalls = 0;
 
   async createReview(request: Omit<CodexCallbackRequest, "codexThreadId">) {
     this.creations += 1;
@@ -636,6 +730,7 @@ class FakeCliAudit implements CodexCliAuditGateway {
   }
 
   async normalize(): Promise<ReviewResult> {
+    this.normalizeCalls += 1;
     return { verdict: "pass", findings: [], testGaps: [], summary: "ok" };
   }
 
@@ -2753,10 +2848,14 @@ test("review/start reporting a different task id IN onStarted is rejected; neith
   }
 });
 
-/** 1.0.8 backward compatibility at the WORKFLOW level: a planned record that
- * already persists a DISTINCT reviewerThreadId (pre-1.0.8 layout) keeps
- * resuming that old task — no migration, no replacement, no new task. */
-test("planned workflow with a legacy distinct reviewerThreadId keeps using that old task", async () => {
+/** 1.1.2 migration: a Reviewer task created by `codex exec` is stored with
+ * `source='exec'`, is never returned by `thread/list` (measured: 0 of 15 exec
+ * tasks listed, versus 62 of 72 App Server tasks) and can therefore NEVER be
+ * rendered in Codex Desktop — not even after a rename. A record that still
+ * carries such a task (no App Server origin marker) is migrated lazily: the old
+ * task is left intact (best-effort renamed for humans) and a NEW visible
+ * Reviewer is created and bound. */
+test("a legacy CLI-created Reviewer task is migrated to a new visible App Server Reviewer", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-legacy-reviewer-"));
   try {
     const gateway = new FakeGateway();
@@ -2764,7 +2863,7 @@ test("planned workflow with a legacy distinct reviewerThreadId keeps using that 
     const instance = manager(directory, gateway);
     const exec = fakeExec("session-legacy-reviewer", directory, []);
     const planned = await instance.start({ task: "Build it" }, exec);
-    // Simulate a pre-1.0.8 record: a separate Reviewer task was already bound.
+    // A pre-1.1.2 record: the Reviewer was bound by `codex exec`.
     const store = new WorkflowStore(directory);
     const seeded = await store.update(planned.id, (r) => {
       r.reviewerThreadId = "legacy-reviewer";
@@ -2773,11 +2872,15 @@ test("planned workflow with a legacy distinct reviewerThreadId keeps using that 
     assert.ok(!seeded.suppressed, "legacy ids persisted");
     const reviewed = await instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.ts"] }, exec);
     assert.equal(reviewed.phase, "passed");
-    assert.equal(gateway.reviewerThreadCalls.length, 0, "the legacy task is reused, never replaced by a new one");
-    assert.ok(gateway.resumeCalls.includes("legacy-reviewer"), "the legacy reviewer task is resumed");
-    assert.deepEqual(gateway.reviewStarts.at(-1), { threadId: "legacy-reviewer", detached: false }, "the review runs on the legacy task");
+    assert.equal(gateway.reviewerThreadCalls.length, 1, "a NEW visible Reviewer is created for the legacy id");
+    assert.deepEqual(gateway.renamedThreads.map((entry) => entry.threadId), ["legacy-reviewer"],
+      "the unrenderable legacy task is renamed best-effort");
+    assert.match(gateway.renamedThreads[0]!.name, /^DSH Reviewer \(legacy/, "the rename marks it as legacy");
+    assert.ok(!gateway.resumeCalls.includes("legacy-reviewer"), "the legacy task is never resumed again");
+    assert.deepEqual(gateway.reviewStarts.at(-1), { threadId: "reviewer-thread", detached: false }, "the review runs on the new visible task");
     const record = (await store.load(planned.id))!;
-    assert.equal(record.reviewerThreadId, "legacy-reviewer", "the persisted legacy id is not migrated");
+    assert.equal(record.reviewerThreadId, "reviewer-thread", "the persisted id moves to the visible task");
+    assert.equal(record.reviewerThreadOrigin, "app-server", "the visible origin is recorded");
   } finally {
     await rmClosed(directory);
   }
@@ -2809,16 +2912,18 @@ test("a legacy record whose reviewerThreadId aliases the Planner task is migrate
     assert.equal(reviewed.reviewerThreadId, "reviewer-thread");
     assert.notEqual(reviewed.reviewerThreadId, reviewed.plannerThreadId, "the alias was replaced by a dedicated Reviewer");
     assert.ok(!gateway.resumeCalls.includes("planner-thread"), "the Planner task is never resumed for a review");
+    assert.deepEqual(gateway.renamedThreads, [],
+      "the Planner task keeps its own title: a shared alias is never renamed as a legacy Reviewer");
     assert.deepEqual(gateway.reviewStarts.at(-1), { threadId: "reviewer-thread", detached: false });
   } finally {
     await rmClosed(directory);
   }
 });
 
-/** 1.1.0 migration on the PRODUCTION (CLI audit) path: the same legacy alias
- * must force a NEW dedicated CLI Reviewer task instead of resuming the
- * Planner task through `codex exec resume <planner>`. */
-test("a legacy CLI record whose reviewerThreadId aliases the Planner task is migrated to a CLI-created Reviewer", async () => {
+/** 1.1.2 production-path migration: the same legacy alias must force a NEW
+ * visible App Server Reviewer instead of resuming the Planner task, and the CLI
+ * audit must create NO durable task at all — only its ephemeral conversions. */
+test("a legacy CLI record whose reviewerThreadId aliases the Planner task is migrated to a visible App Server Reviewer", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-cli-alias-"));
   try {
     const gateway = new FakeGateway();
@@ -2831,67 +2936,146 @@ test("a legacy CLI record whose reviewerThreadId aliases the Planner task is mig
 
     const reviewed = await instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.ts"] }, exec);
     assert.equal(reviewed.phase, "passed");
-    assert.equal(audit.creations, 1, "the alias forces a NEW dedicated CLI Reviewer task");
-    assert.equal(reviewed.reviewerThreadId, "cli-created-reviewer");
+    assert.equal(gateway.reviewerThreadCalls.length, 1, "the alias forces a NEW visible App Server Reviewer");
+    assert.equal(reviewed.reviewerThreadId, "reviewer-thread");
+    assert.equal(reviewed.reviewerThreadOrigin, "app-server");
     assert.notEqual(reviewed.reviewerThreadId, reviewed.plannerThreadId);
-    assert.ok(!audit.reviewRequests.some((request) => request.codexThreadId === "planner-thread"),
-      "the Planner task is never resumed by the CLI audit");
+    assert.ok(!gateway.resumeCalls.includes("planner-thread"), "the Planner task is never resumed for a review");
+    assert.equal(audit.creations, 0, "the CLI never creates a durable Reviewer task any more");
+    assert.equal(audit.reviewRequests.length, 0, "the CLI never runs the visible review turn any more");
+    assert.equal(audit.normalizeCalls, 1, "the CLI keeps the ephemeral structured conversion");
+    assert.deepEqual(gateway.renamedThreads, [],
+      "the Planner task keeps its own title: a shared alias is never renamed as a legacy Reviewer");
   } finally {
     await rmClosed(directory);
   }
 });
 
-test("CLI review-only creates its first task directly and retains it after review failure", async () => {
+test("review-only creates its first VISIBLE Reviewer and retains it after a review failure", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-cli-first-review-"));
   try {
     const gateway = new FakeGateway();
-    gateway.startReviewerThread = async () => { throw new Error("empty App Server tasks cannot be resumed by CLI"); };
     const audit = new FakeCliAudit();
-    const normalReview = audit.review.bind(audit);
+    // The first visible review turn fails: the Reviewer task created just before
+    // it must stay bound, so the retry resumes the SAME task instead of opening
+    // a second one.
+    const normalReview = gateway.startReview.bind(gateway);
     let fail = true;
-    audit.review = async (request) => {
-      if (fail) { fail = false; throw new Error("normalization unavailable"); }
-      return normalReview(request);
+    gateway.startReview = async (options) => {
+      if (fail) { fail = false; throw new Error("review turn unavailable"); }
+      return normalReview(options);
     };
     const instance = manager(directory, gateway, {}, undefined, undefined, audit);
     const exec = fakeExec("cli-first-review", directory, []);
     await changedFile(directory);
-    await assert.rejects(instance.reviewOnly({ implementationSummary: "Changed", changedFiles: ["a.txt"] }, exec), /normalization unavailable/);
+    await assert.rejects(instance.reviewOnly({ implementationSummary: "Changed", changedFiles: ["a.txt"] }, exec), /review turn unavailable/);
     const store = new WorkflowStore(directory);
     const [record] = await store.list();
-    assert.equal(record?.reviewerThreadId, "cli-created-reviewer");
+    assert.equal(record?.reviewerThreadId, "reviewer-thread", "the visible Reviewer id survives the failed round");
+    assert.equal(record?.reviewerThreadOrigin, "app-server");
     assert.equal(record?.reviewCycles, 0);
     const retry = await instance.review(record!.id, { implementationSummary: "Retry", changedFiles: ["a.txt"] }, exec);
     assert.equal(retry.phase, "passed");
-    assert.equal(retry.reviewerThreadId, "cli-created-reviewer");
-    assert.equal(audit.creations, 1);
-    assert.equal(audit.reviewRequests[0]?.codexThreadId, "cli-created-reviewer");
+    assert.equal(retry.reviewerThreadId, "reviewer-thread");
+    assert.equal(gateway.reviewerThreadCalls.length, 1, "the retry resumes the same Reviewer thread");
+    assert.equal(audit.creations, 0, "no durable CLI task is ever created");
     await instance.stop();
   } finally { await rmClosed(directory); }
 });
 
-test("cancel during first CLI review creation cannot bind or apply a late result", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-cli-create-cancel-"));
+/** 1.1.2: with a CLI audit configured the structured conversion runs as an
+ * `--ephemeral` CLI session. When it fails, the round must stay retryable on the
+ * SAME visible Reviewer task — the failure may not lose the identity, consume a
+ * cycle or leave a usable verdict behind. */
+test("1.1.2: a failing ephemeral CLI conversion keeps the visible Reviewer bound and stays retryable", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-cli-normalize-fail-"));
   try {
+    const gateway = new FakeGateway();
     const audit = new FakeCliAudit();
-    const instance = manager(directory, new FakeGateway(), {}, undefined, undefined, audit);
-    const exec = fakeExec("cancel-first-cli", directory, []);
-    audit.createReview = async (request) => {
-      await instance.cancel(request.workflowId, exec);
-      await request.onThread?.("late-cli-task");
-      throw new Error("cancelled creation must not continue");
+    const instance = manager(directory, gateway, {}, undefined, undefined, audit);
+    const exec = fakeExec("cli-normalize-fail", directory, []);
+    const planned = await instance.start({ task: "Build it" }, exec);
+    const store = new WorkflowStore(directory);
+    let fail = true;
+    const normal = audit.normalize.bind(audit);
+    audit.normalize = async () => {
+      if (fail) { fail = false; throw new Error("normalization child died"); }
+      return normal();
     };
+    await assert.rejects(
+      instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.ts"] }, exec),
+      /normalization child died/,
+    );
+    const afterFailure = (await store.load(planned.id))!;
+    assert.equal(afterFailure.phase, "executing", "an infrastructure failure returns to the retryable phase");
+    assert.equal(afterFailure.reviewerThreadId, "reviewer-thread", "the visible Reviewer identity survives the failure");
+    assert.equal(afterFailure.reviewerThreadOrigin, "app-server");
+    assert.equal(afterFailure.reviewCycles, 0, "no cycle is consumed");
+    assert.equal(afterFailure.latestReview, undefined, "no verdict is derived");
+
+    const retry = await instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.ts"] }, exec);
+    assert.equal(retry.phase, "passed");
+    assert.equal(gateway.reviewerThreadCalls.length, 1, "the retry resumes the same visible Reviewer");
+    assert.equal(gateway.reviewStarts.length, 2, "both rounds ran their visible turn on the App Server");
+    assert.equal(audit.creations, 0);
+  } finally { await rmClosed(directory); }
+});
+
+test("cancel during first visible Reviewer creation cannot bind or apply a late result", async () => {  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-cli-create-cancel-"));
+  try {
+    const gateway = new FakeGateway();
+    const store = new WorkflowStore(directory);
+    const instance = manager(directory, gateway);
+    const exec = fakeExec("cancel-first-cli", directory, []);
     await changedFile(directory);
+    // Cancel wins while the App Server is creating the Reviewer task, and the
+    // creation still reports a late id afterwards.
+    gateway.startReviewerThread = async () => {
+      const [record] = await store.list();
+      await instance.cancel(record!.id, exec);
+      return "late-visible-task";
+    };
     const result = await instance.reviewOnly({ implementationSummary: "Changed", changedFiles: ["a.txt"] }, exec);
     assert.equal(result.phase, "cancelled");
-    assert.equal(result.reviewerThreadId, undefined);
+    assert.equal(result.reviewerThreadId, undefined, "a late creation never binds a Reviewer id");
     assert.equal(result.latestReview, undefined);
     assert.equal(result.reviewCycles, 0);
+    assert.equal(gateway.reviewStarts.length, 0, "no review turn starts on the cancelled workflow");
+    assert.deepEqual(gateway.releasedThreads, ["late-visible-task"],
+      "the task created for a cancelled binding is released, never left subscribed");
     await instance.stop();
   } finally { await rmClosed(directory); }
 });
 
-test("CLI planned review releases and resumes the legacy distinct Reviewer task", async () => {
+test("1.1.2: a Reviewer task created for a FAILED binding write is released too", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-bindfail-"));
+  try {
+    const gateway = new FakeGateway();
+    const store = new FlakyStore(directory);
+    const instance = new WorkflowManager(store, gateway, { ...config, storageDir: directory });
+    const exec = fakeExec("session-bindfail", directory, []);
+    const planned = await instance.start({ task: "Build it" }, exec);
+    // The review-scoped updates are: entering (1), evidence (2), Reviewer-thread
+    // persist (3) — failing the THIRD one means the task was created but could
+    // not be bound to the workflow.
+    store.failAtUpdate = store.updateCount + 3;
+    await assert.rejects(
+      instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.txt"] }, exec),
+      /store write failed/,
+    );
+    assert.deepEqual(gateway.releasedThreads, ["reviewer-thread"],
+      "an unbound created Reviewer is released instead of leaking its subscription");
+    const record = (await store.load(planned.id))!;
+    assert.equal(record.reviewerThreadId, undefined, "nothing is bound after the failed write");
+    assert.equal(record.phase, "executing", "the workflow stays retryable");
+  } finally { await rmClosed(directory); }
+});
+
+/** 1.1.2 boundary: with a CLI audit configured, the VISIBLE review turn runs on
+ * the App Server (so the task is renderable in Codex Desktop) while the
+ * structured conversion stays on the CLI — `--ephemeral`, i.e. no durable task.
+ * A legacy CLI-created Reviewer id is never resumed: it is replaced. */
+test("a CLI-audited review runs its visible turn on the App Server and keeps only ephemeral CLI conversions", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-cli-legacy-reviewer-"));
   try {
     const gateway = new FakeGateway();
@@ -2908,10 +3092,12 @@ test("CLI planned review releases and resumes the legacy distinct Reviewer task"
 
     const reviewed = await instance.review(planned.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
     assert.equal(reviewed.phase, "passed");
-    assert.deepEqual(gateway.releasedThreads, ["legacy-cli-reviewer"]);
-    assert.equal(audit.reviewRequests.length, 1);
-    assert.equal(audit.reviewRequests[0]!.codexThreadId, "legacy-cli-reviewer");
-    assert.equal((await store.load(planned.id))!.reviewerThreadId, "legacy-cli-reviewer");
+    assert.deepEqual(gateway.releasedThreads, [], "a replaced legacy task is not released — it is not resumed at all");
+    assert.equal(audit.reviewRequests.length, 0, "the CLI never runs a visible review turn");
+    assert.equal(audit.creations, 0, "the CLI never creates a durable task");
+    assert.equal(audit.normalizeCalls, 1, "the structured conversion still comes from the CLI");
+    assert.deepEqual(gateway.reviewStarts.map((call) => call.threadId), ["reviewer-thread"], "the visible turn runs on the App Server Reviewer");
+    assert.equal((await store.load(planned.id))!.reviewerThreadId, "reviewer-thread");
   } finally {
     await rmClosed(directory);
   }
@@ -3222,7 +3408,7 @@ test("submit persists a submission, resumes the exact thread and enqueues the st
   }
 });
 
-test("bridge callback releases the legacy Reviewer task instead of the source task", async () => {
+test("bridge callback never hands over a legacy CLI Reviewer; the source task stays untouched", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-submit-legacy-reviewer-"));
   try {
     const gateway = new FakeGateway();
@@ -3237,10 +3423,37 @@ test("bridge callback releases the legacy Reviewer task instead of the source ta
 
     await instance.submit(bridge.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
     await waitFor(async () => (await store.load(bridge.id))?.submissionState === "received");
-    assert.deepEqual(gateway.releasedThreads, ["legacy-callback-reviewer"]);
-    assert.equal(callback.requests[0]!.codexThreadId, sourceThreadId);
-    assert.equal(callback.requests[0]!.reviewerThreadId, "legacy-callback-reviewer");
-    assert.equal((await store.load(bridge.id))!.reviewerThreadId, "legacy-callback-reviewer");
+    assert.equal(callback.requests[0]!.codexThreadId, sourceThreadId, "the originating Codex task is never a review target");
+    assert.equal(callback.requests[0]!.reviewerThreadId, undefined,
+      "an unrenderable legacy Reviewer is handed over as UNBOUND so a visible one is created");
+    assert.deepEqual(gateway.releasedThreads, [], "the legacy task is not resumed, so it is not released either");
+    assert.deepEqual(gateway.renamedThreads.map((entry) => entry.threadId), ["legacy-callback-reviewer"],
+      "the legacy task is renamed best-effort for a human reader");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("1.1.2: a bridge record whose Reviewer id IS the origin task is never renamed or resumed", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-submit-alias-reviewer-"));
+  try {
+    const gateway = new FakeGateway();
+    const callback = new FakeCallback();
+    const queue = fakeBridgeQueue();
+    const instance = manager(directory, gateway, {}, callback, queue);
+    const exec = fakeExec("session-submit-alias-reviewer", directory, []);
+    const sourceThreadId = newRequestId();
+    const bridge = await bridgeWorkflow(instance, "session-submit-alias-reviewer", directory, sourceThreadId);
+    const store = new WorkflowStore(directory);
+    // The pre-1.1.0 shared layout: reviewerThreadId aliases the ORIGIN task.
+    await store.update(bridge.id, (r) => { r.reviewerThreadId = r.codexThreadId; }, { ignoreCancelled: false });
+
+    await instance.submit(bridge.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
+    await waitFor(async () => (await store.load(bridge.id))?.submissionState === "received");
+    assert.equal(callback.requests[0]!.reviewerThreadId, undefined, "the shared alias is handed over as unbound");
+    assert.deepEqual(gateway.renamedThreads, [],
+      "the ORIGIN task's title is never overwritten by the legacy-Reviewer rename");
+    assert.deepEqual(gateway.releasedThreads, [], "the origin task is not resumed, so it is not released either");
   } finally {
     await rmClosed(directory);
   }

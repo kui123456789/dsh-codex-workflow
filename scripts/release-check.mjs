@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Release check for dsh-codex-workflow 1.1.1.
+// Release check for dsh-codex-workflow 1.1.2.
 //
 // A repeatable, OFFLINE gate (no Codex login, no real DSH_HOME):
 //   1. verify      : typecheck + full test suite + build
@@ -61,6 +61,22 @@ report("bundle defaults autonomous trigger to complex", /^\s*autoTriggerMode:\s*
   "cordis.patch.yml does not set autoTriggerMode: complex");
 report("system-prompt peer dependency is declared", typeof packageJson.peerDependencies?.["@deepseek-ai/dsh-system-prompt"] === "string",
   "package.json has no @deepseek-ai/dsh-system-prompt peer dependency");
+
+// 1.1.2 VISIBILITY CONTRACT. `source` is fixed by the creation path, and Codex
+// Desktop's sidebar (`thread/list`) only returns `source='vscode'` tasks, which
+// only an App Server `thread/start` produces — a `codex exec` task is never
+// listed (measured 0 of 15) and cannot be renamed into visibility. Two static
+// guards keep that from silently regressing:
+//   a) `workflow.ts` must never create a durable Reviewer through the CLI again
+//      (`createReview` / the CLI dispatcher's visible `review`), and
+//   b) the README must keep documenting the visible creation path + name.
+const workflowSource = await readFile(join(root, "src", "workflow.ts"), "utf8");
+report("workflow.ts never creates a durable CLI Reviewer",
+  !/audit[?!]?\.(createReview|review)\s*\(/.test(workflowSource),
+  "src/workflow.ts calls the CLI dispatcher's visible-review path, which would create a source='exec' task that Codex Desktop can never render");
+report("README documents the Reviewer visibility contract",
+  /source='vscode'/.test(readme) && /thread\/name\/set/.test(readme) && /DSH Reviewer: <workflowId>/.test(readme),
+  "README.md does not document the source='vscode' / thread/name/set / DSH Reviewer naming contract");
 
 // 1) verify
 report("typecheck", runPnpm(["typecheck"]) === 0, "pnpm typecheck failed");

@@ -349,11 +349,14 @@ test("show reports one workflow's stage/submission/review/evidence summary", asy
     const result = await runCli(["show", "--workflow", "wf-show", "--json"], "", home);
     assert.equal(result.code, 0, result.stderr);
     const parsed = JSON.parse(result.stdout) as Record<string, unknown>;
-    assert.equal(parsed.pluginVersion, "1.1.1");
+    assert.equal(parsed.pluginVersion, "1.1.2");
     assert.equal(parsed.phase, "fixing");
     assert.equal(parsed.originatingCodexTaskId, "codex-source-task");
     assert.equal(parsed.reviewerCodexTaskId, "codex-reviewer-task");
     assert.equal(parsed.reviewerTurnId, "codex-reviewer-turn");
+    // 1.1.2: the Reviewer-visibility marker is INTERNAL — it must never leak
+    // into the public `show --json` projection.
+    assert.ok(!JSON.stringify(parsed).includes("reviewerThreadOrigin"), "show must not expose the internal origin marker");
     assert.equal((parsed.latestReview as Record<string, unknown>).findings, 2);
     assert.equal((parsed.latestReview as Record<string, unknown>).blockingFindings, 1);
     assert.equal((parsed.evidence as Record<string, unknown>).fingerprint, true);
