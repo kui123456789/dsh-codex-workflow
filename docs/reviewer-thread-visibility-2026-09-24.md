@@ -80,15 +80,42 @@
 ## 5. 复验方式（离线）
 
 ```
-pnpm typecheck && pnpm test          # 406 tests
+pnpm typecheck && pnpm test          # 416 tests
 pnpm release:check                   # RELEASE_CHECK_OK
 ```
 
 新增断言：Reviewer 创建 RPC 顺序与名字、改名不触发 `thread/resume`、
-`thread/name/set` 失败仍释放已创建线程、带 CLI audit 的审查不产生持久 CLI 任务
+`thread/name/set` 失败仍释放已创建线程、空 App Server 任务在首回合前不可 resume（rollout 约束）
+且首回合跑在创建出的同一线程、带 CLI audit 的审查不产生持久 CLI 任务
 （但 `normalize` 仍走 CLI）、旧 CLI Reviewer 的迁移（旧线程改名 + 新线程绑定 + origin 落库）、
-回调路径瞬时失败的 retryable 语义。
+共享别名迁移**不**改名、未绑定新建 Reviewer 在取消/写入失败时释放、
+可见审查回合的瞬时重试（终态不重试）、回调路径瞬时失败的 retryable 语义。
 
 在线侧证据（本次修复所依据的 `thread/list` 交叉统计与线程比对）由 `%TEMP%` 下的一次性探针脚本
 产出：`list-dump-probe.mjs`（导出 `thread/list` 全量）与 `reviews-visibility-probe.mjs`
 （比对指定线程是否被列出）。探针只读，不写 `~/.codex`。
+
+## 6. 1.1.2 上线后的正向运行时证据（宿主重启后实测）
+
+| 线程 | 创建方 | `source` | `originator` | `name` | 出现在 `thread/list` |
+|---|---|---|---|---|---|
+| `01a0cf65-3580-73a1-8565-f89d451b0527` | 1.1.1 `codex exec` | `exec` | `codex_exec` | `NULL` | **否**（修复前对照） |
+| `01a0d2c8-967e-7603-aee9-776d8de1cb45` | 探针 `codex exec` + 改名 | `exec` | `codex_exec` | `DSH Reviewer: resume-then-name-probe` | **否**（改名救不活旧线程） |
+| `01a0d324-49ad-7bf0-a567-232e9a42de4b` | 1.1.2 `review_only` | `vscode` | `dsh-codex-workflow` | `DSH Reviewer: 165b5412-c10b-437a-aa22-f8f04af725ce` | **是** |
+| `01a0d377-d8c0-7653-afa8-c5f17eaef312` | 1.1.2 冒烟 `review_only` | `vscode` | `dsh-codex-workflow` | `DSH Reviewer: b5d6ea87-eb6b-4c8c-b714-556975525fd3` | **是** |
+
+`thread/list` 实时快照（同一次调用，只列 `DSH` 前缀）：
+
+```
+01a0d377-d8c0 "DSH Reviewer: b5d6ea87-eb6b-4c8c-b714-556975525fd3"
+01a0d324-49ad "DSH Reviewer: 165b5412-c10b-437a-aa22-f8f04af725ce"
+01a0d2ce-a3b9 "DSH Plan: 项目：…"
+01a0d2b0-ec84 "DSH Plan: ## 任务 …"
+```
+
+桌面深链：`codex://threads/<threadId>`（`src/desktop-thread-opener.ts` 的 `codexThreadUri`）。
+
+**已知副作用（可见性的代价）**：线程一旦可渲染，用户在桌面端打开它就会让 Desktop 持有该线程的
+写者锁（1.1.0 记录的那套 `thread-writer-locks/<id>.lock`）。后续审查轮次对同一 Reviewer 线程的
+`thread/resume` 因此可能报 `already has an active writer`；插件把它按瞬时故障重试（有界退避），
+但用户长期开着该线程会让每一轮都先冲突一次。旧布局（`exec` 线程）不存在这个问题，因为它根本不可见。
