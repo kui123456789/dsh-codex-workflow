@@ -1,7 +1,7 @@
 import { mkdir, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { CoordinationStore, coordinationPath } from "./coordination.js";
-import type { ReviewFinding, WorkflowMode, WorkflowPhase, WorkflowRecord } from "./types.js";
+import type { ReviewFinding, ReviewStep, WorkflowMode, WorkflowPhase, WorkflowProcessState, WorkflowRecord } from "./types.js";
 
 export interface UpdateOutcome<T> {
   /** The record as persisted after this update (or the untouched current
@@ -248,6 +248,24 @@ const PHASES = new Set<WorkflowPhase>([
 ]);
 
 const MODES: WorkflowMode[] = ["planned", "review_only"];
+const REVIEW_STEPS = new Set<ReviewStep>([
+  "reviewing",
+  "review_native_turn",
+  "review_readback",
+  "review_display_rewrite",
+  "review_conversion",
+  "review_alignment",
+  "review_reconciliation",
+  "review_finalizing",
+]);
+const PROCESS_STATES = new Set<WorkflowProcessState>([
+  "running",
+  "waiting",
+  "completed",
+  "failed",
+  "cancelled",
+  "stale",
+]);
 
 function parseRecord(value: unknown): WorkflowRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid workflow record");
@@ -266,6 +284,20 @@ function parseRecord(value: unknown): WorkflowRecord {
     noChangeReviewRounds: typeof record.noChangeReviewRounds === "number" ? record.noChangeReviewRounds : 0,
     reviewContractFailures: typeof record.reviewContractFailures === "number" ? record.reviewContractFailures : 0,
     callbackAttempts: typeof record.callbackAttempts === "number" ? record.callbackAttempts : 0,
+    reviewAttempt: typeof record.reviewAttempt === "number" ? record.reviewAttempt : 0,
+    ...(typeof record.reviewStep === "string" && REVIEW_STEPS.has(record.reviewStep as ReviewStep)
+      ? { reviewStep: record.reviewStep as ReviewStep }
+      : {}),
+    ...(typeof record.reviewStartedAt === "string" ? { reviewStartedAt: record.reviewStartedAt } : {}),
+    ...(typeof record.lastProgressAt === "string" ? { lastProgressAt: record.lastProgressAt } : {}),
+    ...(typeof record.activeTurnId === "string" ? { activeTurnId: record.activeTurnId } : {}),
+    ...(typeof record.reviewElapsedMs === "number" && Number.isFinite(record.reviewElapsedMs)
+      ? { reviewElapsedMs: Math.max(0, record.reviewElapsedMs) }
+      : {}),
+    ...(typeof record.lastProgressMessage === "string" ? { lastProgressMessage: record.lastProgressMessage } : {}),
+    ...(typeof record.processState === "string" && PROCESS_STATES.has(record.processState as WorkflowProcessState)
+      ? { processState: record.processState as WorkflowProcessState }
+      : {}),
     assumptions: Array.isArray(record.assumptions) ? record.assumptions : [],
     questions: Array.isArray(record.questions) ? record.questions : [],
     reviewCycles: typeof record.reviewCycles === "number" ? record.reviewCycles : 0,

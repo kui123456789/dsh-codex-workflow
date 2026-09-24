@@ -135,6 +135,8 @@ function resolveConfig(raw: Config): WorkflowConfig {
     transientRetryMaxMs: Math.max(200, Math.min(15 * 60 * 1000, Math.trunc(raw.transientRetryMaxMs))),
     transientRetryBudgetMs: Math.max(0, Math.min(2 * 60 * 60 * 1000, Math.trunc(raw.transientRetryBudgetMs))),
     transientRetryJitterRatio: Math.max(0, Math.min(1, Number(raw.transientRetryJitterRatio) || 0)),
+    reviewHeartbeatMs: Math.max(250, Math.min(5 * 60 * 1000, Math.trunc(raw.reviewHeartbeatMs))),
+    reviewStaleMs: Math.max(1_000, Math.min(24 * 60 * 60 * 1000, Math.trunc(raw.reviewStaleMs))),
     leaseTtlMs: Math.max(5_000, Math.min(60 * 60 * 1000, Math.trunc(raw.leaseTtlMs))),
   };
 }
