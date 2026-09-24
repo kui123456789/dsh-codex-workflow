@@ -2,6 +2,29 @@
 
 All notable changes to `dsh-codex-workflow`.
 
+## [1.1.1] - 2026-09-24
+
+- **Transient upstream failures are retried instead of ending the workflow.** An upstream `server_overloaded` reply — `Selected model is at capacity. Please try a different model.` — matched none of the old retry patterns (`rate limit|429|active writer`) and was therefore classified as a TERMINAL `CodexCallbackProcessError`: the audit failed, the workflow stopped at `executing`, and a human had to run the same call again. Capacity is temporary.
+- New shared module `src/transient-retry.ts` with ONE classification (`isTransientFailure` / `transientReason`) and ONE bounded-backoff policy (exponential + jitter, wall-clock budget) used by every model call: the CLI audit (`review`, `createReview`, `reconcile`, the display rewrite), the App Server turns (planner start/continue, the completion turn, the display rewrite, reconciliation) and `normalize`/`align`. Terminal conditions — a thread that does not exist, schema/display-contract violations, approvals, cancellation — are still never retried.
+- The CLI retry loop no longer uses 9 attempts x ~22 s of linear delay against four hard-coded patterns: it backs off exponentially within `transientRetryBudgetMs` (default 20 min), and a retry RESUMES the task created by the first attempt so a second identity is never opened. When the budget is spent the outcome stays RETRYABLE, never a terminal failure.
+- A visible turn is only retried when it failed WITHOUT producing visible output (nothing was persisted, so re-running cannot duplicate a plan, an audit or a rewrite); cancellation and teardown interrupt a pending backoff immediately.
+- **Diagnostics keep both ends.** `compactDiagnostic` retains head + tail of a long diagnostic: the old `slice(0, 2048)` kept only the head of the JSONL stream and hid the fatal `task_complete`/error record — exactly the line that explains the failure.
+- Tool timeout budgets now include the retry allowance (`startToolTimeout` / `reviewToolTimeout`), so the host can no longer pre-empt a legitimately backing-off operation. A config object that omits the retry fields is normalized, so an absent budget can never turn the bounded retry into an endless loop.
+- New config: `transientRetryBaseMs` (3000), `transientRetryMaxMs` (60000), `transientRetryBudgetMs` (20 min; `0` disables), `transientRetryJitterRatio` (0.25).
+
+## [1.1.0] - 2026-09-24
+
+- **The Reviewer always runs on its own dedicated task.** A review no longer resumes the Planner task (DSH-led workflows) or the bridge's originating Codex task (App Server callback path). Codex Desktop keeps a `thread-writer-locks/<id>.lock` writer handle on every thread it has loaded, so resuming a shared task made reviews fail with `thread-store conflict: thread <id> already has an active writer`; the plugin cannot release a lock held by another process. A real workflow stayed blocked from 22:22 until Codex Desktop was restarted, ~1h40m, while the CLI audit retried and finally surfaced the raw conflict.
+- The first review of a workflow creates a dedicated Reviewer task and persists it as `reviewerThreadId` only after its identity is confirmed; every later review, repair round, re-review, display rewrite, normalization fork and authority-alignment fork targets that same task, and writer release targets only it.
+- **Lazy migration.** Records written before 1.1.0 whose `reviewerThreadId` still aliases `plannerThreadId` (or the bridge `codexThreadId`) are treated as unbound: the next review binds a dedicated Reviewer and replaces the alias. The identity guard against binding a second, different Reviewer stays in force for every non-alias record.
+- The originating task is no longer written by the plugin on any path; the readable verdict reaches the originating Codex task and the original DSH session through the existing bridge relay.
+- Regression coverage: a busy Planner/origin task (writer conflict on every resume) no longer blocks the review, legacy shared identities migrate to a dedicated Reviewer, and the reviews of a round still produce exactly one visible task.
+
+## [1.0.15] - 2026-09-23
+
+- **Fix the ephemeral fork on Codex CLI 0.154.0.** `thread/fork` now sends `excludeTurns: true` for the ephemeral conversion and authority-alignment forks. App Server 0.154.0 rejects an ephemeral fork without it (`-32600 ephemeral paginated thread/fork requires \`excludeTurns: true\``), so every planning and review flow failed at structured normalization. The parameter only trims the RPC RESPONSE payload (the fork comes back with zero turns); the fork still inherits the source thread's context, so conversion turns keep seeing the visible reply they must convert. Non-ephemeral forks and `thread/resume` are unaffected.
+- Verified against codex-cli 0.154.0 with a direct App Server protocol probe (missing → `-32600`, present → fork succeeds, persistent fork still succeeds without it) and a real end-to-end run of the production path (`startThread` → visible turn → `normalizeInFork`), where the conversion fork correctly read a code word that existed only in the parent thread's visible reply. `pnpm verify` passes with 388 tests.
+
 ## [1.0.14] - 2026-09-14
 
 - **Fix first review-only task creation.** The first visible CLI audit now runs a persistent `codex exec --json` turn directly instead of creating an empty App Server task that `exec resume` cannot find.

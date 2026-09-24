@@ -45,6 +45,15 @@ export async function apply(ctx: Context, raw: Config): Promise<void> {
       reviewSchemaFile: schemaFile,
       alignmentSchemaFile,
       timeoutMs: config.callbackTimeoutMs,
+      // 1.1.1: transient upstream failures (server_overloaded / at capacity /
+      // 429 / 5xx / dropped streams / a writer held elsewhere) are retried with
+      // this shared bounded backoff instead of ending the workflow.
+      retry: {
+        baseMs: config.transientRetryBaseMs,
+        maxMs: config.transientRetryMaxMs,
+        budgetMs: config.transientRetryBudgetMs,
+        jitterRatio: config.transientRetryJitterRatio,
+      },
       // `codex exec --json` can emit substantial tool/warning JSONL before the
       // final agent message. Keep retention bounded while allowing real review
       // contexts to complete instead of truncating at the unit-test default.
@@ -119,6 +128,13 @@ function resolveConfig(raw: Config): WorkflowConfig {
     callbackTimeoutMs: Math.max(10_000, Math.min(30 * 60 * 1000, Math.trunc(raw.callbackTimeoutMs))),
     callbackMaxAttempts: Math.max(1, Math.min(10, Math.trunc(raw.callbackMaxAttempts))),
     callbackRetryBaseMs: Math.max(200, Math.min(5 * 60 * 1000, Math.trunc(raw.callbackRetryBaseMs))),
+    // 1.1.1 transient-upstream retry: base/max delays are clamped to sane
+    // bounds, the budget is clamped to 2h, and base > max is impossible because
+    // the ceiling is applied per attempt in backoffDelayMs.
+    transientRetryBaseMs: Math.max(200, Math.min(5 * 60 * 1000, Math.trunc(raw.transientRetryBaseMs))),
+    transientRetryMaxMs: Math.max(200, Math.min(15 * 60 * 1000, Math.trunc(raw.transientRetryMaxMs))),
+    transientRetryBudgetMs: Math.max(0, Math.min(2 * 60 * 60 * 1000, Math.trunc(raw.transientRetryBudgetMs))),
+    transientRetryJitterRatio: Math.max(0, Math.min(1, Number(raw.transientRetryJitterRatio) || 0)),
     leaseTtlMs: Math.max(5_000, Math.min(60 * 60 * 1000, Math.trunc(raw.leaseTtlMs))),
   };
 }

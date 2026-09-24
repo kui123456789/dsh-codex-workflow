@@ -25,7 +25,9 @@ const jsonOutput = {
  *    alignment fork + (on conflict) one visible reconciliation turn on the
  *    same durable task + a SECOND conversion fork + a SECOND alignment fork;
  *  - submit only validates, captures evidence, persists the submission and
- *    starts a manager-owned background review on the existing workflow task.
+ *    starts a manager-owned background review on the workflow's dedicated
+ *    Reviewer task (created on the first review — never the Planner or origin
+ *    task, see 1.1.0).
  *  - review/review_only additionally reserve ONE bounded persisted-read-back
  *    window per readable turn (the native review, the display rewrite and the
  *    reconciliation turn each poll {@link APPENDED_READBACK_TIMEOUT_MS} for
@@ -77,29 +79,49 @@ function rpcTimeoutOf(config: WorkflowConfig): number {
 
 /** start/continue: the Planner worst path of FOUR serial turns (visible +
  * conversion + completion + conversion) + every control RPC at its own
- * timeout + margin. */
-export function startToolTimeout(turnTimeoutMs: number, rpcTimeoutMs: number): number {
-  return saturatedAdd(turnTimeoutMs * PLANNER_MAX_TURNS, MAX_SERIAL_RPCS * rpcTimeoutMs, CLEANUP_MARGIN_MS);
+ * timeout + the transient-retry budget + margin. */
+export function startToolTimeout(turnTimeoutMs: number, rpcTimeoutMs: number, transientRetryBudgetMs = 0): number {
+  return saturatedAdd(
+    turnTimeoutMs * PLANNER_MAX_TURNS,
+    MAX_SERIAL_RPCS * rpcTimeoutMs,
+    retryAllowance(transientRetryBudgetMs),
+    CLEANUP_MARGIN_MS,
+  );
 }
 
 /** review/review_only: SEVEN serial turns (native + display rewrite +
  * conversion + authority alignment + reconciliation + second conversion +
  * second alignment) + RPCs + one bound for EACH persisted read-back (the
  * native read-back, the rewrite read-back and the reconciliation read-back
- * poll a bounded rollout window) + margin. */
-export function reviewToolTimeout(turnTimeoutMs: number, rpcTimeoutMs: number): number {
+ * poll a bounded rollout window) + the transient-retry budget + margin. */
+export function reviewToolTimeout(turnTimeoutMs: number, rpcTimeoutMs: number, transientRetryBudgetMs = 0): number {
   return saturatedAdd(
     turnTimeoutMs * REVIEW_MAX_TURNS,
     MAX_SERIAL_RPCS * rpcTimeoutMs,
+    retryAllowance(transientRetryBudgetMs),
     3 * APPENDED_READBACK_TIMEOUT_MS,
     CLEANUP_MARGIN_MS,
   );
 }
 
+/**
+ * 1.1.1: how much extra wall clock the transient-retry policy can add to a tool.
+ *
+ * Every serial turn gets its own bounded retry budget, so the arithmetic worst
+ * case would be `turns × budget`. Two budgets are budgeted here instead: an
+ * upstream outage is consumed by the FIRST turn that hits it, and a tool that
+ * spends more than two full budgets on retries is a multi-hour outage where the
+ * host ending the call is acceptable — the workflow stays retryable and the
+ * user can simply run it again, which is exactly what the retry policy is for.
+ */
+function retryAllowance(transientRetryBudgetMs: number): number {
+  return transientRetryBudgetMs > 0 ? 2 * transientRetryBudgetMs : 0;
+}
+
 export function createWorkflowTools(manager: WorkflowManager, config: WorkflowConfig): ToolDefinition[] {
   const rpcTimeoutMs = rpcTimeoutOf(config);
-  const startTimeout = startToolTimeout(config.turnTimeoutMs, rpcTimeoutMs);
-  const reviewTimeout = reviewToolTimeout(config.turnTimeoutMs, rpcTimeoutMs);
+  const startTimeout = startToolTimeout(config.turnTimeoutMs, rpcTimeoutMs, config.transientRetryBudgetMs);
+  const reviewTimeout = reviewToolTimeout(config.turnTimeoutMs, rpcTimeoutMs, config.transientRetryBudgetMs);
   const instantTimeout = 60_000;
   return [
     defineTool({
@@ -127,7 +149,7 @@ export function createWorkflowTools(manager: WorkflowManager, config: WorkflowCo
     }),
     defineTool({
       name: "codex_workflow_review",
-      description: "Append an independent read-only Codex review to this workflow's existing Codex task: for planned workflows that is the original Planner task, for review_only it is the workflow's dedicated review task (no Planner exists). Call after implementing the plan and after every repair round; re-reviews reuse the same task.",
+      description: "Append an independent read-only Codex review to this workflow's dedicated Reviewer task: since 1.1.0 a review always runs on its own task, never on the Planner task or the Codex origin task (a foreign writer holding that task, such as Codex Desktop, would otherwise block the review). Call after implementing the plan and after every repair round; re-reviews reuse the same dedicated Reviewer task.",
       parameters: {
         workflowId: { type: "string", required: true },
         implementationSummary: { type: "string", required: true },

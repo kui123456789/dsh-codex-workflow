@@ -284,6 +284,14 @@ export interface WorkflowConfig {
   callbackTimeoutMs: number;
   callbackMaxAttempts: number;
   callbackRetryBaseMs: number;
+  /** 1.1.1 shared retry policy for TRANSIENT upstream failures
+   * (server_overloaded / at capacity / 429 / 5xx / dropped streams / a thread
+   * writer held elsewhere). Exponential backoff with jitter, bounded by a total
+   * wall-clock budget per operation. */
+  transientRetryBaseMs: number;
+  transientRetryMaxMs: number;
+  transientRetryBudgetMs: number;
+  transientRetryJitterRatio: number;
   /** Lease lifetime for submission callback claims (ms); heartbeats renew at
    * ttl/3 while a callback runs. Default 60000. */
   leaseTtlMs?: number;

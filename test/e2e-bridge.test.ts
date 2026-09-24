@@ -56,6 +56,11 @@ const config: WorkflowConfig = {
   callbackTimeoutMs: 10_000,
   callbackMaxAttempts: 3,
   callbackRetryBaseMs: 200,
+  // 1.1.1 fast-but-real transient retry bounds (tests must not wait seconds).
+  transientRetryBaseMs: 1,
+  transientRetryMaxMs: 5,
+  transientRetryBudgetMs: 1_000,
+  transientRetryJitterRatio: 0,
   turnTimeoutMs: 10_000,
   idleProcessMs: 0,
   terminalRelayTimeoutMs: 60_000,
@@ -196,19 +201,21 @@ test("end-to-end: CLI dispatch -> followup -> submit -> same-task review -> fina
       assert.equal(submitted.submissionState, "received", submitted.submissionError);
       assert.ok(submitted.submissionId);
       assert.ok(submitted.reviewerThreadId);
-      assert.equal(submitted.reviewerThreadId, codexThreadId);
+      // 1.1.0: the review runs on a DEDICATED Reviewer task, never the
+      // originating Codex task (whose writer lock Codex Desktop may hold).
+      assert.notEqual(submitted.reviewerThreadId, codexThreadId);
       const calls = (await readFile(callsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
         method: string;
         params: Record<string, any>;
       });
-      const read = calls.find((call) => call.method === "thread/read");
       const starts = calls.filter((call) => call.method === "thread/start");
       const forks = calls.filter((call) => call.method === "thread/fork");
       const turns = calls.filter((call) => call.method === "turn/start");
-      assert.equal(read?.params.threadId, codexThreadId);
-      assert.equal(read?.params.includeTurns, false, "source validation must not load turns");
-      assert.ok(calls.some((call) => call.method === "thread/resume" && call.params.threadId === codexThreadId));
-      assert.equal(starts.length, 0, "review creates no second visible task");
+      assert.equal(calls.filter((call) => call.params.threadId === codexThreadId).length, 0,
+        "the originating task is never read, resumed, renamed or written");
+      assert.equal(starts.length, 1, "exactly ONE dedicated Reviewer task is created");
+      assert.ok(calls.some((call) => call.method === "thread/resume" && call.params.threadId === submitted.reviewerThreadId),
+        "the dedicated Reviewer is the task that gets resumed");
       // 1.0.7: the VISIBLE Reviewer turn runs on the durable Reviewer WITHOUT
       // an outputSchema; the structured verdict is produced by ONE ephemeral
       // fork conversion turn. 1.0.10 adds a SECOND ephemeral fork: the
@@ -376,7 +383,8 @@ test("codex_workflow_submit returns promptly; DSH turn-end never aborts the stil
       assert.ok(!(await exists(interruptFile)), "no turn was interrupted by tool-return or turn-end");
       const calls = (await readFile(callsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { method: string; params: Record<string, any> });
       assert.ok(!calls.some((call) => call.method === "turn/interrupt"), "no turn/interrupt was issued");
-      assert.equal(calls.filter((call) => call.method === "thread/start").length, 0, "no second visible Reviewer task was created");
+      assert.equal(calls.filter((call) => call.method === "thread/start").length, 1,
+        "exactly ONE dedicated Reviewer task was created, and no other visible task");
       assert.equal(calls.filter((call) => call.method === "thread/fork").length, 2, "one conversion fork + one review-authority alignment fork");
       assert.equal(calls.filter((call) => call.method === "thread/unsubscribe").length, 3, "the durable Reviewer and BOTH ephemeral forks (conversion + alignment) were each released once");
       void followups;

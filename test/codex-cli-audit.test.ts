@@ -297,13 +297,20 @@ test("CLI audit preserves invalid-thread, process-error and no-final-message cla
   );
 });
 
-test("CLI audit retries busy results and keeps the final busy outcome retryable", async () => {
-  const busy = spawned(Array.from({ length: 10 }, () => ({ stdout: "", stderr: "thread already has an active writer", code: 1 })));
+test("CLI audit retries busy results within the retry budget and keeps the final outcome retryable", async () => {
+  // 1.1.1: the retry loop is now bounded by the shared TIME budget instead of a
+  // hard-coded 9 attempts, so the test drives an injected clock.
+  const busy = spawned(Array.from({ length: 3 }, () => ({ stdout: "", stderr: "thread already has an active writer", code: 1 })));
+  let clock = 0;
   await assert.rejects(
-    dispatcher(busy.spawn, { retryBaseMs: 0 }).review({ workflowId: "wf-busy", submissionId: "sub", codexThreadId: "task", cwd: "C:\\repo", prompt: "review" }),
+    dispatcher(busy.spawn, {
+      retry: { baseMs: 5, maxMs: 5, budgetMs: 12, jitterRatio: 0 },
+      now: () => clock,
+      sleep: async (ms) => { clock += ms; },
+    }).review({ workflowId: "wf-busy", submissionId: "sub", codexThreadId: "task", cwd: "C:\\repo", prompt: "review" }),
     /codex CLI audit busy/,
   );
-  assert.equal(busy.calls.length, 10);
+  assert.equal(busy.calls.length, 3, "retried until the budget was spent, then stayed retryable");
 });
 
 test("CLI audit output overflow kills the child and fails without normalization", async () => {
@@ -346,4 +353,92 @@ test("cancelSubmission terminates the matching ephemeral child and stop waits fo
   await audit.stop();
   await assert.rejects(stoppedChild, /dispatcher stopped/);
   assert.equal(signals.filter((signal) => signal === "SIGKILL").length, 2);
+});
+
+/** The EXACT upstream reply observed on 2026-09-24 02:24 (see
+ * docs/reviewer-thread-lock-2026-09-24.md and transient-retry.ts): a temporary
+ * capacity problem that used to be reported as a terminal process failure. */
+const OVERLOADED = `${JSON.stringify({ type: "thread.started", thread_id: "01a0cf65-3580-73a1-8565-f89d451b0527" })}\n`
+  + `${JSON.stringify({ type: "turn.started" })}\n`
+  + `${JSON.stringify({ type: "task_complete", last_agent_message: null, error: { message: "Selected model is at capacity. Please try a different model.", codex_error_info: "server_overloaded" } })}\n`;
+
+test("1.1.1: a server_overloaded audit is RETRIED on the same task and can still produce a verdict", async () => {
+  const fake = spawned([
+    { stdout: OVERLOADED, code: 1 },
+    { stdout: agentMessage(VISIBLE_REVIEW) },
+    { stdout: agentMessage(JSON.stringify(PASS_REVIEW)) },
+  ]);
+  const sleeps: number[] = [];
+  const audit = dispatcher(fake.spawn, {
+    retry: { baseMs: 5, maxMs: 5, budgetMs: 60_000, jitterRatio: 0 },
+    sleep: async (ms) => { sleeps.push(ms); },
+  });
+  const result = await audit.review({
+    workflowId: "wf-overload",
+    submissionId: "sub-overload",
+    codexThreadId: "reviewer-task",
+    cwd: "C:\\repo",
+    prompt: "review prompt",
+    task: "Review the implementation",
+  });
+  assert.equal(result.kind, "verdict");
+  assert.equal(result.verdict.verdict, "pass");
+  assert.deepEqual(sleeps, [5], "the transient failure backed off once before retrying");
+  assert.equal(fake.calls.length, 3, "review retried, then normalization ran");
+  // The retry RESUMED the same durable task — it never opened a second one.
+  const retried = fake.calls[1]!.args;
+  assert.deepEqual(retried.slice(-3), ["resume", "reviewer-task", "-"]);
+});
+
+test("1.1.1: an overload that never clears stays RETRYABLE, never a terminal process failure", async () => {
+  const fake = spawned([
+    { stdout: OVERLOADED, code: 1 },
+    { stdout: OVERLOADED, code: 1 },
+    { stdout: OVERLOADED, code: 1 },
+  ]);
+  let clock = 0;
+  const audit = dispatcher(fake.spawn, {
+    retry: { baseMs: 10, maxMs: 10, budgetMs: 25, jitterRatio: 0 },
+    now: () => clock,
+    sleep: async (ms) => { clock += ms; },
+  });
+  await assert.rejects(
+    audit.review({
+      workflowId: "wf-overload-always",
+      submissionId: "sub-overload-always",
+      codexThreadId: "reviewer-task",
+      cwd: "C:\\repo",
+      prompt: "review prompt",
+    }),
+    (error: unknown) => {
+      assert.ok(!(error instanceof CodexCallbackProcessError), "an exhausted transient retry must NOT be a terminal failure");
+      assert.match((error as Error).message, /busy/);
+      // The diagnostic keeps the TAIL: the old slice(0, 2048) only kept the
+      // head of the JSONL and hid the real reason.
+      assert.match((error as Error).message, /at capacity/);
+      return true;
+    },
+  );
+  assert.equal(fake.calls.length, 3, "retried until the budget ran out");
+});
+
+test("1.1.1: a NON-transient process failure is not retried", async () => {
+  const fake = spawned([{ stdout: "boom: unexpected tool use", code: 1 }]);
+  const sleeps: number[] = [];
+  const audit = dispatcher(fake.spawn, {
+    retry: { baseMs: 5, maxMs: 5, budgetMs: 60_000, jitterRatio: 0 },
+    sleep: async (ms) => { sleeps.push(ms); },
+  });
+  await assert.rejects(
+    audit.review({
+      workflowId: "wf-terminal",
+      submissionId: "sub-terminal",
+      codexThreadId: "reviewer-task",
+      cwd: "C:\\repo",
+      prompt: "review prompt",
+    }),
+    CodexCallbackProcessError,
+  );
+  assert.equal(fake.calls.length, 1, "terminal failures fail fast, exactly as before");
+  assert.deepEqual(sleeps, []);
 });

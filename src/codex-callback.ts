@@ -17,8 +17,8 @@ export interface CodexCallbackRequest {
   task?: string;
   planMarkdown?: string;
   reviewerThreadId?: string;
-  /** Legacy compatibility only. New bridge workflows append reviews to
-   * codexThreadId and do not create or rename a Reviewer task. */
+  /** Display name for the DEDICATED Reviewer task created for this review
+   * (1.1.0). The origin task is never resumed or renamed. */
   reviewerName?: string;
   model?: string;
   effort?: ReasoningEffort;

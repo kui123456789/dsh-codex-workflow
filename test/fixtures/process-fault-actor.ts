@@ -51,6 +51,13 @@ const baseConfig = {
   callbackTimeoutMs: 10_000,
   callbackMaxAttempts: 3,
   callbackRetryBaseMs: 50,
+  // 1.1.1 transient-retry bounds: tiny so a retried turn cannot slow the fault
+  // tests down (a config object MISSING these fields is normalized by the
+  // manager, but explicit values keep the fixture deterministic).
+  transientRetryBaseMs: 1,
+  transientRetryMaxMs: 5,
+  transientRetryBudgetMs: 100,
+  transientRetryJitterRatio: 0,
   leaseTtlMs: 60_000,
   turnTimeoutMs: 60_000,
   idleProcessMs: 0,

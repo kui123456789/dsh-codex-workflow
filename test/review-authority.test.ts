@@ -55,6 +55,11 @@ const config: WorkflowConfig = {
   callbackTimeoutMs: 10_000,
   callbackMaxAttempts: 3,
   callbackRetryBaseMs: 200,
+  // 1.1.1 fast-but-real transient retry bounds (tests must not wait seconds).
+  transientRetryBaseMs: 1,
+  transientRetryMaxMs: 5,
+  transientRetryBudgetMs: 1_000,
+  transientRetryJitterRatio: 0,
   turnTimeoutMs: 10_000,
   idleProcessMs: 0,
   terminalRelayTimeoutMs: 60_000,
@@ -497,8 +502,10 @@ test("conflict + reconciled aligned applies the CORRECTED verdict in ONE busines
     assert.equal(after.latestReviewConflict!.reconciled, true);
     assert.equal(after.latestReviewConflict!.resolved, true);
     assert.equal(gateway.reconcileServed, 1);
-    // The reconciliation ran on the SAME durable task (the workflow planner task).
-    assert.equal(gateway.reconcileCalls[0]!.threadId, after.plannerThreadId);
+    // The reconciliation ran on the DEDICATED Reviewer task (1.1.0) — the
+    // Planner task is never a review target.
+    assert.equal(gateway.reconcileCalls[0]!.threadId, after.reviewerThreadId);
+    assert.notEqual(gateway.reconcileCalls[0]!.threadId, after.plannerThreadId);
     assert.match(gateway.reconcileCalls[0]!.prompt, /finding #0/);
     assert.match(gateway.reconcileCalls[0]!.prompt, /approved plan: exactly two test cases/);
   } finally {
@@ -580,7 +587,8 @@ test("demo-smoke regression: overreaching automated-test demand is refused and r
     assert.equal(after.phase, "passed", "the plan-conformant implementation passes without adding tests");
     assert.equal(after.reviewCycles, 1);
     assert.equal(after.latestReview?.verdict, "pass");
-    assert.equal(gateway.reconcileCalls[0]!.threadId, after.plannerThreadId, "reconciliation reused the SAME durable task");
+    assert.equal(gateway.reconcileCalls[0]!.threadId, after.reviewerThreadId, "reconciliation reused the SAME dedicated Reviewer task");
+    assert.notEqual(gateway.reconcileCalls[0]!.threadId, after.plannerThreadId, "the Planner task is never a review target");
     assert.ok(deferred.some((message) => /passed workflow/.test(deferredText(message))));
   } finally {
     await instance.stop();

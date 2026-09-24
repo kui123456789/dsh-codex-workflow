@@ -2,7 +2,7 @@
 
 DeepSeek Harness plugin that gives Codex read-only planning/review roles while DSH remains the sole executor. Two flows share the same workflow engine:
 
-- **Codex-led bridge (preferred)** — the Codex task that produced the plan sends it to the exact live DSH session through a durable SQLite bridge; DSH implements it, and the plugin appends every readable audit to that same Codex task before returning the verdict to the original DSH session.
+- **Codex-led bridge (preferred)** — the Codex task that produced the plan sends it to the exact live DSH session through a durable SQLite bridge; DSH implements it, and the plugin runs every readable audit on the workflow's own **dedicated Reviewer task** before returning the verdict to the original DSH session (the originating Codex task is never resumed or written; it receives the outcome through the bridge relay).
 - **DSH-led tools** — the DSH agent can autonomously start `codex_workflow_start` for complex development tasks, or the user can request it explicitly; implementation and review still run through the same workflow engine.
 
 No browser is opened or controlled anywhere in the product path; no network listener, MCP, hooks, or skills are involved. Browser clicking is a development-only workaround and is not part of the plugin.
@@ -19,7 +19,7 @@ Planner turns continue to use the Codex App Server/Desktop. Reviewer turns, brid
 
 ### Upgrading after a DSH update
 
-Version 1.0.14 targets DSH `0.1.5-rc.1` and newer compatible 0.1.x releases.
+Version 1.1.0 targets DSH `0.1.5-rc.1` and newer compatible 0.1.x releases.
 Older DSH versions need the older plugin release. Source installs must refresh
 their local dependencies with `pnpm install --frozen-lockfile` and rebuild;
 upgrading the host alone does not update a linked plugin's `node_modules`.
@@ -50,7 +50,7 @@ pnpm verify
 pnpm doctor
 ```
 
-`pnpm run lifecycle:accept` runs the real hybrid acceptance against a live Codex login: Planner remains on the App Server/Desktop, while visible Reviewer/reconciliation turns run through real `codex exec --json resume <existing-task> -` and normalization/alignment run through separate `codex exec --ephemeral --output-schema ...` sessions. The gate records the actual spawned arguments (configured model via `-m`, visible reviewer effort via `model_reasoning_effort`, ephemeral effort fixed to `low`), proves reviews remain readable Markdown on the original task, exercises DSH-led/bridge/demo-smoke authority flows, and asserts the bridge Desktop opener is called zero times. `DSH_CODEX_LIFECYCLE_MODEL`, `DSH_CODEX_LIFECYCLE_EFFORT`, and `DSH_CODEX_LIFECYCLE_TIMEOUT_MS` control the real acceptance without changing runtime defaults.
+`pnpm run lifecycle:accept` runs the real hybrid acceptance against a live Codex login: Planner remains on the App Server/Desktop, while visible Reviewer/reconciliation turns run through real `codex exec --json resume <existing-task> -` and normalization/alignment run through separate `codex exec --ephemeral --output-schema ...` sessions. The gate records the actual spawned arguments (configured model via `-m`, visible reviewer effort via `model_reasoning_effort`, ephemeral effort fixed to `low`), proves reviews remain readable Markdown on the dedicated Reviewer task, exercises DSH-led/bridge/demo-smoke authority flows, and asserts the bridge Desktop opener is called zero times. `DSH_CODEX_LIFECYCLE_MODEL`, `DSH_CODEX_LIFECYCLE_EFFORT`, and `DSH_CODEX_LIFECYCLE_TIMEOUT_MS` control the real acceptance without changing runtime defaults.
 
 ## Codex-led flow (preferred)
 
@@ -65,15 +65,15 @@ $payload = '{"task":"实现搜索功能","planMarkdown":"<proposed_plan>…</pro
 $payload | dsh-codex-workflow dispatch --cwd $PWD --codex-thread $env:CODEX_THREAD_ID --stdin
 ```
 
-The bridge resolves the exact session (explicit `--dsh-session` wins; otherwise the cwd must match exactly one live session, and ambiguity fails loudly). DSH receives the plan as a plugin relay message and implements it. When done, DSH calls `codex_workflow_submit`; the plugin validates the **exact stored Codex task id** read-only and resumes that same task for the readable audit:
+The bridge resolves the exact session (explicit `--dsh-session` wins; otherwise the cwd must match exactly one live session, and ambiguity fails loudly). DSH receives the plan as a plugin relay message and implements it. When done, DSH calls `codex_workflow_submit`; the plugin validates the **exact stored Codex task id** read-only, then runs the readable audit on the workflow's **dedicated Reviewer task** — the originating task is never resumed and never written:
 
 ```text
 Planner/source Codex task --App Server--> readable plan
-same visible task --codex exec --json resume--> visible Markdown review/reconciliation
+dedicated Reviewer task --codex exec --json resume--> visible Markdown review/reconciliation
 independent CLI session --ephemeral --output-schema--> normalization/alignment JSON
 ```
 
-The first successful review binding persists `reviewerThreadId` as the same value as the original Planner/source task; every later review resumes it again. Old records that already contain a distinct `reviewerThreadId` always prefer that task over `codexThreadId`, including writer release and callback persistence. The visible CLI receives `-m <reviewerModel>` when configured and `-c model_reasoning_effort="<reviewerEffort>"`; a blank model omits `-m` and uses the CLI default. Active-writer/rate-limit conditions remain retryable and never create a replacement task.
+**The Reviewer never shares a task (1.1.0).** The first successful review binding creates a separate Reviewer task and persists it as `reviewerThreadId`; every later review, repair round and re-review resumes that same task, and writer release targets only it. A review never resumes the Planner task or the bridge's originating task, so an external writer holding them can no longer block a review with `thread-store conflict: thread X already has an active writer` — Codex Desktop keeps exactly such a writer lock on every thread it has loaded, and the plugin has no way to release it. Records written before 1.1.0 whose `reviewerThreadId` still aliases the Planner/source task are migrated lazily: the next review binds a dedicated Reviewer and replaces the alias. The visible CLI receives `-m <reviewerModel>` when configured and `-c model_reasoning_effort="<reviewerEffort>"`; a blank model omits `-m` and uses the CLI default. Active-writer/rate-limit conditions remain retryable, and a retry can no longer be blocked by the Planner or originating task.
 
 **The durable workflow history is human-readable.** Visible Planner/Reviewer turns never carry an `outputSchema`: each CLI review is readable Markdown (VERDICT / FINDINGS with severity, blocking and file:line / TEST GAPS / SUMMARY) in the original task's language. Structured normalization and authority alignment use independent `--ephemeral` CLI sessions with the same effective model and `model_reasoning_effort="low"`; they never use `resume`, never enter Desktop history, and never persist an internal id into `plannerThreadId`, `reviewerThreadId`, or `codexThreadId`.
 
@@ -81,17 +81,23 @@ The first successful review binding persists `reviewerThreadId` as the same valu
 
 **Review authority alignment (1.0.10).** After the visible review is normalized into the structured verdict, an INVISIBLE ephemeral fork (same read-only conversion machinery, low effort) checks every finding/test gap against an authority hierarchy: 1. a REPRODUCIBLE critical/high correctness/security/data-corruption defect (must carry concrete file:line + failing-scenario evidence) > 2. the ORIGINAL TASK and its explicit constraints (file scope, exact test counts, dependency limits, acceptance method) > 3. the APPROVED PLAN > 4. the previously applied findings and the current fix summary > 5. generic quality suggestions. Ordinary scope/test-count/verification-method conflicts resolve in the plan's favor: automated tests, STATIC CHECKS and REAL COMMAND verification are all formal evidence of a requirement — the Reviewer may no longer demand automated tests for behavior the task/plan verifies by real commands, and may not demand changes that exceed the task/plan's explicit bounds (a level-1 exception with reproducible evidence is the only override). The Planner contract mirrors this: it must never strengthen "tests cover A and B" into "exactly two tests" unless the user explicitly limited the count.
 
-**The visible review is contract-checked from CLI JSONL.** The dispatcher extracts the last completed `agent_message`, requires the four readable section lines and the original task's language, and never accepts a structured ReviewResult envelope as visible output. A display violation may run one corrective visible CLI resume on the same task. No completion path calls App Server `thread/read`, `thread/fork`, `resumeThread`, or any Desktop navigation/refresh API; the Markdown is already persisted by CLI resume and the user can inspect the task later.
+**The visible review is contract-checked from CLI JSONL.** The dispatcher extracts the last completed `agent_message`, requires the four readable section lines and the original task's language, and never accepts a structured ReviewResult envelope as visible output. A display violation may run one corrective visible CLI resume on the same **dedicated Reviewer** task. No completion path calls App Server `thread/read`, `thread/fork`, `resumeThread`, or any Desktop navigation/refresh API; the Markdown is already persisted by CLI resume and the user can inspect the task later.
 
 **Conflicts never cost the user a review cycle and never ask DSH to change code.** A conflict does not overwrite `latestReview`, increment `reviewCycles`, enter `fixing`, or send a fix instruction. One reconciliation CLI resume may rewrite the complete verdict on the same task; its prompt contains an explicit preservation manifest for every non-conflicting finding/test gap. Deterministic multiset checks reject deletion, field changes, duplicate-count drift and unrelated additions before re-alignment. A successful correction applies as one business cycle; two consecutive unresolved contract conflicts block without consuming a cycle.
 
 ### Reviewer writer-lock semantics
 
-Before a visible CLI review or reconciliation, the plugin calls `thread/unsubscribe`/writer release for the selected visible task (`reviewerThreadId ?? codexThreadId`). After CLI completion it performs only idempotent cleanup: it does not re-subscribe, call `resumeThread`, read/fork the task for display, or invoke the Desktop opener. The review remains on the existing task; users open it manually when convenient. Legacy opener fields remain compatible but CLI audit records keep `desktopOpenState: "disabled"`.
+Before a visible CLI review or reconciliation, the plugin calls `thread/unsubscribe`/writer release for the selected visible task (`reviewerThreadId` — always a dedicated Reviewer task since 1.1.0). After CLI completion it performs only idempotent cleanup: it does not re-subscribe, call `resumeThread`, read/fork the task for display, or invoke the Desktop opener. The review remains on that Reviewer task; users open it manually when convenient. Legacy opener fields remain compatible but CLI audit records keep `desktopOpenState: "disabled"`.
+
+### Transient upstream failures are retried (1.1.1)
+
+Capacity and throttling problems are temporary, so they never end a workflow any more. One shared policy (`src/transient-retry.ts`) classifies `server_overloaded` / "Selected model is at capacity" / 429 / `usage limit` / 502-504 / dropped streams / a thread writer held by another process, and retries the operation with exponential backoff plus jitter inside `transientRetryBudgetMs` (default 20 minutes). It covers the CLI audit (`review`, `createReview`, `reconcile`, the display rewrite), the App Server turns (planner start/continue, the completion turn, the display rewrite, reconciliation) and `normalize`/`align`.
+
+Terminal conditions are never retried: a thread that does not exist, schema or display-contract violations, approvals, and any cancellation. A visible turn is retried only when it failed WITHOUT producing visible output, so a retry can never duplicate a plan, an audit or a rewrite, and a pending backoff is interrupted immediately by cancel/teardown. When the budget is spent the outcome stays RETRYABLE (the workflow records the reason and the user can run it again) — it is never reported as a terminal failure. Long diagnostics keep head AND tail, so the persisted error always shows the real reason.
 
 ### How the verdict comes back (automatic path)
 
-`codex_workflow_submit` returns as soon as the submission and evidence are durably stored. A manager-owned backend CLI review then appends readable Markdown to the selected existing task; ephemeral CLI normalization/alignment produce the internal structured result. The plugin validates and stages that verdict, enqueues the deterministic `submit_verdict`, and the bridge runtime relays the outcome to the original DSH session. The CLI child never writes the bridge queue itself.
+`codex_workflow_submit` returns as soon as the submission and evidence are durably stored. A manager-owned backend CLI review then appends readable Markdown to the workflow's dedicated Reviewer task; ephemeral CLI normalization/alignment produce the internal structured result. The plugin validates and stages that verdict, enqueues the deterministic `submit_verdict`, and the bridge runtime relays the outcome to the original DSH session. The CLI child never writes the bridge queue itself.
 
 No periodic progress messages are injected while a review is running; `codex_workflow_status` is the on-demand progress view. Busy and rate-limit conditions remain silent background retries. Invalid task ids, missing final agent messages and terminal CLI process failures are persisted as an idempotent `submission_notice` and wake the original DSH session exactly once, including after a plugin restart.
 
@@ -153,7 +159,7 @@ Questions, explanations, translation, read-only inspection/research and Git-only
 planning -> waiting_input -> executing -> reviewing -> fixing -> passed
 executing/fixing -> codex_workflow_submit (returns immediately) -> queued -> sending -> retrying -> verdict_ready -> received -> applied -> delivered
                                                              `-> failed (invalid thread, no verdict, invalid identity/schema)
-first sending: read-only source validation -> resume source task for review; later sending: resume that same task
+first sending: read-only source validation -> create + resume the dedicated Reviewer task; later sending: resume that same Reviewer task
 verdict_ready: verdict staged in the record; enqueue pending (crash-recoverable)
 received:      verdict command queued for application
 applied:       outcome persisted (pass | fixing | waiting_review_decision | blocked | refused-if-changed)
@@ -187,7 +193,7 @@ Workflow records, leases, the bridge queue and the **live-session registry all l
 `dsh-codex-workflow` is also the audit/ops surface (all commands support `--json`):
 
 - `workflows [--cwd] [--dsh-session] [--phase]` — list workflow summaries (never payloads).
-- `show --workflow <id>` — plugin version plus one workflow's source/review task ids, stage, submission/callback state, review cycle, last error and evidence summary. In new planned/bridge workflows both ids intentionally identify the same Codex task; old workflows may still report a distinct Reviewer id.
+- `show --workflow <id>` — plugin version plus one workflow's source/review task ids, stage, submission/callback state, review cycle, last error and evidence summary. Since 1.1.0 the Reviewer id always names a dedicated Reviewer task, distinct from the Planner/source id; records written before 1.1.0 may still show a shared id until their next review migrates them.
 - `queue [--status <status>]` — queue/receipt/dead-letter rows with attempts, next retry and last error (never command payloads).
 - `retry --request <id>` — requeue a `dead-letter` request or a legacy imported `failed` row; idempotent, and refuses active or completed rows. A cancelled receipt is stored on a completed `done` row and is never retried.
 - `prune [--older-than <ms>] [--commit]` — dry-run by default; `--commit` removes only **terminal** receipts and passed/cancelled workflows older than the retention window. Active workflows, undelivered verdicts and failed/blocked diagnostics are never candidates.
@@ -215,6 +221,10 @@ Defaults in `cordis.patch.yml`:
 - `callbackTimeoutMs`: `600000` (10 s–30 min)
 - `callbackMaxAttempts`: `3` (1–10 attempts per persistent recovery round)
 - `callbackRetryBaseMs`: `2000` (200 ms–5 min)
+- `transientRetryBaseMs`: `3000` (200 ms–5 min; first backoff for a TRANSIENT upstream failure)
+- `transientRetryMaxMs`: `60000` (200 ms–15 min; per-attempt backoff ceiling)
+- `transientRetryBudgetMs`: `1200000` (0–2 h; total wall clock one operation may spend retrying; `0` disables automatic retry)
+- `transientRetryJitterRatio`: `0.25` (0–1; ±jitter applied to every backoff)
 - `turnTimeoutMs`: `600000`
 - `idleProcessMs`: `5000` (starts only after all App Server work is idle)
 - `terminalRelayTimeoutMs`: `60000` (0 disables; maximum 10 minutes; cancels only a stuck terminal pass relay and preserves inbox work)

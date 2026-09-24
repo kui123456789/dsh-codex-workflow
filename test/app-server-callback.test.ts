@@ -43,7 +43,7 @@ async function waitForFileText(path: string, timeoutMs = 10_000): Promise<string
   }
 }
 
-test("validates and reuses the source Codex task for every background review", async () => {
+test("creates and reuses a dedicated Reviewer task for every background review, never touching the origin task", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-app-server-callback-"));
   const marker = join(directory, "calls.jsonl");
   const codex = new CodexAppServerClient({
@@ -78,7 +78,10 @@ test("validates and reuses the source Codex task for every background review", a
     };
     const first = await callback.send(request);
     assert.deepEqual(first, { kind: "verdict", verdict: { verdict: "pass", findings: [], testGaps: [], summary: "ok" } });
-    assert.equal(reviewerThreadId, request.codexThreadId);
+    // 1.1.0: the review runs on a DEDICATED Reviewer task. The originating
+    // task is never resumed, read, renamed or written, so an external writer
+    // holding it (Codex Desktop) can never block the review.
+    assert.notEqual(reviewerThreadId, request.codexThreadId, "the Reviewer is a dedicated task, never the origin task");
     // request.onStarted fires ONLY for the visible Reviewer turn — the
     // ephemeral conversion fork reports through onEphemeralStarted, so the
     // persisted Reviewer ids are never overwritten by a fork id.
@@ -91,7 +94,7 @@ test("validates and reuses the source Codex task for every background review", a
       ...request,
       submissionId: "submission-2",
       reviewerThreadId,
-      onThread: () => { throw new Error("the already-bound source task must not be registered again"); },
+      onThread: () => { throw new Error("the already-bound dedicated Reviewer must not be registered again"); },
     });
     assert.equal(second.kind, "verdict");
 
@@ -99,7 +102,6 @@ test("validates and reuses the source Codex task for every background review", a
       method: string;
       params: Record<string, any>;
     });
-    const reads = calls.filter((call) => call.method === "thread/read");
     const starts = calls.filter((call) => call.method === "thread/start");
     const forks = calls.filter((call) => call.method === "thread/fork");
     const resumes = calls.filter((call) => call.method === "thread/resume");
@@ -108,25 +110,28 @@ test("validates and reuses the source Codex task for every background review", a
     const name = calls.find((call) => call.method === "thread/name/set");
     const unsubs = calls.filter((call) => call.method === "thread/unsubscribe");
 
-    // First review validates the source read-only, then resumes that SAME task.
-    // No second durable Codex task is created or renamed.
-    const sourceReads = reads.filter((call) => call.params.includeTurns !== true);
-    assert.equal(sourceReads.length, 1);
-    assert.equal(sourceReads[0]?.params.threadId, request.codexThreadId);
-    assert.equal(sourceReads[0]?.params.includeTurns, false, "source validation must not load turns");
-    assert.equal(starts.length, 0, "review never creates another visible Codex task");
-    assert.equal(settings, undefined, "the callback does not replace the source task settings");
-    assert.equal(name, undefined, "the source task keeps its original name");
+    // The originating task is NEVER touched by a review (no read, no resume,
+    // no settings, no rename, no turn).
+    const originCalls = calls.filter((call) => call.params.threadId === request.codexThreadId);
+    assert.equal(originCalls.length, 0,
+      `the originating task must never be touched: ${originCalls.map((call) => call.method).join(", ")}`);
+    // The first review creates exactly ONE new durable task: the dedicated
+    // Reviewer, named for the workflow.
+    assert.equal(starts.length, 1, "the first review creates its own dedicated Reviewer task");
+    assert.equal(name?.params.name, "DSH Reviewer: workflow-1", "the dedicated Reviewer is named for the workflow");
+    assert.notEqual(name?.params.threadId, request.codexThreadId, "the origin task keeps its original name");
+    assert.ok(settings, "the dedicated Reviewer receives the readable review instructions");
+    assert.notEqual(settings?.params.threadId, request.codexThreadId, "the origin task settings are never replaced");
 
     // One ephemeral conversion fork per review cycle, always created from the
-    // SAME persistent source task.
+    // DEDICATED Reviewer task.
     assert.equal(forks.length, 2, "one ephemeral conversion fork per review cycle");
     assert.ok(forks.every((call) => call.params.ephemeral === true), "conversion forks are always ephemeral");
-    assert.ok(forks.every((call) => call.params.threadId === request.codexThreadId), "forks are created from the shared workflow task");
+    assert.ok(forks.every((call) => call.params.threadId === reviewerThreadId), "forks are created from the dedicated Reviewer task");
     assert.ok(forks.every((call) => call.params.cwd === directory), "forks bind the workflow cwd");
 
-    assert.equal(resumes.length, 2, "each review resumes the shared task before writing its visible turn");
-    assert.ok(resumes.every((call) => call.params.threadId === request.codexThreadId));
+    assert.equal(resumes.length, 2, "each review resumes the dedicated Reviewer task before writing its visible turn");
+    assert.ok(resumes.every((call) => call.params.threadId === reviewerThreadId));
 
     // FOUR turns per two cycles: two VISIBLE review turns (no outputSchema,
     // safe settings) and two EPHEMERAL conversion turns (with the schema,
@@ -166,9 +171,9 @@ test("validates and reuses the source Codex task for every background review", a
     // The plugin releases its App Server subscription after each review; this
     // does not delete or hide the persistent Codex task. Each ephemeral fork is
     // also released exactly once.
-    assert.equal(unsubs.length, 4, "2 shared-task releases + 2 fork releases");
-    assert.equal(unsubs.filter((call) => call.params.threadId === request.codexThreadId).length, 2);
-    const forkUnsubs = unsubs.filter((call) => call.params.threadId !== request.codexThreadId);
+    assert.equal(unsubs.length, 4, "2 dedicated-Reviewer releases + 2 fork releases");
+    assert.equal(unsubs.filter((call) => call.params.threadId === reviewerThreadId).length, 2);
+    const forkUnsubs = unsubs.filter((call) => call.params.threadId !== reviewerThreadId);
     assert.equal(forkUnsubs.length, 2, "each ephemeral fork is released exactly once");
   } finally {
     await callback.stop();
@@ -222,7 +227,7 @@ test("the background path rewrites a display-violating visible review on the SAM
     });
     const starts = calls.filter((call) => call.method === "thread/start");
     const turns = calls.filter((call) => call.method === "turn/start");
-    assert.equal(starts.length, 0, "the review reuses the source task instead of creating another visible task");
+    assert.equal(starts.length, 1, "the review creates exactly ONE dedicated Reviewer task");
     const visible = turns.filter((call) => !call.params.outputSchema);
     const conversions = turns.filter((call) => call.params.outputSchema);
     // Visible review turn + one display-rewrite turn on the SAME thread, then
@@ -359,7 +364,8 @@ test("the background path rewrites on the PERSISTED read-back: compliant streame
     const conversions = calls.filter((call) => call.method === "turn/start" && call.params.outputSchema);
     assert.equal(conversions.length, 1);
     assert.match(conversions[0]?.params.input?.[0]?.text ?? "", /实现需调整，测试需补齐/, "the conversion consumes the rewrite's persisted final message");
-    assert.equal(calls.filter((call) => call.method === "thread/start").length, 0, "no second visible task is created");
+    assert.equal(calls.filter((call) => call.method === "thread/start").length, 1,
+      "exactly ONE dedicated Reviewer task is created — never a second visible task");
     // The persisted rollout ids DELIBERATELY differ from the RPC turn ids
     // (real App Server evidence) — the read-back located the appended turns
     // via the baseline id set, never by RPC-id equality.
@@ -453,7 +459,7 @@ test("a missing source task is a terminal invalid thread", async () => {
   }
 });
 
-test("an active writer on the shared source task is retried instead of creating another task", async () => {
+test("a busy originating task never blocks the review: a dedicated Reviewer task is created instead", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-app-server-callback-writer-"));
   const marker = join(directory, "calls.jsonl");
   const codex = new CodexAppServerClient({
@@ -472,29 +478,40 @@ test("an active writer on the shared source task is retried instead of creating 
   });
   const callback = new AppServerCodexCallbackDispatcher(codex);
   try {
+    let reviewerThreadId = "";
+    // REGRESSION (1.1.0): the originating task is held by an external writer —
+    // exactly the Codex Desktop condition that used to freeze reviews with
+    // "thread-store conflict: ... already has an active writer". The review
+    // must still produce a verdict on its own dedicated Reviewer task.
     const result = await callback.send({
       workflowId: "workflow-writer",
       submissionId: "submission-writer",
       codexThreadId: "origin-task-writer",
       cwd: directory,
       prompt: "Review the implementation.",
-      onThread: () => { throw new Error("a busy source task must not be persisted as active"); },
+      onThread: (threadId: string) => { reviewerThreadId = threadId; },
     });
-    assert.deepEqual(result, { kind: "retryable_busy", reason: "active writer" });
+    assert.deepEqual(result, { kind: "verdict", verdict: { verdict: "pass", findings: [], testGaps: [], summary: "ok" } });
+    assert.ok(reviewerThreadId, "the dedicated Reviewer identity is reported for persistence");
+    assert.notEqual(reviewerThreadId, "origin-task-writer");
 
     const calls = (await readFile(marker, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
       method: string;
       params: Record<string, any>;
     });
-    // Validation remains read-only, but review must resume the exact source
-    // task. A writer conflict is therefore an explicit retry condition; the
-    // plugin never escapes it by creating a second visible task.
-    const sourceReads = calls.filter((call) => call.method === "thread/read" && call.params.includeTurns !== true);
-    assert.deepEqual(sourceReads.map((call) => call.method), ["thread/read"]);
-    assert.equal(sourceReads.find((call) => call.method === "thread/read")?.params.threadId, "origin-task-writer");
-    assert.equal(calls.filter((call) => call.method === "thread/resume").length, 1);
-    assert.equal(calls.filter((call) => call.method === "thread/start").length, 0);
-    assert.equal(calls.filter((call) => call.method === "turn/start").length, 0);
+    // The busy originating task is NEVER touched: no resume, no read, no turn.
+    const originCalls = calls.filter((call) => call.params.threadId === "origin-task-writer");
+    assert.equal(originCalls.length, 0,
+      `the busy origin task must never be touched: ${originCalls.map((call) => call.method).join(", ")}`);
+    assert.equal(calls.filter((call) => call.method === "thread/start").length, 1, "one dedicated Reviewer task is created");
+    assert.ok(calls.filter((call) => call.method === "thread/resume").every((call) => call.params.threadId === reviewerThreadId));
+    const turns = calls.filter((call) => call.method === "turn/start");
+    const visible = turns.filter((call) => !call.params.outputSchema);
+    const conversions = turns.filter((call) => call.params.outputSchema);
+    assert.equal(visible.length, 1);
+    assert.ok(visible.every((call) => call.params.threadId === reviewerThreadId), "the visible review runs on the dedicated Reviewer");
+    assert.ok(conversions.every((call) => call.params.threadId !== reviewerThreadId && call.params.threadId !== "origin-task-writer"),
+      "the conversion runs on its own ephemeral fork");
   } finally {
     await callback.stop();
     await codex.stop();
@@ -587,7 +604,7 @@ test("cancel interrupts the active review turn on the shared source task", async
   try {
     const sending = callback.send(request, controller.signal);
     await waitForValue(() => started);
-    assert.equal(started!.threadId, request.codexThreadId, "the active review is appended to the source task");
+    assert.notEqual(started!.threadId, request.codexThreadId, "the active review runs on the dedicated Reviewer task");
     // Cancelling the workflow interrupts the running review turn on that task.
     callback.cancel(request.workflowId);
     // Unblock the hanging turn so teardown and the rejection settle.
@@ -596,7 +613,7 @@ test("cancel interrupts the active review turn on the shared source task", async
     const [thread, turn] = (await waitForFileText(marker)).trim().split(":");
     assert.equal(thread, started!.threadId, "interrupt must target the active review turn");
     assert.ok(turn);
-    assert.equal(thread, request.codexThreadId);
+    assert.notEqual(thread, request.codexThreadId, "the originating task is never interrupted");
     // Cancellation releases the plugin's subscription exactly once.
     const calls = (await readFile(callsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
       method: string;
@@ -633,12 +650,14 @@ test("cancel latches the visible->fork window: a fork that starts after cancel i
   });
   const callback = new AppServerCodexCallbackDispatcher(codex);
   try {
+    let reviewerThreadId = "";
     const request = {
       workflowId: "wf-latch",
       submissionId: "sub-latch",
       codexThreadId: "origin-latch",
       cwd: directory,
       prompt: "Review.",
+      onThread: (threadId: string) => { reviewerThreadId = threadId; },
     };
     const sending = callback.send(request);
     // The visible turn has COMPLETED and the fork RPC is now HELD: we are
@@ -660,11 +679,11 @@ test("cancel latches the visible->fork window: a fork that starts after cancel i
     // The freshly started FORK turn was interrupted (the marker reflects the
     // last interrupt: the fork's thread/turn — never the source task).
     const [thread, turn] = (await waitForFileText(interruptFile)).trim().split(":");
-    assert.notEqual(thread, request.codexThreadId, "the source task is never interrupted");
+    assert.notEqual(thread, request.codexThreadId, "the originating task is never interrupted");
     assert.ok(thread && turn, "the fork turn was interrupted");
 
-    // Both the durable Reviewer and the ephemeral fork were released exactly
-    // once; the old owner's fork never kept running.
+    // Both the durable dedicated Reviewer and the ephemeral fork were released
+    // exactly once; the old owner's fork never kept running.
     const calls = (await readFile(callsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
       method: string;
       params: Record<string, any>;
@@ -673,7 +692,9 @@ test("cancel latches the visible->fork window: a fork that starts after cancel i
     assert.equal(unsubs.length, 2, "the fork AND the durable Reviewer are each released once");
     const unsubThreads = new Set(unsubs.map((call) => call.params.threadId));
     assert.equal(unsubThreads.size, 2, "two distinct threads were released");
-    assert.ok(unsubs.some((call) => call.params.threadId === request.codexThreadId));
+    assert.ok(reviewerThreadId && reviewerThreadId !== request.codexThreadId);
+    assert.ok(unsubs.some((call) => call.params.threadId === reviewerThreadId), "the dedicated Reviewer is released");
+    assert.ok(!unsubs.some((call) => call.params.threadId === request.codexThreadId), "the originating task is never released");
   } finally {
     await callback.stop();
     await codex.stop();
@@ -717,8 +738,9 @@ test("an invalid normalization output is RETRYABLE, never a terminal failure", a
       params: Record<string, any>;
     });
     const unsubs = calls.filter((call) => call.method === "thread/unsubscribe");
-    assert.equal(unsubs.length, 2, "the fork AND the durable Reviewer are released exactly once");
-    assert.ok(unsubs.some((call) => call.params.threadId === "origin-invalid"), "the shared task subscription is released");
+    assert.equal(unsubs.length, 2, "the fork AND the dedicated Reviewer are released exactly once");
+    assert.ok(unsubs.every((call) => call.params.threadId !== "origin-invalid"), "the originating task is never released");
+    assert.equal(new Set(unsubs.map((call) => call.params.threadId)).size, 2, "two distinct threads (Reviewer + fork) were released");
   } finally {
     await callback.stop();
     await codex.stop();
@@ -776,7 +798,7 @@ test("provisional pass messages are never applied; only the final changes_reques
     });
     const unsubs = calls.filter((call) => call.method === "thread/unsubscribe");
     assert.equal(unsubs.length, 2, "a changes_requested verdict releases the Reviewer and the fork once each");
-    assert.ok(unsubs.some((call) => call.params.threadId === "origin-prov"));
+    assert.ok(unsubs.every((call) => call.params.threadId !== "origin-prov"), "the originating task is never released");
   } finally {
     await callback.stop();
     await codex.stop();
@@ -892,7 +914,7 @@ test("a failed normalization turn never produces a verdict and stays retryable",
   }
 });
 
-test("a source-task binding persistence failure releases the resumed subscription once", async () => {
+test("a dedicated-Reviewer binding persistence failure releases the resumed subscription once", async () => {
     const directory = await mkdtemp(join(tmpdir(), "dsh-callback-source-bind-"));
     const marker = join(directory, "calls.jsonl");
     const codex = new CodexAppServerClient({
@@ -919,10 +941,13 @@ test("a source-task binding persistence failure releases the resumed subscriptio
         method: string;
         params: Record<string, any>;
       });
-      assert.equal(calls.filter((call) => call.method === "thread/start").length, 0, "no replacement task was created");
+      assert.equal(calls.filter((call) => call.method === "thread/start").length, 1,
+        "the dedicated Reviewer task is created before its binding is persisted");
       const unsubs = calls.filter((call) => call.method === "thread/unsubscribe");
-      assert.equal(unsubs.length, 1, "the resumed source subscription is released exactly once");
-      assert.equal(unsubs[0]?.params.threadId, "origin-bind");
+      assert.equal(unsubs.length, 1, "the resumed Reviewer subscription is released exactly once");
+      assert.notEqual(unsubs[0]?.params.threadId, "origin-bind", "the originating task is never released");
+      assert.equal(calls.filter((call) => call.params.threadId === "origin-bind").length, 0,
+        "the originating task is never touched by a review");
     } finally {
       await callback.stop();
       await codex.stop();
@@ -963,15 +988,15 @@ test("two concurrent reviewers on separate threads release each thread independe
     const starts = calls.filter((call) => call.method === "thread/start");
     const forks = calls.filter((call) => call.method === "thread/fork");
     const unsubs = calls.filter((call) => call.method === "thread/unsubscribe");
-    // Two source tasks are resumed and released independently, plus two
-    // ephemeral conversion forks.
-    assert.equal(starts.length, 0);
+    // 1.1.0: each review creates its OWN dedicated Reviewer task; the two
+    // originating tasks are never resumed, released or otherwise touched.
+    assert.equal(starts.length, 2, "one dedicated Reviewer task per workflow");
     assert.equal(forks.length, 2);
     assert.equal(unsubs.length, 4);
     const unsubThreads = new Set(unsubs.map((call) => call.params.threadId));
-    assert.equal(unsubThreads.size, 4, "2 source tasks + 2 fork threads all released");
-    assert.ok(unsubs.some((call) => call.params.threadId === "origin-a"));
-    assert.ok(unsubs.some((call) => call.params.threadId === "origin-b"));
+    assert.equal(unsubThreads.size, 4, "2 dedicated Reviewers + 2 fork threads all released");
+    const originTouched = calls.filter((call) => call.params.threadId === "origin-a" || call.params.threadId === "origin-b");
+    assert.equal(originTouched.length, 0, "the originating tasks are never touched by a review");
   } finally {
     await callback.stop();
     await codex.stop();

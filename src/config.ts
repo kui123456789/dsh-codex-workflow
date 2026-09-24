@@ -30,6 +30,15 @@ export const Config = z.object({
   callbackTimeoutMs: z.number().default(10 * 60 * 1000),
   callbackMaxAttempts: z.number().default(3),
   callbackRetryBaseMs: z.number().default(2000),
+  /** 1.1.1 transient-upstream retry policy (shared by the CLI audit, the App
+   * Server turns and the submission callback). `server_overloaded` / 429 / 5xx
+   * are TEMPORARY: the plugin now backs off and tries again inside these
+   * bounds instead of ending the workflow and asking a human to redo the call.
+   * Budget 0 disables the automatic retry entirely. */
+  transientRetryBaseMs: z.number().default(3_000),
+  transientRetryMaxMs: z.number().default(60_000),
+  transientRetryBudgetMs: z.number().default(20 * 60 * 1000),
+  transientRetryJitterRatio: z.number().default(0.25),
   leaseTtlMs: z.number().default(60_000),
   turnTimeoutMs: z.number().default(10 * 60 * 1000),
   idleProcessMs: z.number().default(5_000),

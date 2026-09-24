@@ -382,15 +382,97 @@ const config: WorkflowConfig = {
   callbackTimeoutMs: 10_000,
   callbackMaxAttempts: 3,
   callbackRetryBaseMs: 200,
+  // 1.1.1 fast-but-real transient retry bounds (tests must not wait seconds).
+  transientRetryBaseMs: 1,
+  transientRetryMaxMs: 5,
+  transientRetryBudgetMs: 1_000,
+  transientRetryJitterRatio: 0,
   turnTimeoutMs: 10_000,
   idleProcessMs: 0,
   terminalRelayTimeoutMs: 60_000,
   storageDir: "",
 };
 
-function manager(directory: string, gateway = new FakeGateway(), overrides: Partial<WorkflowConfig> = {}, callback?: CodexCallback, bridgeQueue?: { enqueue(command: BridgeCommand): Promise<string> }, audit?: CodexCliAuditGateway) {
-  return new WorkflowManager(new WorkflowStore(directory), gateway, { ...config, ...overrides, storageDir: directory }, callback, bridgeQueue, audit);
+function manager(
+  directory: string,
+  gateway = new FakeGateway(),
+  overrides: Partial<WorkflowConfig> = {},
+  callback?: CodexCallback,
+  bridgeQueue?: { enqueue(command: BridgeCommand): Promise<string> },
+  audit?: CodexCliAuditGateway,
+  /** 1.1.1 test seams for the transient-retry backoff (no real waits). */
+  retryHooks?: { sleep?: (ms: number, signal?: AbortSignal) => Promise<void>; now?: () => number; random?: () => number },
+) {
+  return new WorkflowManager(new WorkflowStore(directory), gateway, { ...config, ...overrides, storageDir: directory }, callback, bridgeQueue, audit, retryHooks);
 }
+
+/** Gateway whose N first turns fail with a scripted error (1.1.1 retry tests). */
+class FlakyTurnGateway extends FakeGateway {
+  attempts = 0;
+  constructor(private readonly failure: { message: string; times: number }) { super(); }
+
+  override async startTurn(
+    threadId: string,
+    options?: Parameters<FakeGateway["startTurn"]>[1],
+  ) {
+    this.attempts += 1;
+    if (this.attempts <= this.failure.times) {
+      // A turn that FAILED before producing any visible output: nothing was
+      // persisted, so re-running it is safe.
+      return {
+        kind: "completed" as const,
+        threadId,
+        turnId: `failed-turn-${this.attempts}`,
+        status: "failed" as const,
+        text: "",
+        error: this.failure.message,
+      };
+    }
+    return super.startTurn(threadId, options);
+  }
+}
+
+/**
+ * 1.1.1 regression (the reported bug): an upstream `server_overloaded` reply
+ * ("Selected model is at capacity. Please try a different model.") on a visible
+ * turn used to fail the whole tool call and stall the workflow until a human
+ * ran it again. It is now retried inside the tool with the shared backoff.
+ */
+test("1.1.1: a server_overloaded planner turn is retried inside the tool instead of stalling the workflow", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-transient-planner-"));
+  try {
+    const gateway = new FlakyTurnGateway({
+      message: "Selected model is at capacity. Please try a different model.",
+      times: 1,
+    });
+    const instance = manager(directory, gateway, {}, undefined, undefined, undefined, {
+      sleep: async () => undefined,
+      random: () => 0.5,
+    });
+    const exec = fakeExec("session-transient-planner", directory, []);
+    const planned = await instance.start({ task: "Build it" }, exec);
+    assert.equal(planned.phase, "executing", "the workflow still starts");
+    assert.equal(gateway.attempts, 2, "the overloaded turn was retried ONCE inside the tool");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("1.1.1: a TERMINAL planner failure is never retried", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-terminal-planner-"));
+  try {
+    const gateway = new FlakyTurnGateway({ message: "codex thread 01a0 does not exist", times: 1 });
+    const instance = manager(directory, gateway, {}, undefined, undefined, undefined, {
+      sleep: async () => undefined,
+      random: () => 0.5,
+    });
+    const exec = fakeExec("session-terminal-planner", directory, []);
+    await instance.start({ task: "Build it" }, exec).catch(() => undefined);
+    assert.equal(gateway.attempts, 1, "a terminal failure fails fast, exactly as before");
+  } finally {
+    await rmClosed(directory);
+  }
+});
 
 /** Deterministic callback double: queue results; record every resume request. */
 class FakeCallback implements CodexCallback {
@@ -500,17 +582,22 @@ test("runs plan, repair, and review in the original DSH session", async () => {
     assert.equal(planned.mode, "planned");
     const first = await managerInstance.review(planned.id, { implementationSummary: "Implemented", testResults: "pass" }, exec);
     assert.equal(first.phase, "fixing");
-    assert.equal(first.reviewerThreadId, "planner-thread");
+    // 1.1.0: the Reviewer is a DEDICATED task — never the Planner task.
+    assert.equal(first.reviewerThreadId, "reviewer-thread");
+    assert.notEqual(first.reviewerThreadId, first.plannerThreadId, "the Reviewer never aliases the Planner task");
     const second = await managerInstance.review(planned.id, { implementationSummary: "Fixed", testResults: "pass" }, exec);
     assert.equal(second.phase, "passed");
-    // Planned workflows append every review to the original Planner task. No
-    // second visible Reviewer task is created; both rounds refresh the review
-    // contract on the shared task.
-    assert.equal(gateway.reviewerThreadCalls.length, 0);
-    assert.equal(gateway.instructionCalls.length, 2);
-    assert.deepEqual(gateway.reviewThreads, ["planner-thread", "planner-thread"]);
-    assert.deepEqual(gateway.reviewStarts[0], { threadId: "planner-thread", detached: false });
-    assert.deepEqual(gateway.reviewStarts[1], { threadId: "planner-thread", detached: false });
+    // The FIRST round creates the dedicated Reviewer (its readable contract
+    // rides that creation); the second round resumes it and refreshes the
+    // per-round context. The Planner task is never a review target.
+    assert.equal(gateway.reviewerThreadCalls.length, 1);
+    assert.equal(gateway.instructionCalls.length, 1);
+    assert.match(gateway.reviewerThreadCalls[0]?.developerInstructions ?? "", /Build it/, "the dedicated Reviewer carries the readable review contract");
+    assert.deepEqual(gateway.reviewThreads, ["reviewer-thread", "reviewer-thread"]);
+    assert.deepEqual(gateway.reviewStarts[0], { threadId: "reviewer-thread", detached: false });
+    assert.deepEqual(gateway.reviewStarts[1], { threadId: "reviewer-thread", detached: false });
+    assert.ok(!gateway.resumeCalls.includes("planner-thread"), "a review never resumes the Planner task");
+    assert.ok(gateway.resumeCalls.includes("reviewer-thread"));
     assert.ok(deferred.length >= 3);
   } finally {
     await rmClosed(directory);
@@ -1091,9 +1178,11 @@ test("Git reviews send a custom target with the full Chinese context, git scope 
     assert.ok(!/uncommittedChanges/.test(instructions), "the instructions never leak the native target type");
     // The developer-instructions channel stays populated as an AUXILIARY
     // refresh (same context), but the target above is what the verdict runs on.
-    const developer = gateway.instructionCalls[0]?.instructions ?? "";
+    const developer = gateway.reviewerThreadCalls[0]?.developerInstructions
+      ?? gateway.instructionCalls[0]?.instructions ?? "";
     assert.match(developer, /实现用户登录功能/, "same context via the auxiliary thread developer instructions");
-    assert.equal(gateway.reviewerThreadCalls.length, 0, "planned review creates no second visible task");
+    assert.equal(gateway.reviewerThreadCalls.length, 1, "the review creates exactly ONE dedicated Reviewer task");
+    assert.match(gateway.reviewerThreadCalls[0]?.name ?? "", /^DSH Reviewer:/, "the dedicated Reviewer is named for the workflow");
   } finally {
     await rmClosed(directory);
   }
@@ -1159,8 +1248,10 @@ test("non-Git reviews send a custom target with the full readable context and ga
     assert.match(instructions, /VERDICT: pass is allowed when every explicit requirement has implementation evidence \(code\) plus verification evidence of the kind the task\/plan requires/);
     assert.ok(!/git status/.test(instructions), "non-Git instructions never claim a git scope");
     assert.ok(!/untracked/.test(instructions), "non-Git instructions never mention untracked files");
-    // The developer-instructions channel is populated identically (auxiliary).
-    const developer = gateway.instructionCalls[0]?.instructions ?? "";
+    // The developer-instructions channel is populated identically on the
+    // DEDICATED Reviewer task (auxiliary).
+    const developer = gateway.reviewerThreadCalls[0]?.developerInstructions
+      ?? gateway.instructionCalls[0]?.instructions ?? "";
     assert.match(developer, /增加搜索接口/, "same context via the auxiliary thread developer instructions too");
   } finally {
     await rmClosed(directory);
@@ -1195,11 +1286,11 @@ test("a Chinese task with an English one-line review triggers one visible rewrit
     // ONE display-rewrite turn on the SAME durable Reviewer at low effort:
     // visible (no schema) and silent.
     assert.equal(gateway.rewriteCalls.length, 1, "the English one-liner triggers exactly one rewrite turn");
-    assert.equal(gateway.rewriteCalls[0]?.threadId, "planner-thread", "the rewrite runs on the shared workflow task");
+    assert.equal(gateway.rewriteCalls[0]?.threadId, "reviewer-thread", "the rewrite runs on the dedicated Reviewer task");
     assert.equal(gateway.rewriteCalls[0]?.effort, "low", "the rewrite runs at low effort");
     assert.equal(gateway.rewriteCalls[0]?.schema, undefined, "the rewrite turn is visible and never carries the JSON schema");
     assert.equal(gateway.rewriteCalls[0]?.model, "fake-default-model", "the rewrite reuses the same effective reviewer model");
-    assert.equal(gateway.reviewerThreadCalls.length, 0, "no second Reviewer task is ever created");
+    assert.equal(gateway.reviewerThreadCalls.length, 1, "exactly one dedicated Reviewer task is created");
     // The rewrite turn is the registered ACTIVE visible turn (cancel target).
     assert.ok(gateway.turnCalls.some((call) => call.schema === undefined), "the rewrite is a normal visible turn");
 
@@ -1208,10 +1299,10 @@ test("a Chinese task with an English one-line review triggers one visible rewrit
     const conversionPrompt = gateway.lastConversionPrompt() ?? "";
     assert.match(conversionPrompt, /VERDICT: pass\nFINDINGS: none\nTEST GAPS: none\nSUMMARY: 实现符合计划，测试全部通过/, "the conversion consumes the corrected authoritative text");
     assert.ok(!conversionPrompt.includes("strips sync"), "the English one-liner never reaches the conversion");
-    // The conversion fork still runs on the durable Reviewer thread id.
-    assert.equal(gateway.forkCalls.at(-1)?.threadId, "planner-thread");
-    // The SAME Reviewer id was used for the rewrite: one durable thread total.
-    assert.equal(gateway.reviewerThreadCalls.length, 0, "the Planner task is reused across the rewrite");
+    // The conversion fork still runs on the dedicated Reviewer thread id.
+    assert.equal(gateway.forkCalls.at(-1)?.threadId, "reviewer-thread");
+    // The SAME dedicated Reviewer id was used for the rewrite: one thread total.
+    assert.equal(gateway.reviewerThreadCalls.length, 1, "the dedicated Reviewer is reused across the rewrite");
   } finally {
     await rmClosed(directory);
   }
@@ -1366,10 +1457,10 @@ test("cancel during the display rewrite interrupts exactly the rewrite turn and 
     const cancelled = await instance.cancel(planned.id, exec);
     assert.equal(cancelled.phase, "cancelled");
     assert.ok(
-      gateway.interrupts.some((entry) => entry.threadId === "planner-thread" && entry.turnId === "rewrite-turn-1"),
-      "cancel interrupts the rewrite turn on the SAME Reviewer thread",
+      gateway.interrupts.some((entry) => entry.threadId === "reviewer-thread" && entry.turnId === "rewrite-turn-1"),
+      "cancel interrupts the rewrite turn on the dedicated Reviewer thread",
     );
-    assert.equal(gateway.reviewerThreadCalls.length, 0, "no second Reviewer is ever created");
+    assert.equal(gateway.reviewerThreadCalls.length, 1, "exactly one dedicated Reviewer is created");
     gateway.rewriteGate.release();
     const settled = await pendingReview;
     assert.equal(settled.phase, "cancelled", "the settling rewrite path never resurrects the workflow");
@@ -1435,9 +1526,9 @@ test("teardown interrupts an in-flight display rewrite turn", async () => {
     const pendingReview = instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.ts"] }, exec);
     await waitFor(() => gateway.rewriteCalls.length === 1);
     const stopping = instance.stop();
-    // Teardown interrupts the ACTIVE visible turn — the rewrite on the SAME
-    // durable Reviewer thread — while it is still held by the gate.
-    await waitFor(() => gateway.interrupts.some((entry) => entry.threadId === "planner-thread" && entry.turnId === "rewrite-turn-1"));
+    // Teardown interrupts the ACTIVE visible turn — the rewrite on the
+    // dedicated Reviewer thread — while it is still held by the gate.
+    await waitFor(() => gateway.interrupts.some((entry) => entry.threadId === "reviewer-thread" && entry.turnId === "rewrite-turn-1"));
     gateway.rewriteGate.release();
     await pendingReview;
     await stopping;
@@ -1473,7 +1564,7 @@ test("persisted read-back is the display authority: compliant streamed but viola
     }, exec);
     assert.equal(reviewed.phase, "fixing");
     assert.equal(gateway.rewriteCalls.length, 1, "the VIOLATING PERSISTED text triggers exactly one rewrite");
-    assert.equal(gateway.rewriteCalls[0]?.threadId, "planner-thread", "the rewrite runs on the shared workflow task");
+    assert.equal(gateway.rewriteCalls[0]?.threadId, "reviewer-thread", "the rewrite runs on the dedicated Reviewer task");
     // The PERSISTED rollout ids deliberately differ from the RPC turn ids
     // (real App Server evidence): read-back must locate the appended turn via
     // the baseline id set, never by RPC-id equality.
@@ -1487,7 +1578,7 @@ test("persisted read-back is the display authority: compliant streamed but viola
     assert.ok(!rewritePrompt.includes(DEFAULT_RAW_REVIEW), "the compliant streamed text is never the rewrite input");
     const conversionPrompt = gateway.lastConversionPrompt() ?? "";
     assert.match(conversionPrompt, /实现需调整，测试需补齐/, "the rewrite's PERSISTED final message drives the conversion");
-    assert.equal(gateway.reviewerThreadCalls.length, 0, "no second Reviewer task is ever created");
+    assert.equal(gateway.reviewerThreadCalls.length, 1, "exactly one dedicated Reviewer task is created");
   } finally {
     await rmClosed(directory);
   }
@@ -2341,14 +2432,14 @@ test("cancel interrupts a still-running review and is not overwritten when it se
     const pendingReview = instance.review(planned.id, { implementationSummary: "one", changedFiles: ["changed.txt"] }, exec);
     // The reviewer ids must be persisted while the review is still running.
     const store = new WorkflowStore(directory);
-    await waitFor(async () => (await store.load(planned.id))?.reviewerThreadId === "planner-thread");
+    await waitFor(async () => (await store.load(planned.id))?.reviewerThreadId === "reviewer-thread");
     const during = await store.load(planned.id);
-    assert.equal(during?.reviewerThreadId, "planner-thread");
+    assert.equal(during?.reviewerThreadId, "reviewer-thread");
     assert.equal(during?.reviewerTurnId, "review-turn-1");
     assert.equal(during?.phase, "reviewing");
     const cancelled = await instance.cancel(planned.id, exec);
     assert.equal(cancelled.phase, "cancelled");
-    assert.deepEqual(gateway.interrupts, [{ threadId: "planner-thread", turnId: "review-turn-1" }]);
+    assert.deepEqual(gateway.interrupts, [{ threadId: "reviewer-thread", turnId: "review-turn-1" }]);
     release();
     const settled = await pendingReview;
     // The settling review must not overwrite the cancelled phase.
@@ -2460,7 +2551,7 @@ test("a failing turn registration fails the workflow and interrupts the new turn
     assert.ok(records[0]?.error);
     // The just-started reviewer turn was interrupted, mirroring the app-server.
     assert.ok(gateway.interrupts.some(
-      (entry) => entry.threadId === "planner-thread" && entry.turnId === "review-turn-1",
+      (entry) => entry.threadId === "reviewer-thread" && entry.turnId === "review-turn-1",
     ));
     // The workflow stays ACTIVE (retryable) after an infrastructure failure.
     const active = await store.activeForSession("session-regfail");
@@ -2488,16 +2579,16 @@ test("cancel before the reviewer ids are persisted: onStarted never resurrects a
     // The durable Reviewer THREAD is already persisted (created before the
     // review runs); the review TURN is not registered yet: cancel wins first.
     const before = await store.load(planned.id);
-    assert.equal(before?.reviewerThreadId, "planner-thread");
+    assert.equal(before?.reviewerThreadId, "reviewer-thread");
     assert.equal(before?.reviewerTurnId, undefined);
     assert.equal(before?.plannerTurnId, "planner-turn-1");
     const cancelled = await instance.cancel(planned.id, exec);
     assert.equal(cancelled.phase, "cancelled");
-    // 1.0.8: with the shared-task layout the persisted ids cannot prove a
-    // LIVE turn — the completed Planner turn (planner-turn-1) must NEVER
-    // receive an interrupt, and no interrupt may be sent at all while the
-    // review turn has not registered yet (the genuinely running turn is
-    // covered by the active-turn map / suppressed-registration interrupt).
+    // 1.0.8/1.1.0: the persisted ids cannot prove a LIVE turn — the completed
+    // Planner turn (planner-turn-1) must NEVER receive an interrupt, and no
+    // interrupt may be sent at all while the review turn has not registered
+    // yet (the genuinely running turn is covered by the active-turn map /
+    // suppressed-registration interrupt).
     assert.equal(gateway.interrupts.length, 0, "cancel before registration interrupts nothing");
     beforeOnStarted.release();
     const settled = await pendingReview;
@@ -2505,7 +2596,7 @@ test("cancel before the reviewer ids are persisted: onStarted never resurrects a
     assert.equal((await store.load(planned.id))?.phase, "cancelled");
     // The turn obtained after cancellation was interrupted, not resurrected.
     assert.ok(gateway.interrupts.some(
-      (entry) => entry.threadId === "planner-thread" && entry.turnId === "review-turn-1",
+      (entry) => entry.threadId === "reviewer-thread" && entry.turnId === "review-turn-1",
     ));
     assert.ok(!gateway.interrupts.some(
       (entry) => entry.threadId === "planner-thread" && entry.turnId === "planner-turn-1",
@@ -2559,13 +2650,13 @@ test("review/start reporting a different task id IN onStarted is rejected; neith
     assert.equal(record.latestReview, undefined, "no verdict was written");
     // The rogue id was NEVER persisted (the guard runs before any store write)
     // and never became an active cancel target — it was interrupted instead.
-    assert.equal(record.reviewerThreadId, "planner-thread", "the persisted workflow task id is NEVER overwritten");
+    assert.equal(record.reviewerThreadId, "reviewer-thread", "the persisted dedicated Reviewer id is NEVER overwritten");
     assert.equal(record.reviewerTurnId, undefined, "no reviewer turn was ever persisted");
     assert.ok(
       gateway.interrupts.some((i) => i.threadId === "rogue-thread"),
       "the rogue turn was interrupted immediately instead of being tracked",
     );
-    assert.equal(gateway.reviewerThreadCalls.length, 0, "no second visible task was ever created");
+    assert.equal(gateway.reviewerThreadCalls.length, 1, "exactly ONE dedicated Reviewer task is created; the rogue review task is never tracked");
     assert.equal(gateway.forkCalls.length, 1, "only the planner conversion ran — no review conversion ever started");
   } finally {
     await rmClosed(directory);
@@ -2597,6 +2688,64 @@ test("planned workflow with a legacy distinct reviewerThreadId keeps using that 
     assert.deepEqual(gateway.reviewStarts.at(-1), { threadId: "legacy-reviewer", detached: false }, "the review runs on the legacy task");
     const record = (await store.load(planned.id))!;
     assert.equal(record.reviewerThreadId, "legacy-reviewer", "the persisted legacy id is not migrated");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+/** 1.1.0 migration: a planned record whose reviewerThreadId still ALIASES the
+ * Planner task (the pre-1.1.0 shared layout) must never be resumed for a
+ * review. The next review lazily binds a DEDICATED Reviewer instead, so an
+ * external writer holding the Planner task can never block the review. */
+test("a legacy record whose reviewerThreadId aliases the Planner task is migrated to a dedicated Reviewer", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-alias-migration-"));
+  try {
+    const gateway = new FakeGateway();
+    gateway.reviewResults = [{ verdict: "pass", findings: [], testGaps: [], summary: "ok" }];
+    const instance = manager(directory, gateway);
+    const exec = fakeExec("session-alias-migration", directory, []);
+    const planned = await instance.start({ task: "Build it" }, exec);
+    const store = new WorkflowStore(directory);
+    const seeded = await store.update(planned.id, (r) => {
+      r.reviewerThreadId = r.plannerThreadId; // the legacy SHARED identity
+      r.reviewerTurnId = undefined;
+    }, { ignoreCancelled: false });
+    assert.ok(!seeded.suppressed, "the legacy alias is seeded");
+    assert.equal(seeded.record.reviewerThreadId, seeded.record.plannerThreadId);
+
+    const reviewed = await instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.ts"] }, exec);
+    assert.equal(reviewed.phase, "passed");
+    assert.equal(gateway.reviewerThreadCalls.length, 1, "the alias is migrated: exactly ONE dedicated Reviewer is created");
+    assert.equal(reviewed.reviewerThreadId, "reviewer-thread");
+    assert.notEqual(reviewed.reviewerThreadId, reviewed.plannerThreadId, "the alias was replaced by a dedicated Reviewer");
+    assert.ok(!gateway.resumeCalls.includes("planner-thread"), "the Planner task is never resumed for a review");
+    assert.deepEqual(gateway.reviewStarts.at(-1), { threadId: "reviewer-thread", detached: false });
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+/** 1.1.0 migration on the PRODUCTION (CLI audit) path: the same legacy alias
+ * must force a NEW dedicated CLI Reviewer task instead of resuming the
+ * Planner task through `codex exec resume <planner>`. */
+test("a legacy CLI record whose reviewerThreadId aliases the Planner task is migrated to a CLI-created Reviewer", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-cli-alias-"));
+  try {
+    const gateway = new FakeGateway();
+    const audit = new FakeCliAudit();
+    const instance = manager(directory, gateway, {}, undefined, undefined, audit);
+    const exec = fakeExec("cli-alias-migration", directory, []);
+    const planned = await instance.start({ task: "Build it" }, exec);
+    const store = new WorkflowStore(directory);
+    await store.update(planned.id, (r) => { r.reviewerThreadId = r.plannerThreadId; }, { ignoreCancelled: false });
+
+    const reviewed = await instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.ts"] }, exec);
+    assert.equal(reviewed.phase, "passed");
+    assert.equal(audit.creations, 1, "the alias forces a NEW dedicated CLI Reviewer task");
+    assert.equal(reviewed.reviewerThreadId, "cli-created-reviewer");
+    assert.notEqual(reviewed.reviewerThreadId, reviewed.plannerThreadId);
+    assert.ok(!audit.reviewRequests.some((request) => request.codexThreadId === "planner-thread"),
+      "the Planner task is never resumed by the CLI audit");
   } finally {
     await rmClosed(directory);
   }
@@ -2699,7 +2848,7 @@ test("cancel during the conversion fork interrupts the FORK turn and never overw
     // The ephemeral conversion fork is the active turn, but its id must NEVER
     // land in reviewerThreadId/reviewerTurnId — the durable ids keep pointing
     // at the visible Reviewer task.
-    assert.equal(during?.reviewerThreadId, "planner-thread");
+    assert.equal(during?.reviewerThreadId, "reviewer-thread");
     assert.equal(during?.reviewerTurnId, "review-turn-1");
     const cancelled = await instance.cancel(planned.id, exec);
     assert.equal(cancelled.phase, "cancelled");
@@ -2826,7 +2975,7 @@ test("onStarted interrupt failure after cancellation still leaves the record can
     assert.equal(settled.phase, "cancelled");
     assert.equal((await store.load(planned.id))?.phase, "cancelled");
     assert.ok(gateway.interrupts.some(
-      (entry) => entry.threadId === "planner-thread" && entry.turnId === "review-turn-1",
+      (entry) => entry.threadId === "reviewer-thread" && entry.turnId === "review-turn-1",
     ));
   } finally {
     await rmClosed(directory);

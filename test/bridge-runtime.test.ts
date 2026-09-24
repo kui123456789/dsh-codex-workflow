@@ -51,6 +51,11 @@ const config: WorkflowConfig = {
   callbackTimeoutMs: 10_000,
   callbackMaxAttempts: 3,
   callbackRetryBaseMs: 200,
+  // 1.1.1 fast-but-real transient retry bounds (tests must not wait seconds).
+  transientRetryBaseMs: 1,
+  transientRetryMaxMs: 5,
+  transientRetryBudgetMs: 1_000,
+  transientRetryJitterRatio: 0,
   turnTimeoutMs: 10_000,
   idleProcessMs: 0,
   terminalRelayTimeoutMs: 60_000,

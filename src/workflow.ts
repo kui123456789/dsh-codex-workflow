@@ -20,6 +20,7 @@ import {
   type SubmitVerdictCommand,
 } from "./bridge-protocol.js";
 import { collectEvidence, isGitRepository } from "./evidence.js";
+import { backoffDelayMs, normalizeBackoff, transientReason, type BackoffPolicy } from "./transient-retry.js";
 import {
   SILENT_REVIEW_PROMPT_BLOCK,
   reviewDisplayError,
@@ -107,16 +108,16 @@ export interface CodexGateway {
    * reviewer model explicit even when nothing is configured, so visible
    * reviewer turns and their conversion forks always share one model. */
   resolveDefaultModel?(signal?: AbortSignal): Promise<string | undefined>;
-  /** Create a fresh, durable, empty REVIEW-ONLY thread (never copying the
-   * source chat history) with the readable review contract + full context as
-   * its developer instructions (AUXILIARY channel only: a native review turn
-   * may not reliably see thread-settings instructions), plus model/safety
-   * settings. Since 1.0.8 this is used ONLY by `review_only` (which has no
-   * Planner task to reuse) and never for planned flows — planned reviews
-   * append to the original Planner task. Verdict correctness never depends on
-   * the developer instructions — the full per-round context AND the
-   * item-by-item coverage gate ride the `review/start` custom target on every
-   * round. */
+  /** Create a fresh, durable, empty REVIEWER thread (never copying the source
+   * chat history) with the readable review contract + full context as its
+   * developer instructions (AUXILIARY channel only: a native review turn may
+   * not reliably see thread-settings instructions), plus model/safety
+   * settings. Since 1.1.0 this is the ONLY way a review task comes into
+   * existence on this path: every review — planned, bridge or `review_only` —
+   * runs on its own dedicated Reviewer thread and never resumes the Planner
+   * or origin task. Verdict correctness never depends on the developer
+   * instructions — the full per-round context AND the item-by-item coverage
+   * gate ride the `review/start` custom target on every round. */
   startReviewerThread?(options: {
     cwd: string;
     name: string;
@@ -149,6 +150,27 @@ export interface CodexGateway {
 }
 
 export type { ReviewInput };
+
+/**
+ * 1.1.0 Reviewer ownership: a Reviewer task is ALWAYS a dedicated thread —
+ * never the Planner task, never the bridge origin task.
+ *
+ * Older records bound the Reviewer to a SHARED task: `reviewerThreadId ===
+ * plannerThreadId` for DSH-led planned workflows, `=== codexThreadId` for the
+ * legacy App Server callback. Such an alias is treated here as UNBOUND, so the
+ * next review lazily binds a dedicated Reviewer instead of resuming the shared
+ * task. Resuming it is exactly what froze a real workflow: Codex Desktop keeps
+ * a writer lock on every thread it has loaded, so a Planner/origin task that
+ * the Desktop still holds made every review fail with
+ * `thread-store conflict: thread <id> already has an active writer` — a lock
+ * the plugin has no way to release. Records that already carry a dedicated
+ * Reviewer id are unaffected and keep their task.
+ */
+function isSharedReviewerAlias(record: WorkflowRecord): boolean {
+  if (!record.reviewerThreadId) return false;
+  return record.reviewerThreadId === record.plannerThreadId
+    || record.reviewerThreadId === record.codexThreadId;
+}
 
 /** Resumable Reviewer callback injected by the host. */
 export interface CodexCallback {
@@ -201,6 +223,10 @@ export class WorkflowManager {
   /** Submission lease lifetime; heartbeats renew at ttl/3 while a callback
    * runs, so only crashed owners are ever taken over. */
   private readonly leaseTtlMs: number;
+  /** Seams for the 1.1.1 transient-retry backoff. */
+  private readonly retryNow: () => number;
+  private readonly retrySleep: (ms: number, signal?: AbortSignal) => Promise<void>;
+  private readonly retryRandom: () => number;
 
   constructor(
     private readonly store: WorkflowStore,
@@ -209,8 +235,64 @@ export class WorkflowManager {
     private readonly callback?: CodexCallback,
     private readonly bridgeQueue?: { enqueue(command: BridgeCommand): Promise<string> },
     private readonly audit?: CodexCliAuditGateway,
+    /** 1.1.1 test seams for the transient-retry backoff (never wait for real
+     * time in a test). Production passes nothing and uses real timers. */
+    retryHooks: { sleep?: (ms: number, signal?: AbortSignal) => Promise<void>; now?: () => number; random?: () => number } = {},
   ) {
     this.leaseTtlMs = config.leaseTtlMs ?? 60_000;
+    this.retryNow = retryHooks.now ?? Date.now;
+    this.retrySleep = retryHooks.sleep ?? ((ms, signal) => delay(ms, signal));
+    this.retryRandom = retryHooks.random ?? Math.random;
+  }
+
+  /** 1.1.1: the shared retry policy for TRANSIENT upstream failures. A config
+   * object built without the retry fields is normalized here so an absent
+   * budget can never turn the bounded retry into an endless loop. */
+  private retryPolicy(): BackoffPolicy {
+    return normalizeBackoff({
+      baseMs: this.config.transientRetryBaseMs,
+      maxMs: this.config.transientRetryMaxMs,
+      budgetMs: this.config.transientRetryBudgetMs,
+      jitterRatio: this.config.transientRetryJitterRatio,
+    });
+  }
+
+  /**
+   * Run ONE visible model turn, retrying ONLY transient upstream failures
+   * (server_overloaded / at capacity / 429 / 5xx / dropped streams / a writer
+   * held by another process) with the shared bounded backoff.
+   *
+   * Why this exists: an upstream `server_overloaded` reply used to surface as a
+   * failed turn and the tool failed with it — the workflow stopped and a human
+   * had to run the same call again. Capacity is temporary.
+   *
+   * Safety of the retry: it happens only for a turn that ended NOT completed
+   * AND produced no visible text, i.e. one that persisted no plan, audit or
+   * rewrite; re-running it cannot duplicate user-visible output. Cancellation
+   * and teardown propagate through `signal`, and terminal failures (invalid
+   * thread, approval denial, schema/display contract violations) are returned
+   * unchanged for the caller to classify.
+   */
+  private async startTurnWithTransientRetry(
+    threadId: string,
+    options: Parameters<CodexGateway["startTurn"]>[1],
+    signal?: AbortSignal,
+  ): Promise<TurnWaitResult> {
+    const policy = this.retryPolicy();
+    const deadline = this.retryNow() + policy.budgetMs;
+    for (let attempt = 0; ; attempt += 1) {
+      const outcome = await this.codex.startTurn(threadId, options, signal);
+      const failedWithoutOutput = outcome.kind === "completed"
+        && outcome.status !== "completed"
+        && (outcome.text ?? "").trim().length === 0;
+      const reason = failedWithoutOutput
+        ? transientReason(`${outcome.error ?? ""} ${outcome.reason ?? ""}`)
+        : undefined;
+      if (!reason || !(policy.budgetMs > 0)) return outcome;
+      const delayMs = backoffDelayMs(attempt, policy, this.retryRandom);
+      if (this.retryNow() + delayMs > deadline) return outcome;
+      await this.retrySleep(delayMs, signal);
+    }
   }
 
   /** Resumable Codex callback used by bridge workflows; injected by the host. */
@@ -368,7 +450,7 @@ export class WorkflowManager {
       // unconfigured — whatever the Plan collaboration mode resolves (the
       // client reports it via onModel and the fork reuses the SAME model).
       let plannerModel = args.plannerModel || this.config.plannerModel || undefined;
-      const outcome = await this.codex.startTurn(plannerThreadId, {
+      const outcome = await this.startTurnWithTransientRetry(plannerThreadId, {
         prompt: plannerPrompt(record.task),
         ...(plannerModel ? { model: plannerModel } : {}),
         effort: args.plannerEffort ?? this.config.plannerEffort,
@@ -725,7 +807,7 @@ export class WorkflowManager {
       outcome = await this.codex.continueTurn(pending, answers, exec.signal);
     } else {
       await this.codex.resumeThread(record.plannerThreadId, record.cwd, exec.signal);
-      outcome = await this.codex.startTurn(record.plannerThreadId, {
+      outcome = await this.startTurnWithTransientRetry(record.plannerThreadId, {
         prompt: resumedAnswerPrompt(answers),
         ...(plannerModel ? { model: plannerModel } : {}),
         effort: this.config.plannerEffort,
@@ -958,9 +1040,18 @@ export class WorkflowManager {
           | { kind: "verdict"; verdict: ReviewResult }
           | { kind: "retryable_busy"; reason?: string };
         try {
-          const visibleThreadId = current.reviewerThreadId ?? current.codexThreadId!;
-          if (this.codex.releaseThreadForExternal) await this.codex.releaseThreadForExternal(visibleThreadId, signal);
-          else await this.codex.unsubscribeThread?.(visibleThreadId, signal);
+          // 1.1.0: only the workflow's OWN dedicated Reviewer task is ever
+          // released. The Planner/origin task is not a review target any more
+          // (an external writer holding it must never block a review), and a
+          // legacy shared alias is not resumed at all — the dispatcher binds a
+          // dedicated Reviewer instead.
+          const boundReviewer = current.reviewerThreadId && !isSharedReviewerAlias(current)
+            ? current.reviewerThreadId
+            : undefined;
+          if (boundReviewer) {
+            if (this.codex.releaseThreadForExternal) await this.codex.releaseThreadForExternal(boundReviewer, signal);
+            else await this.codex.unsubscribeThread?.(boundReviewer, signal);
+          }
           outcome = await this.callback!.send({
             workflowId,
             submissionId,
@@ -972,7 +1063,10 @@ export class WorkflowManager {
             // DSH-led path (task language + four readable sections).
             task: current.task,
             ...(current.planMarkdown ? { planMarkdown: current.planMarkdown } : {}),
-            reviewerThreadId: current.reviewerThreadId,
+            // A legacy shared alias is handed over as UNBOUND so the
+            // dispatcher creates the dedicated Reviewer instead of resuming
+            // the Planner/origin task.
+            reviewerThreadId: boundReviewer,
             reviewerName: `DSH Reviewer: ${workflowId}`,
             ...(current.reviewerModel || this.config.reviewerModel
               ? { model: current.reviewerModel || this.config.reviewerModel }
@@ -1024,13 +1118,13 @@ export class WorkflowManager {
             throw error;
           }
           const message = errorMessage(error);
+          // 1.1.1: the SHARED transient classification (server_overloaded /
+          // at capacity / 429 / 5xx / dropped streams / writer held elsewhere)
+          // so a temporary capacity problem can never be filed as an unknown,
+          // terminal-looking callback failure.
           const busyReason = /Codex turn timed out|timed out/i.test(message)
             ? "turn timeout"
-            : /429 Too Many Requests|exceeded retry limit|rate limit/i.test(message)
-              ? "rate limit"
-              : /already in use|already has an active writer/i.test(message)
-                ? "active writer"
-                : "unknown callback failure";
+            : transientReason(message) ?? "unknown callback failure";
           outcome = { kind: "retryable_busy", reason: busyReason };
         }
         if (leaseLost) return current; // never write or enqueue after losing the lease
@@ -1203,6 +1297,9 @@ export class WorkflowManager {
           });
           return current;
         }
+        // The bridge submission cadence stays governed by `callbackRetryBaseMs`
+        // (the recovery loop's own knob); the 1.1.1 transient policy governs the
+        // MODEL calls (CLI audit + visible turns), not this queue cadence.
         await delay(this.config.callbackRetryBaseMs * 2 ** (attemptsThisRound - 1), signal);
         if (signal?.aborted) throw abortError(signal);
       }
@@ -1735,39 +1832,40 @@ export class WorkflowManager {
         return await this.reviewOnceViaCli(workflowId, current, input, evidence, exec, priorPhase);
       }
 
-      // The durable visible workflow task: planned workflows append reviews to
-      // their original Planner task, so planning and review stay together in
-      // Desktop. `review_only` has no Planner and creates one review task. Old
-      // records with a distinct reviewerThreadId keep using it. The
-      // readable review contract + FULL per-round context (workflow identity,
-      // original task, approved plan, implementation summary, changed files,
-      // test results, workspace evidence) are ALSO injected as the thread's
-      // developer instructions (refreshed before every round) — but only as an
-      // AUXILIARY channel: a real App Server native review turn does not
-      // reliably see hidden thread-settings instructions, so verdict
-      // correctness never depends on them. The complete context and the
-      // coverage gate ride the `review/start` custom target on every path
-      // (see below). Desktop keeps seeing ONE workflow task for planned flows.
+      // The durable visible REVIEWER task (1.1.0). A review always runs on a
+      // DEDICATED Reviewer thread — never the Planner task, never the bridge
+      // origin task — because Codex Desktop keeps a writer lock on every
+      // thread it has loaded: resuming a shared task made reviews fail with
+      // `thread-store conflict: thread <id> already has an active writer`, a
+      // lock the plugin cannot release. A legacy record whose reviewerThreadId
+      // still aliases the shared task is migrated lazily (a dedicated Reviewer
+      // is created below). The readable review contract + FULL per-round
+      // context (workflow identity, original task, approved plan,
+      // implementation summary, changed files, test results, workspace
+      // evidence) are ALSO injected as the thread's developer instructions
+      // (refreshed before every round) — but only as an AUXILIARY channel: a
+      // real App Server native review turn does not reliably see hidden
+      // thread-settings instructions, so verdict correctness never depends on
+      // them. The complete context and the coverage gate ride the
+      // `review/start` custom target on every path (see below).
       const reviewerModel = current.reviewerModel
         || this.config.reviewerModel
         || await this.codex.resolveDefaultModel?.(exec.signal)
         || undefined;
       const contract = reviewContractInstructions(current, input, evidence);
       let reviewerThreadId = current.reviewerThreadId;
+      // 1.1.0: a legacy shared identity (Reviewer === Planner/origin task) is
+      // migrated lazily — a dedicated Reviewer task is created below instead of
+      // resuming a task an external writer may hold.
+      if (reviewerThreadId && isSharedReviewerAlias(current)) reviewerThreadId = undefined;
       if (!reviewerThreadId) {
-        if (current.mode === "planned" && current.plannerThreadId) {
-          reviewerThreadId = current.plannerThreadId;
-          await this.codex.resumeThread(reviewerThreadId, current.cwd, exec.signal);
-          await this.codex.updateReviewerInstructions?.(reviewerThreadId, current.cwd, contract, exec.signal);
-        } else {
-          if (!this.codex.startReviewerThread) throw new Error("codex gateway has no startReviewerThread");
-          reviewerThreadId = await this.codex.startReviewerThread({
-            cwd: current.cwd,
-            name: `DSH Reviewer: ${workflowId}`,
-            ...(reviewerModel ? { model: reviewerModel } : {}),
-            developerInstructions: contract,
-          }, exec.signal);
-        }
+        if (!this.codex.startReviewerThread) throw new Error("codex gateway has no startReviewerThread");
+        reviewerThreadId = await this.codex.startReviewerThread({
+          cwd: current.cwd,
+          name: `DSH Reviewer: ${workflowId}`,
+          ...(reviewerModel ? { model: reviewerModel } : {}),
+          developerInstructions: contract,
+        }, exec.signal);
         const threadCommit = await this.store.update(workflowId, (r) => {
           r.reviewerThreadId = reviewerThreadId!;
         }, { ignoreCancelled: false });
@@ -1873,7 +1971,7 @@ export class WorkflowManager {
         // rewrite's persisted output is detected as an APPENDED turn, never by
         // assuming the `turn/start` RPC id equals the persisted rollout id.
         const rewriteBaseline = await this.codex.captureTurnBaseline?.(reviewerThreadId, exec.signal);
-        const rewrite = await this.codex.startTurn(reviewerThreadId, {
+        const rewrite = await this.startTurnWithTransientRetry(reviewerThreadId, {
           prompt: reviewRewritePrompt(authoritativeText, current),
           ...(reviewerModel ? { model: reviewerModel } : {}),
           effort: "low",
@@ -2045,7 +2143,13 @@ export class WorkflowManager {
   ): Promise<WorkflowRecord> {
     let current = seed;
     const reviewerModel = current.reviewerModel || this.config.reviewerModel;
-    let threadId = current.reviewerThreadId || current.plannerThreadId;
+    // 1.1.0: the Reviewer runs on a DEDICATED task. It is never the Planner
+    // task (nor the bridge origin): an external writer holding that task would
+    // otherwise block every review with "already has an active writer". A
+    // legacy shared identity is migrated lazily — `createReview` below binds
+    // the dedicated Reviewer and the persisted alias is replaced.
+    let threadId = current.reviewerThreadId;
+    if (threadId && isSharedReviewerAlias(current)) threadId = undefined;
     const request = {
       workflowId,
       submissionId: `review-${Date.now()}`,
@@ -2062,7 +2166,13 @@ export class WorkflowManager {
         ...request,
         onThread: async (id) => {
           const commit = await this.store.update(workflowId, (r) => {
-            if (r.reviewerThreadId && r.reviewerThreadId !== id) throw new Error("review task identity changed");
+            // A dedicated Reviewer is bound exactly ONCE. The single exception
+            // is the lazy migration of a legacy shared identity (the persisted
+            // reviewerThreadId still aliasing the Planner/origin task): that
+            // alias is replaced, never a previously bound dedicated Reviewer.
+            if (r.reviewerThreadId && r.reviewerThreadId !== id && !isSharedReviewerAlias(r)) {
+              throw new Error("review task identity changed");
+            }
             r.reviewerThreadId = id;
           }, { ignoreCancelled: false });
           if (commit.suppressed) throw new Error("workflow cancelled during CLI task creation");
@@ -2270,7 +2380,7 @@ export class WorkflowManager {
     const baseline = await this.codex.captureTurnBaseline?.(threadId, signal);
     let reconcile: TurnWaitResult;
     try {
-      reconcile = await this.codex.startTurn(threadId, {
+      reconcile = await this.startTurnWithTransientRetry(threadId, {
         prompt: reviewReconcilePrompt(result, conflicts, {
           workflowId: record.id,
           task: record.task,
@@ -2552,7 +2662,7 @@ export class WorkflowManager {
     if (result.status === "ready" && result.planMarkdown?.trim() && !isPlausibleCompletePlan(visibleText)) {
       let completion: TurnWaitResult;
       try {
-        completion = await this.codex.startTurn(outcome.threadId, {
+        completion = await this.startTurnWithTransientRetry(outcome.threadId, {
           prompt: plannerCompletionPrompt(visibleText),
           ...(model ? { model } : {}),
           effort: this.config.plannerEffort,

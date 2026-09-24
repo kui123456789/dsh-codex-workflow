@@ -9,6 +9,7 @@ import { isChineseText, reviewDisplayError, reviewRewritePrompt } from "./review
 import type { AlignmentOutcome, ReasoningEffort, ReviewResult } from "./types.js";
 import type { CodexCallbackRequest, CodexCallbackResult } from "./codex-callback.js";
 import { CodexCallbackProcessError, CodexInvalidThreadError, CodexNoVerdictError } from "./codex-callback.js";
+import { backoffDelayMs, compactDiagnostic, DEFAULT_BACKOFF, normalizeBackoff, transientReason, type BackoffPolicy } from "./transient-retry.js";
 
 export interface CodexCliAuditOptions {
   command: string;
@@ -23,6 +24,13 @@ export interface CodexCliAuditOptions {
   killGraceMs?: number;
   killKillGraceMs?: number;
   retryBaseMs?: number;
+  /** 1.1.1 shared transient-retry policy (classification + bounded exponential
+   * backoff). `retryBaseMs` is honoured as a legacy alias for `baseMs`. */
+  retry?: Partial<BackoffPolicy>;
+  /** Injectable seams (tests assert the backoff sequence without real waits). */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  now?: () => number;
+  random?: () => number;
 }
 
 export type NewCliReviewRequest = Omit<CodexCallbackRequest, "codexThreadId" | "reviewerThreadId" | "onThread"> & {
@@ -52,11 +60,35 @@ export class CodexCliAuditDispatcher implements CodexCliAuditGateway {
   private stopped = false;
   private stopPromise?: Promise<void>;
   private childSequence = 0;
+  /** 1.1.1: ONE shared retry policy for every `codex exec` call this process
+   * makes, so a transient upstream condition (server_overloaded / 429 / 5xx /
+   * dropped stream / a writer held elsewhere) never ends a workflow. */
+  private readonly retry: BackoffPolicy;
+  private readonly now: () => number;
+  private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>;
+  private readonly random: () => number;
 
-  constructor(private readonly options: CodexCliAuditOptions) {}
+  constructor(private readonly options: CodexCliAuditOptions) {
+    this.retry = normalizeBackoff({
+      ...DEFAULT_BACKOFF,
+      ...(options.retryBaseMs !== undefined ? { baseMs: options.retryBaseMs } : {}),
+      ...(options.retry ?? {}),
+    });
+    this.now = options.now ?? Date.now;
+    this.sleepFn = options.sleep ?? ((ms, signal) => abortableDelay(ms, signal));
+    this.random = options.random ?? Math.random;
+  }
 
   send(request: CodexCallbackRequest, signal?: AbortSignal): Promise<CodexCallbackResult & { kind: "verdict"; visibleText: string; threadId: string }> {
-    return this.review(request, signal);
+    // 1.1.0: an UNBOUND workflow gets a DEDICATED Reviewer task. Resuming the
+    // origin/Planner task is never an option — Codex Desktop holds a
+    // thread-writer lock on every thread it has loaded, which is exactly what
+    // froze real reviews with "already has an active writer" (a lock the
+    // plugin cannot release). `createReview` reports and persists the new
+    // identity through `onThread`.
+    if (request.reviewerThreadId) return this.review(request, signal);
+    const { reviewerThreadId: _unbound, codexThreadId: _origin, ...rest } = request;
+    return this.createReview({ ...rest, onThread: request.onThread ?? (() => undefined) }, signal);
   }
 
   cancel(workflowId: string): void {
@@ -99,12 +131,25 @@ export class CodexCliAuditDispatcher implements CodexCliAuditGateway {
    * identity before normalization so a failed round can resume the same task. */
   async createReview(request: NewCliReviewRequest, signal?: AbortSignal) {
     let threadId: string | undefined;
-    const result = await this.run(request.workflowId, request.submissionId,
-      this.buildArgs({ cwd: request.cwd, model: request.model, effort: request.effort }),
-      request.prompt, signal, undefined, async (id) => {
+    const result = await this.runWithTransientRetry({
+      workflowId: request.workflowId,
+      submissionId: request.submissionId,
+      prompt: request.prompt,
+      signal,
+      // An attempt AFTER a transient failure must RESUME the task created by
+      // the first attempt: opening a second task would bind a different
+      // identity and break the "one dedicated Reviewer" invariant.
+      buildArgs: (resumeThreadId) => this.buildArgs({
+        cwd: request.cwd,
+        model: request.model,
+        effort: request.effort,
+        threadId: resumeThreadId,
+      }),
+      onNewThread: async (id) => {
         threadId = id;
         await request.onThread(id);
-      });
+      },
+    });
     if (!threadId) {
       if (result.code !== 0) this.throwProcess("new review", result.stdout, result.stderr, result.code);
       throw new CodexNoVerdictError("new CLI review did not report a thread.started identity");
@@ -124,17 +169,71 @@ export class CodexCliAuditDispatcher implements CodexCliAuditGateway {
   }
 
   private async runReviewWithRetry(request: CodexCallbackRequest, signal?: AbortSignal) {
-    const args = this.buildArgs({
-      cwd: request.cwd,
-      model: request.model,
-      effort: request.effort,
-      threadId: this.visibleThreadId(request),
+    return this.runWithTransientRetry({
+      workflowId: request.workflowId,
+      submissionId: request.submissionId,
+      prompt: request.prompt,
+      signal,
+      resumeThreadId: this.visibleThreadId(request),
+      buildArgs: (resumeThreadId) => this.buildArgs({
+        cwd: request.cwd,
+        model: request.model,
+        effort: request.effort,
+        threadId: resumeThreadId,
+      }),
     });
+  }
+
+  /**
+   * The ONE retry loop every `codex exec` invocation goes through (1.1.1).
+   *
+   * Before this existed, `runReviewWithRetry` retried at most 9 times with a
+   * ~22 s linear total against four hard-coded patterns, and every other call
+   * site (`normalize`, `align`, `reconcile`, the display rewrite) did not retry
+   * at all. A real `server_overloaded` reply — "Selected model is at capacity.
+   * Please try a different model." — matched none of them, so a purely
+   * temporary upstream condition was reported as a terminal failure and the
+   * workflow stopped until a human ran the same call again.
+   *
+   * The loop now uses the shared classification (`transientReason`) and the
+   * shared bounded backoff, honours cancellation while sleeping, and reuses the
+   * task created by the first attempt on every retry.
+   */
+  private async runWithTransientRetry(input: {
+    workflowId: string;
+    submissionId?: string;
+    prompt: string;
+    signal?: AbortSignal;
+    /** Durable task to resume, when this call targets one. */
+    resumeThreadId?: string;
+    /** Rebuilt per attempt so the retry resumes instead of re-creating. */
+    buildArgs: (resumeThreadId: string | undefined) => string[];
+    /** Called when the CLI reports a fresh `thread.started` identity. */
+    onNewThread?: (threadId: string) => Promise<void>;
+  }): Promise<{ code: number | null; stdout: string; stderr: string }> {
+    const policy = this.retry;
+    const deadline = this.now() + policy.budgetMs;
+    let createdThreadId: string | undefined;
+    const onNewThread = input.onNewThread
+      ? async (threadId: string) => {
+        createdThreadId ??= threadId;
+        await input.onNewThread!(threadId);
+      }
+      : undefined;
     for (let attempt = 0; ; attempt += 1) {
-      const result = await this.run(request.workflowId, request.submissionId, args, request.prompt, signal, this.visibleThreadId(request));
-      const diagnostic = `${result.stdout}\n${result.stderr}`;
-      if (result.code === 0 || attempt >= 9 || !/active writer|already has an active writer|rate limit|429 Too Many Requests/i.test(diagnostic)) return result;
-      await abortableDelay((this.options.retryBaseMs ?? 500) * (attempt + 1), signal);
+      const target = input.resumeThreadId ?? createdThreadId;
+      const result = await this.run(
+        input.workflowId, input.submissionId, input.buildArgs(target), input.prompt, input.signal, target, onNewThread,
+      );
+      if (result.code === 0) return result;
+      const reason = transientReason(`${result.stdout}\n${result.stderr}`);
+      if (!reason || !(policy.budgetMs > 0)) return result;
+      const delayMs = backoffDelayMs(attempt, policy, this.random);
+      // Stop when the next wait would exceed the budget: the caller classifies
+      // the LAST result (a transient one stays retryable at the workflow level,
+      // it is never turned into a terminal failure).
+      if (this.now() + delayMs > deadline) return result;
+      await this.sleepFn(delayMs, input.signal);
     }
   }
 
@@ -178,12 +277,18 @@ export class CodexCliAuditDispatcher implements CodexCliAuditGateway {
   }
 
   async normalize(input: { visibleText: string; cwd: string; workflowId: string; submissionId?: string; model?: string }, signal?: AbortSignal): Promise<ReviewResult> {
-    const result = await this.run(input.workflowId, input.submissionId, this.buildArgs({
-      cwd: input.cwd,
-      model: input.model,
-      effort: "low",
-      schemaFile: this.options.reviewSchemaFile,
-    }), input.visibleText, signal);
+    const result = await this.runWithTransientRetry({
+      workflowId: input.workflowId,
+      submissionId: input.submissionId,
+      prompt: input.visibleText,
+      signal,
+      buildArgs: () => this.buildArgs({
+        cwd: input.cwd,
+        model: input.model,
+        effort: "low",
+        schemaFile: this.options.reviewSchemaFile,
+      }),
+    });
     if (result.code !== 0) this.throwProcess("ephemeral", result.stdout, result.stderr, result.code);
     const text = extractAgentMessage(result.stdout);
     if (!text) throw new CodexNoVerdictError("no final agent message found in CLI normalization output");
@@ -191,12 +296,18 @@ export class CodexCliAuditDispatcher implements CodexCliAuditGateway {
   }
 
   async align(input: { result: ReviewResult; task: string; planMarkdown?: string; previousReview?: ReviewResult; fixSummary?: string; cwd: string; workflowId: string; submissionId?: string; model?: string; prompt: string }, signal?: AbortSignal): Promise<AlignmentOutcome> {
-    const result = await this.run(input.workflowId, input.submissionId, this.buildArgs({
-      cwd: input.cwd,
-      model: input.model,
-      effort: "low",
-      schemaFile: this.options.alignmentSchemaFile,
-    }), input.prompt, signal);
+    const result = await this.runWithTransientRetry({
+      workflowId: input.workflowId,
+      submissionId: input.submissionId,
+      prompt: input.prompt,
+      signal,
+      buildArgs: () => this.buildArgs({
+        cwd: input.cwd,
+        model: input.model,
+        effort: "low",
+        schemaFile: this.options.alignmentSchemaFile,
+      }),
+    });
     if (result.code !== 0) this.throwProcess("ephemeral", result.stdout, result.stderr, result.code);
     const text = extractAgentMessage(result.stdout);
     if (!text) throw new CodexNoVerdictError("no final agent message found in CLI alignment output");
@@ -363,8 +474,14 @@ export class CodexCliAuditDispatcher implements CodexCliAuditGateway {
   private throwProcess(threadId: string, stdout: string, stderr: string, code: number | null): never {
     const diagnostic = `${stdout}\n${stderr}`;
     if (/no rollout found for thread id/i.test(diagnostic)) throw new CodexInvalidThreadError(`codex thread ${threadId} does not exist`);
-    if (code === null || /rate limit|already in use|active writer/i.test(diagnostic)) throw new CodexCliAuditBusyError(`codex CLI audit busy: ${diagnostic.trim().slice(0, 2048)}`);
-    throw new CodexCallbackProcessError(`codex CLI audit exited with code ${code}: ${diagnostic.trim().slice(0, 2048)}`);
+    // 1.1.1: a TRANSIENT upstream condition stays RETRYABLE even after the
+    // retry budget is spent — capacity/throttling is temporary by nature, and
+    // reporting it as a terminal process failure is what silently killed
+    // workflows (see transient-retry.ts for the incident).
+    if (code === null || transientReason(diagnostic)) {
+      throw new CodexCliAuditBusyError(`codex CLI audit busy: ${compactDiagnostic(diagnostic)}`);
+    }
+    throw new CodexCallbackProcessError(`codex CLI audit exited with code ${code}: ${compactDiagnostic(diagnostic)}`);
   }
 }
 

@@ -661,6 +661,14 @@ export class CodexAppServerClient {
       cwd,
       runtimeWorkspaceRoots: [cwd],
       ephemeral: true,
+      // REQUIRED by Codex App Server (verified on codex-cli 0.154.0): an
+      // ephemeral fork is rejected with "ephemeral paginated thread/fork
+      // requires `excludeTurns: true`" (JSON-RPC -32600) without it. It only
+      // trims the RPC RESPONSE payload (the fork comes back with zero turns
+      // instead of the paginated source history); the fork still inherits the
+      // source thread's context, so the conversion/alignment turns keep seeing
+      // the visible reply they must convert.
+      excludeTurns: true,
     }, signal);
     const thread = object(response.thread);
     return string(thread.id, "thread/fork result.thread.id");

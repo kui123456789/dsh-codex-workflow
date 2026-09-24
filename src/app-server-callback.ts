@@ -17,13 +17,14 @@ interface ActiveReview {
 }
 
 /**
- * Production callback path for Codex-led workflows.
+ * App Server callback path for Codex-led workflows.
  *
- * The originating Codex Desktop task is the durable workflow task. The first
- * review validates it read-only (`thread/read`, no turns), then resumes that
- * SAME task and appends the visible review there. Later review cycles resume
- * the same persisted id. Old workflows that already have a distinct
- * reviewerThreadId keep using it for compatibility.
+ * Since 1.1.0 the review runs on a DEDICATED Reviewer task: the originating
+ * Codex task is never resumed and never written to, so a foreign writer
+ * holding it (Codex Desktop) cannot block the review. The readable verdict
+ * reaches the originating task through the bridge relay, not through its
+ * writer lock. Records that already carry a distinct reviewerThreadId keep
+ * using that task.
  */
 export class AppServerCodexCallbackDispatcher {
   private readonly active = new Map<string, ActiveReview>();
@@ -128,18 +129,28 @@ export class AppServerCodexCallbackDispatcher {
     let claimed = false;
     try {
       reviewerThreadId = request.reviewerThreadId;
+      // 1.1.0: a review NEVER runs on the origin (source) task. A dedicated
+      // Reviewer task is created instead, so an external writer holding the
+      // user's Codex task (Codex Desktop keeps a writer lock on every thread
+      // it has loaded) can never block the review with "already has an active
+      // writer". The origin task stays untouched: the readable verdict reaches
+      // it through the bridge (submission/verdict relay), not by taking its
+      // writer.
+      const created = !reviewerThreadId;
       if (!reviewerThreadId) {
-        // New workflow: review in the exact source task. A live writer conflict
-        // is retried below; creating a second visible task is forbidden.
-        await this.codex.validateSourceThread(request.codexThreadId, signal);
-        reviewerThreadId = request.codexThreadId;
+        if (!this.codex.startReviewerThread) throw new Error("codex gateway has no startReviewerThread");
+        reviewerThreadId = await this.codex.startReviewerThread({
+          cwd: request.cwd,
+          name: request.reviewerName ?? `DSH Reviewer: ${request.workflowId}`,
+        }, signal);
       }
       await this.codex.resumeThread(reviewerThreadId, request.cwd, signal);
       this.trackThreadRef(reviewerThreadId, 1);
       claimed = true;
-      if (!request.reviewerThreadId) {
-        // Persist the shared identity only after resume succeeds. A busy source
-        // remains unbound and can be retried without a stale reviewer id.
+      if (created) {
+        // Persist the dedicated identity only after the resume succeeded. A
+        // failed creation/resume leaves the record unbound and retryable
+        // instead of storing a stale reviewer id.
         await request.onThread?.(reviewerThreadId);
       }
 
