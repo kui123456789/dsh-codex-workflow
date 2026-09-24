@@ -39,6 +39,8 @@ export const Config = z.object({
   transientRetryMaxMs: z.number().default(60_000),
   transientRetryBudgetMs: z.number().default(20 * 60 * 1000),
   transientRetryJitterRatio: z.number().default(0.25),
+  reviewHeartbeatMs: z.number().default(15_000),
+  reviewStaleMs: z.number().default(60_000),
   leaseTtlMs: z.number().default(60_000),
   turnTimeoutMs: z.number().default(10 * 60 * 1000),
   idleProcessMs: z.number().default(5_000),

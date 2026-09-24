@@ -474,6 +474,96 @@ test("1.1.1: a TERMINAL planner failure is never retried", async () => {
   }
 });
 
+test("review observability heartbeats independently during a long Reviewer turn", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-review-heartbeat-"));
+  try {
+    const gateway = new FakeGateway();
+    gateway.reviewGate = deferredGate();
+    const instance = manager(directory, gateway, { reviewHeartbeatMs: 10, reviewStaleMs: 500 });
+    const exec = fakeExec("session-review-heartbeat", directory, []);
+    const run = instance.reviewOnly({ implementationSummary: "Changed", changedFiles: ["src/a.ts"] }, exec);
+    await waitFor(async () => (await new WorkflowStore(directory).list()).length === 1);
+    const record = (await new WorkflowStore(directory).list())[0]!;
+    await waitFor(async () => (await new WorkflowStore(directory).load(record.id))?.reviewStep === "review_native_turn");
+    const running = await new WorkflowStore(directory).load(record.id);
+    assert.equal(running?.processState, "running");
+    assert.equal(running?.reviewStep, "review_native_turn");
+    const firstProgress = running?.lastProgressAt;
+    await waitFor(async () => {
+      const current = await new WorkflowStore(directory).load(record.id);
+      return Boolean(current?.lastProgressAt && current.lastProgressAt !== firstProgress);
+    });
+    const heartbeat = await new WorkflowStore(directory).load(record.id);
+    assert.equal(heartbeat?.processState, "running");
+    assert.ok((heartbeat?.reviewElapsedMs ?? 0) >= 0);
+    assert.match(heartbeat?.lastProgressMessage ?? "", /Reviewer|Review/i);
+    gateway.reviewGate.release();
+    const completed = await run;
+    assert.equal(completed.processState, "completed");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("status classifies a review with no recent heartbeat as stale", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-review-stale-"));
+  try {
+    const store = new WorkflowStore(directory);
+    const old = new Date(Date.now() - 5_000).toISOString();
+    const record: WorkflowRecord = {
+      schemaVersion: 1,
+      id: "review-stale-workflow",
+      dshSessionId: "session-review-stale",
+      cwd: directory,
+      task: "Review the changes",
+      mode: "review_only",
+      phase: "reviewing",
+      createdAt: old,
+      updatedAt: old,
+      assumptions: [],
+      questions: [],
+      reviewCycles: 0,
+      reviewAttempt: 1,
+      reviewStep: "review_native_turn",
+      reviewStartedAt: old,
+      lastProgressAt: old,
+      reviewElapsedMs: 5_000,
+      processState: "running",
+      lastProgressMessage: "Reviewer turn is running",
+    };
+    await store.save(record);
+    const instance = manager(directory, new FakeGateway(), { reviewStaleMs: 1_000 });
+    const status = await instance.status(record.id, fakeExec(record.dshSessionId, directory, []));
+    assert.equal(status.processState, "stale");
+    assert.equal(status.reviewerActive, false);
+    assert.match(status.lastProgressMessage ?? "", /No Review heartbeat/);
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("cancelling a review stops its heartbeat and records cancelled", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-review-cancel-"));
+  try {
+    const gateway = new FakeGateway();
+    gateway.reviewGate = deferredGate();
+    const instance = manager(directory, gateway, { reviewHeartbeatMs: 10, reviewStaleMs: 500 });
+    const exec = fakeExec("session-review-cancel", directory, []);
+    const run = instance.reviewOnly({ implementationSummary: "Changed", changedFiles: ["src/a.ts"] }, exec);
+    await waitFor(async () => (await new WorkflowStore(directory).list()).length === 1);
+    const workflow = (await new WorkflowStore(directory).list())[0]!;
+    await waitFor(async () => (await new WorkflowStore(directory).load(workflow.id))?.processState === "running");
+    const cancelled = await instance.cancel(workflow.id, exec);
+    assert.equal(cancelled.phase, "cancelled");
+    assert.equal(cancelled.processState, "cancelled");
+    gateway.reviewGate.release();
+    const settled = await run;
+    assert.equal(settled.processState, "cancelled");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
 /** Deterministic callback double: queue results; record every resume request. */
 class FakeCallback implements CodexCallback {
   results: Array<CodexCallbackResult | Error> = [];

@@ -41,6 +41,18 @@ export type WorkflowPhase =
   | "failed"
   | "cancelled";
 
+export type ReviewStep =
+  | "reviewing"
+  | "review_native_turn"
+  | "review_readback"
+  | "review_display_rewrite"
+  | "review_conversion"
+  | "review_alignment"
+  | "review_reconciliation"
+  | "review_finalizing";
+
+export type WorkflowProcessState = "running" | "waiting" | "completed" | "failed" | "cancelled" | "stale";
+
 export interface PlannerQuestion {
   id: string;
   header: string;
@@ -178,6 +190,15 @@ export interface WorkflowRecord {
     itemId: string;
   };
   reviewCycles: number;
+  /** Safe, durable observability for the current/most recent review attempt. */
+  reviewStep?: ReviewStep;
+  reviewStartedAt?: string;
+  lastProgressAt?: string;
+  activeTurnId?: string;
+  reviewAttempt?: number;
+  reviewElapsedMs?: number;
+  lastProgressMessage?: string;
+  processState?: WorkflowProcessState;
   /** Optional for records written by older versions; defaults to 0. */
   noChangeReviewRounds?: number;
   /** Consecutive review CALLS (DSH-led review rounds or bridge submissions)
@@ -292,6 +313,10 @@ export interface WorkflowConfig {
   transientRetryMaxMs: number;
   transientRetryBudgetMs: number;
   transientRetryJitterRatio: number;
+  /** Independent Review progress heartbeat and stale threshold. Optional for
+   * host/test configs written before observability was added. */
+  reviewHeartbeatMs?: number;
+  reviewStaleMs?: number;
   /** Lease lifetime for submission callback claims (ms); heartbeats renew at
    * ttl/3 while a callback runs. Default 60000. */
   leaseTtlMs?: number;

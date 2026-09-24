@@ -48,6 +48,8 @@ import type {
   SubmissionState,
   TurnNeedsInputResult,
   TurnWaitResult,
+  ReviewStep,
+  WorkflowProcessState,
   WorkflowConfig,
   WorkflowPhase,
   WorkflowRecord,
@@ -227,6 +229,8 @@ export class WorkflowManager {
   private readonly retryNow: () => number;
   private readonly retrySleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly retryRandom: () => number;
+  /** DSH-owned Review heartbeat timers. They never depend on model output. */
+  private readonly reviewHeartbeats = new Map<string, NodeJS.Timeout>();
 
   constructor(
     private readonly store: WorkflowStore,
@@ -243,6 +247,120 @@ export class WorkflowManager {
     this.retryNow = retryHooks.now ?? Date.now;
     this.retrySleep = retryHooks.sleep ?? ((ms, signal) => delay(ms, signal));
     this.retryRandom = retryHooks.random ?? Math.random;
+  }
+
+  private reviewHeartbeatMs(): number {
+    return Math.max(250, this.config.reviewHeartbeatMs ?? 15_000);
+  }
+
+  private reviewStaleMs(): number {
+    return Math.max(1_000, this.config.reviewStaleMs ?? 60_000);
+  }
+
+  /** Start a durable Review attempt and its independent heartbeat. */
+  private async beginReviewObservation(
+    workflowId: string,
+    options: { enterReviewing?: boolean; step?: ReviewStep; message?: string } = {},
+  ) {
+    const now = new Date().toISOString();
+    const outcome = await this.store.update(workflowId, (record) => {
+      if (options.enterReviewing !== false) record.phase = "reviewing";
+      record.processState = "running";
+      record.reviewStep = options.step ?? "reviewing";
+      record.reviewStartedAt = now;
+      record.lastProgressAt = now;
+      record.reviewAttempt = (record.reviewAttempt ?? 0) + 1;
+      record.reviewElapsedMs = 0;
+      record.activeTurnId = undefined;
+      record.lastProgressMessage = options.message ?? "Review started";
+    }, { ignoreCancelled: false });
+    if (!outcome.suppressed) this.startReviewHeartbeat(workflowId);
+    return outcome;
+  }
+
+  private startReviewHeartbeat(workflowId: string): void {
+    this.stopReviewHeartbeat(workflowId);
+    const timer = setInterval(() => {
+      void this.markReviewProgress(workflowId).catch(() => undefined);
+    }, this.reviewHeartbeatMs());
+    timer.unref();
+    this.reviewHeartbeats.set(workflowId, timer);
+  }
+
+  private stopReviewHeartbeat(workflowId: string): void {
+    const timer = this.reviewHeartbeats.get(workflowId);
+    if (timer) clearInterval(timer);
+    this.reviewHeartbeats.delete(workflowId);
+  }
+
+  /** Persist only safe phase diagnostics; never model text or raw JSONL. */
+  private async markReviewProgress(
+    workflowId: string,
+    step?: ReviewStep,
+    message?: string,
+    activeTurnId?: string | null,
+  ): Promise<WorkflowRecord | undefined> {
+    const now = new Date();
+    const iso = now.toISOString();
+    const outcome = await this.store.update(workflowId, (record) => {
+      if (record.processState !== "running") return;
+      if (step) record.reviewStep = step;
+      record.lastProgressAt = iso;
+      if (record.reviewStartedAt) {
+        const started = Date.parse(record.reviewStartedAt);
+        if (Number.isFinite(started)) record.reviewElapsedMs = Math.max(0, now.getTime() - started);
+      }
+      if (activeTurnId !== undefined) record.activeTurnId = activeTurnId ?? undefined;
+      if (message) record.lastProgressMessage = message;
+    }, { ignoreCancelled: false });
+    return outcome.record;
+  }
+
+  private async finishReviewObservation(workflowId: string, fallbackState?: WorkflowProcessState): Promise<void> {
+    this.stopReviewHeartbeat(workflowId);
+    const now = new Date();
+    const iso = now.toISOString();
+    await this.store.update(workflowId, (record) => {
+      if (record.processState !== "running") return;
+      const terminalState: WorkflowProcessState = record.phase === "cancelled"
+        ? "cancelled"
+        : fallbackState
+          ?? (submissionActive(record.submissionState)
+            ? "waiting"
+            : record.phase === "reviewing" || record.phase === "executing" || record.phase === "fixing"
+              ? "failed"
+              : "completed");
+      record.processState = terminalState;
+      record.activeTurnId = undefined;
+      record.lastProgressAt = iso;
+      if (record.reviewStartedAt) {
+        const started = Date.parse(record.reviewStartedAt);
+        if (Number.isFinite(started)) record.reviewElapsedMs = Math.max(0, now.getTime() - started);
+      }
+      record.lastProgressMessage = terminalState === "completed"
+        ? "Review completed"
+        : terminalState === "waiting"
+          ? "Review waiting for retry or verdict delivery"
+        : terminalState === "cancelled"
+          ? "Review cancelled"
+          : terminalState === "stale"
+            ? "Review heartbeat became stale"
+            : "Review failed; retry is available";
+    }, { ignoreCancelled: true }).catch(() => undefined);
+  }
+
+  private async refreshStaleReview(record: WorkflowRecord): Promise<WorkflowRecord> {
+    if (record.processState !== "running" || !record.lastProgressAt) return record;
+    const age = Date.now() - Date.parse(record.lastProgressAt);
+    if (!Number.isFinite(age) || age <= this.reviewStaleMs()) return record;
+    const outcome = await this.store.update(record.id, (current) => {
+      if (current.processState !== "running" || current.lastProgressAt !== record.lastProgressAt) return;
+      current.processState = "stale";
+      current.activeTurnId = undefined;
+      current.lastProgressMessage = `No Review heartbeat for ${Math.floor(age / 1000)} seconds`;
+    }, { ignoreCancelled: true });
+    this.stopReviewHeartbeat(record.id);
+    return outcome.record;
   }
 
   /** 1.1.1: the shared retry policy for TRANSIENT upstream failures. A config
@@ -572,6 +690,10 @@ export class WorkflowManager {
         r.stagedVerdict = undefined;
         r.submissionNotice = undefined;
         r.callbackState = "idle";
+        r.processState = "failed";
+        r.activeTurnId = undefined;
+        r.lastProgressAt = new Date().toISOString();
+        r.lastProgressMessage = "Review failed: workspace evidence was insufficient";
         this.resetDesktopOpenState(r, command.submissionId ?? r.submissionId);
         return r;
       }
@@ -587,6 +709,10 @@ export class WorkflowManager {
         r.appliedVerdictEvidenceFingerprint = undefined;
         r.stagedVerdict = undefined;
         r.callbackState = "idle";
+        r.processState = "failed";
+        r.activeTurnId = undefined;
+        r.lastProgressAt = new Date().toISOString();
+        r.lastProgressMessage = "Review failed: workspace changed during delivery";
         this.resetDesktopOpenState(r, command.submissionId ?? r.submissionId);
         return r;
       }
@@ -608,6 +734,14 @@ export class WorkflowManager {
       r.phase = computed.phase;
       r.error = computed.error;
       r.noChangeReviewRounds = computed.noChangeReviewRounds ?? r.noChangeReviewRounds;
+      r.processState = "completed";
+      r.activeTurnId = undefined;
+      r.lastProgressAt = new Date().toISOString();
+      r.lastProgressMessage = "Review completed";
+      if (r.reviewStartedAt) {
+        const started = Date.parse(r.reviewStartedAt);
+        if (Number.isFinite(started)) r.reviewElapsedMs = Math.max(0, Date.now() - started);
+      }
       this.resetDesktopOpenState(r, command.submissionId ?? r.submissionId);
       return r;
     }, { ignoreCancelled: false });
@@ -915,6 +1049,11 @@ export class WorkflowManager {
       // now durably persisted); release it before the long callback runs.
       await submitLease.release();
       submitReleased = true;
+      await this.beginReviewObservation(workflowId, {
+        enterReviewing: false,
+        step: "reviewing",
+        message: "Review queued; waiting for Reviewer",
+      });
       const prompt = callbackPrompt(prepared.record, input, evidence);
       this.startSubmissionTask(workflowId, submissionId, prompt, prepared.record, lease);
       leaseTransferred = true;
@@ -1036,6 +1175,7 @@ export class WorkflowManager {
         if (sending.submissionId !== submissionId || submissionTerminal(sending.submissionState)) {
           return sending; // cancelled or re-claimed by another restarter
         }
+        await this.markReviewProgress(workflowId, "review_native_turn", "Running Reviewer turn");
         let outcome:
           | { kind: "verdict"; verdict: ReviewResult }
           | { kind: "retryable_busy"; reason?: string };
@@ -1084,6 +1224,9 @@ export class WorkflowManager {
               const registered = await updateCurrent((r) => {
                 r.reviewerThreadId = threadId;
                 r.reviewerTurnId = turnId;
+                r.activeTurnId = turnId;
+                r.lastProgressAt = new Date().toISOString();
+                r.lastProgressMessage = "Reviewer turn is running";
               });
               if (registered.reviewerThreadId !== threadId || registered.reviewerTurnId !== turnId) {
                 throw new Error("submission no longer owns the active reviewer turn");
@@ -1147,12 +1290,14 @@ export class WorkflowManager {
           let verdict = applyReviewConsistency(outcome.verdict);
           let contractFailed = false;
           try {
+        await this.markReviewProgress(workflowId, "review_alignment", "Checking Review authority alignment", null);
             // The alignment prompt receives the PREVIOUSLY APPLIED review and
             // THIS submission's fix summary (both persisted on the record), so
             // a legitimately carried-forward finding is never misjudged as a
             // generic conflict.
             const alignment = await this.alignReview(current, verdict, signal, current.pendingReviewRequest);
             if (!alignment.aligned) {
+              await this.markReviewProgress(workflowId, "review_reconciliation", "Reconciling Review findings", null);
               const reconciled = await this.reconcileReview(current, verdict, alignment.conflicts, signal, current.pendingReviewRequest);
               contractConflict = {
                 conflicts: alignment.conflicts,
@@ -1224,6 +1369,7 @@ export class WorkflowManager {
           }
         }
         if (outcome.kind === "verdict") {
+          await this.markReviewProgress(workflowId, "review_finalizing", "Finalizing Review status", null);
           if (!this.bridgeQueue) {
             const committed = await updateCurrent((r) => {
               r.submissionState = "waiting_verdict";
@@ -1310,6 +1456,7 @@ export class WorkflowManager {
       return current;
     } finally {
       lease?.stopHeartbeat();
+      await this.finishReviewObservation(workflowId);
     }
   }
 
@@ -1683,9 +1830,34 @@ export class WorkflowManager {
 
   async status(workflowId: string | undefined, exec: ToolRunContext): Promise<WorkflowRecord & { reviewerActive: boolean }> {
     const agent = requireAgent(exec);
-    const record = workflowId ? await this.store.load(workflowId) : await this.store.activeForSession(agent.id);
+    let record = workflowId ? await this.store.load(workflowId) : await this.store.activeForSession(agent.id);
     if (!record) throw new Error(workflowId ? `unknown workflow ${workflowId}` : "no active Codex workflow for this session");
     if (record.dshSessionId !== agent.id) throw new Error("workflow belongs to another DSH session");
+    // Old records have no observability fields. Hydrate a safe baseline from
+    // their durable updatedAt and immediately classify an abandoned review as
+    // stale; status remains read-safe and never exposes model output.
+    if (!record.processState && record.phase === "reviewing") {
+      const baseline = record.updatedAt || new Date().toISOString();
+      const hydrated = await this.store.update(record.id, (current) => {
+        if (current.processState) return;
+        current.processState = "running";
+        current.reviewStep = "reviewing";
+        current.reviewStartedAt = current.reviewStartedAt ?? baseline;
+        current.lastProgressAt = current.lastProgressAt ?? baseline;
+        current.reviewAttempt = current.reviewAttempt ?? 1;
+        current.reviewElapsedMs = current.reviewElapsedMs ?? 0;
+        current.lastProgressMessage = current.lastProgressMessage ?? "Review status recovered after restart";
+      }, { ignoreCancelled: true });
+      record = hydrated.record;
+    }
+    record = await this.refreshStaleReview(record);
+    if (!record.processState && ["passed", "blocked", "waiting_review_decision"].includes(record.phase)) {
+      record = { ...record, processState: "completed" };
+    } else if (!record.processState && record.phase === "cancelled") {
+      record = { ...record, processState: "cancelled" };
+    } else if (!record.processState && record.phase === "failed") {
+      record = { ...record, processState: "failed" };
+    }
     // Whether a Reviewer turn is currently executing. Provsional per-message
     // JSON is never surfaced; `latestReview` only ever holds an applied verdict.
     // A live Reviewer turn is reported by the callback dispatcher (accurate even
@@ -1696,7 +1868,7 @@ export class WorkflowManager {
     const reviewerActive =
       this.callback?.activeReview?.(record.id) === true
       || this.activeTurns.get(record.id)?.kind === "reviewer"
-      || (record.phase === "reviewing" && Boolean(record.reviewerTurnId));
+      || (record.processState === "running" && record.phase === "reviewing" && Boolean(record.reviewerTurnId));
     return { ...record, reviewerActive };
   }
 
@@ -1740,6 +1912,14 @@ export class WorkflowManager {
         // an interrupt.
       }
       r.phase = "cancelled";
+      r.processState = "cancelled";
+      r.activeTurnId = undefined;
+      r.lastProgressAt = new Date().toISOString();
+      r.lastProgressMessage = "Review cancelled";
+      if (r.reviewStartedAt) {
+        const started = Date.parse(r.reviewStartedAt);
+        if (Number.isFinite(started)) r.reviewElapsedMs = Math.max(0, Date.now() - started);
+      }
       if (r.submissionId && !submissionTerminal(r.submissionState)) {
         // Terminate the in-flight submission so no callback state may regress.
         r.submissionState = "failed";
@@ -1747,6 +1927,7 @@ export class WorkflowManager {
         r.callbackState = "failed";
       }
     }, { ignoreCancelled: true });
+    this.stopReviewHeartbeat(workflowId);
     if (active) target = { threadId: active.threadId, turnId: active.turnId };
     if (target) {
       await this.codex.interrupt(target.threadId, target.turnId, exec.signal).catch(() => undefined);
@@ -1805,12 +1986,11 @@ export class WorkflowManager {
   ): Promise<WorkflowRecord> {
     const pre = await this.store.load(workflowId);
     const priorPhase: WorkflowPhase = pre?.phase === "fixing" ? "fixing" : "executing";
-    const entering = await this.store.update(workflowId, (r) => {
-      r.phase = "reviewing";
-      // reviewCycles is NOT counted here: only a successfully applied verdict
-      // consumes a cycle, so infrastructure failures (evidence/review/normalize
-      // throws, timeouts) leave a retryable phase without burning a cycle.
-    }, { ignoreCancelled: false });
+    const entering = await this.beginReviewObservation(workflowId, {
+      enterReviewing: true,
+      step: "reviewing",
+      message: "Review started; collecting workspace evidence",
+    });
     if (entering.suppressed) return entering.record;
     let current = entering.record;
     try {
@@ -1868,6 +2048,9 @@ export class WorkflowManager {
         }, exec.signal);
         const threadCommit = await this.store.update(workflowId, (r) => {
           r.reviewerThreadId = reviewerThreadId!;
+          r.reviewStep = "review_native_turn";
+          r.lastProgressAt = new Date().toISOString();
+          r.lastProgressMessage = "Running Reviewer turn";
         }, { ignoreCancelled: false });
         if (threadCommit.suppressed) return threadCommit.record;
         current = threadCommit.record;
@@ -1875,6 +2058,10 @@ export class WorkflowManager {
         await this.codex.resumeThread(reviewerThreadId, current.cwd, exec.signal);
         // Auxiliary refresh of the hidden channel; never load-bearing.
         await this.codex.updateReviewerInstructions?.(reviewerThreadId, current.cwd, contract, exec.signal);
+      }
+
+      if (current.reviewerThreadId === reviewerThreadId && current.reviewStep !== "review_native_turn") {
+        await this.markReviewProgress(workflowId, "review_native_turn", "Running Reviewer turn");
       }
 
       // Git AND non-Git reviews use the SAME `review/start` custom target. Its
@@ -1926,6 +2113,7 @@ export class WorkflowManager {
         return afterReview!;
       }
       current = afterReview;
+      await this.markReviewProgress(workflowId, "review_readback", "Reading persisted Reviewer result", null);
       // BOTH the visible review turn AND the ephemeral normalization turn must
       // have genuinely completed (`status === "completed"`, not just the
       // `completed` kind): interrupted/failed/timed-out turns carry no usable
@@ -1971,6 +2159,7 @@ export class WorkflowManager {
         // rewrite's persisted output is detected as an APPENDED turn, never by
         // assuming the `turn/start` RPC id equals the persisted rollout id.
         const rewriteBaseline = await this.codex.captureTurnBaseline?.(reviewerThreadId, exec.signal);
+        await this.markReviewProgress(workflowId, "review_display_rewrite", "Rewriting Reviewer display output", null);
         const rewrite = await this.startTurnWithTransientRetry(reviewerThreadId, {
           prompt: reviewRewritePrompt(authoritativeText, current),
           ...(reviewerModel ? { model: reviewerModel } : {}),
@@ -2014,6 +2203,7 @@ export class WorkflowManager {
       // different default. The authoritative text is the rewrite turn's final
       // message when a display-rewrite ran, otherwise the native review text.
       let normalized: TurnWaitResult;
+      await this.markReviewProgress(workflowId, "review_conversion", "Converting Reviewer result", null);
       try {
         normalized = await this.codex.normalizeInFork({
           threadId: review.threadId,
@@ -2051,10 +2241,12 @@ export class WorkflowManager {
       // conflicts block the workflow with a reportable contract failure.
       let applied: ReviewResult | undefined;
       let conflictInfo: ReviewConflictInfo | undefined;
+      await this.markReviewProgress(workflowId, "review_alignment", "Checking Review authority alignment", null);
       const alignment = await this.alignReview(current, result, exec.signal, input);
       if (alignment.aligned) {
         applied = result;
       } else {
+        await this.markReviewProgress(workflowId, "review_reconciliation", "Reconciling Review findings");
         const reconciled = await this.reconcileReview(current, result, alignment.conflicts, exec.signal, input);
         conflictInfo = {
           conflicts: alignment.conflicts,
@@ -2080,6 +2272,10 @@ export class WorkflowManager {
               + `${r.reviewContractFailures} consecutive review calls; no code changes are required`
             : "review contract conflict: the review conflicts with the authority hierarchy and was not reconciled "
               + "after one correction attempt; no code changes are required — the next review call may retry";
+          r.processState = blocked ? "completed" : "failed";
+          r.activeTurnId = undefined;
+          r.lastProgressAt = new Date().toISOString();
+          r.lastProgressMessage = blocked ? "Review completed with a contract block" : "Review failed; retry is available";
         }, { ignoreCancelled: false });
         if (conflictCommit.suppressed) return conflictCommit.record;
         if (conflictCommit.record.phase === "blocked") {
@@ -2095,6 +2291,7 @@ export class WorkflowManager {
       // the outcome policy includes this round; the message is only injected
       // after the commit confirmed we were not cancelled in the meantime.
       let outcomeMessage: string | undefined;
+      await this.markReviewProgress(workflowId, "review_finalizing", "Finalizing Review status");
       const commit = await this.store.update(workflowId, (r) => {
         r.latestReview = applied!;
         // A cycle is consumed only now that a structured verdict is applied:
@@ -2109,6 +2306,14 @@ export class WorkflowManager {
         r.noChangeReviewRounds = outcome.noChangeReviewRounds ?? r.noChangeReviewRounds;
         r.phase = outcome.phase;
         r.error = outcome.error;
+        r.processState = "completed";
+        r.activeTurnId = undefined;
+        r.lastProgressAt = new Date().toISOString();
+        r.lastProgressMessage = "Review completed";
+        if (r.reviewStartedAt) {
+          const started = Date.parse(r.reviewStartedAt);
+          if (Number.isFinite(started)) r.reviewElapsedMs = Math.max(0, Date.now() - started);
+        }
       }, { ignoreCancelled: false });
       if (commit.suppressed) return commit.record;
       if (outcomeMessage) exec.deferContext(pluginMessage(outcomeMessage));
@@ -2127,9 +2332,15 @@ export class WorkflowManager {
         if (r.phase !== "reviewing") return;
         r.phase = priorPhase;
         r.error = errorMessage(error);
+        r.processState = "failed";
+        r.activeTurnId = undefined;
+        r.lastProgressAt = new Date().toISOString();
+        r.lastProgressMessage = "Review failed; retry is available";
       }, { ignoreCancelled: false });
       if (failed.suppressed) return failed.record;
       throw error;
+    } finally {
+      await this.finishReviewObservation(workflowId);
     }
   }
 
@@ -2162,6 +2373,7 @@ export class WorkflowManager {
     };
     let review;
     if (!threadId) {
+      await this.markReviewProgress(workflowId, "review_native_turn", "Starting CLI Reviewer turn");
       review = await this.audit!.createReview({
         ...request,
         onThread: async (id) => {
@@ -2181,6 +2393,7 @@ export class WorkflowManager {
         },
       }, exec.signal);
     } else {
+      await this.markReviewProgress(workflowId, "review_native_turn", "Resuming CLI Reviewer turn");
       if (current.reviewerThreadId !== threadId) {
         const commit = await this.store.update(workflowId, (r) => { r.reviewerThreadId = threadId!; }, { ignoreCancelled: false });
         if (commit.suppressed) return commit.record;
@@ -2192,15 +2405,18 @@ export class WorkflowManager {
     }
     if (review.threadId !== threadId) throw new Error("CLI review returned a different task identity");
     if (review.kind !== "verdict") throw new Error("CLI audit did not return a verdict");
+    await this.markReviewProgress(workflowId, "review_readback", "Reading CLI Reviewer result");
     current = (await this.store.load(workflowId)) ?? current;
     if (current.phase === "cancelled") return current;
     const displayError = reviewDisplayError(review.visibleText, current);
     if (displayError) throw new Error(`CLI review violates the display contract: ${displayError}`);
     let applied: ReviewResult | undefined;
     let conflictInfo: ReviewConflictInfo | undefined;
+    await this.markReviewProgress(workflowId, "review_alignment", "Checking Review authority alignment");
     const alignment = await this.alignReview(current, review.verdict, exec.signal, input);
     if (alignment.aligned) applied = review.verdict;
     else {
+      await this.markReviewProgress(workflowId, "review_reconciliation", "Reconciling Review findings", null);
       const reconciled = await this.reconcileReview(current, review.verdict, alignment.conflicts, exec.signal, input);
       conflictInfo = { conflicts: alignment.conflicts, reconciled: true, resolved: reconciled.aligned, at: new Date().toISOString() };
       if (reconciled.aligned) applied = reconciled.result;
@@ -2213,10 +2429,15 @@ export class WorkflowManager {
         const blocked = r.reviewContractFailures >= 2;
         r.phase = blocked ? "blocked" : priorPhase;
         r.error = blocked ? "reviewer contract failure: unresolved CLI review authority conflict" : "review contract conflict: CLI review requires reconciliation";
+        r.processState = blocked ? "completed" : "failed";
+        r.activeTurnId = undefined;
+        r.lastProgressAt = new Date().toISOString();
+        r.lastProgressMessage = blocked ? "Review completed with a contract block" : "Review failed; retry is available";
       }, { ignoreCancelled: false });
       return commit.record;
     }
     let message: string | undefined;
+    await this.markReviewProgress(workflowId, "review_finalizing", "Finalizing Review status", null);
     const commit = await this.store.update(workflowId, (r) => {
       r.latestReview = applied!;
       r.reviewCycles += 1;
@@ -2227,6 +2448,14 @@ export class WorkflowManager {
       r.noChangeReviewRounds = outcome.noChangeReviewRounds ?? r.noChangeReviewRounds;
       r.phase = outcome.phase;
       r.error = outcome.error;
+      r.processState = "completed";
+      r.activeTurnId = undefined;
+      r.lastProgressAt = new Date().toISOString();
+      r.lastProgressMessage = "Review completed";
+      if (r.reviewStartedAt) {
+        const started = Date.parse(r.reviewStartedAt);
+        if (Number.isFinite(started)) r.reviewElapsedMs = Math.max(0, Date.now() - started);
+      }
     }, { ignoreCancelled: false });
     if (message) exec.deferContext(pluginMessage(message));
     return commit.record;
@@ -2465,6 +2694,11 @@ export class WorkflowManager {
       } else {
         r.reviewerThreadId = threadId;
         r.reviewerTurnId = turnId;
+        if (r.processState === "running") {
+          r.activeTurnId = turnId;
+          r.lastProgressAt = new Date().toISOString();
+          r.lastProgressMessage = "Reviewer turn is running";
+        }
       }
     }, { ignoreCancelled: false });
     if (outcome.suppressed) {
@@ -2490,6 +2724,9 @@ export class WorkflowManager {
   ): Promise<void> {
     this.activeTurns.set(workflowId, { threadId, turnId, kind, ephemeral: true });
     const record = await this.store.load(workflowId);
+    if (record?.processState === "running" && kind === "reviewer") {
+      await this.markReviewProgress(workflowId, undefined, "Reviewer conversion turn is running", turnId);
+    }
     if (!record || record.phase === "cancelled") {
       this.activeTurns.delete(workflowId);
       await this.codex.interrupt(threadId, turnId).catch(() => undefined);
