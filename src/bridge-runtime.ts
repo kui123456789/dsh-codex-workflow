@@ -316,7 +316,10 @@ export class BridgeRuntime {
       // `polling` true through this finalizer so another timer tick cannot
       // overlap a new pump and teardown cannot return before the pump settles.
       try {
-        await this.refreshSessionsInternal(false).catch(() => undefined);
+        // Use the public seam here: tests and embedders may decorate the
+        // session router, while the default implementation still delegates to
+        // the internal repository-backed refresh.
+        await this.refreshSessions(false).catch(() => undefined);
       } finally {
         this.polling = false;
       }
