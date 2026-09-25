@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.8] - 2026-09-26
+
+- Ephemeral Planner/Reviewer threads now run structured conversion on the same thread instead of forking, because Codex App Server does not provide a rollout for ephemeral fork sources.
+- Ephemeral review paths no longer attempt persisted thread read-back; readable streamed output is used for the private conversion and DSH Session projection.
+- Added regression coverage proving ephemeral conversion emits a schema turn without `thread/fork`.
+
 All notable changes to `dsh-codex-workflow`.
 
 ## [1.1.7] - 2026-09-26

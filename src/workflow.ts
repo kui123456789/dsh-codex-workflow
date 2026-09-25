@@ -127,6 +127,16 @@ export interface CodexGateway {
     prompt: string;
     model?: string;
     outputSchema: Record<string, unknown>;
+    sourceEphemeral?: boolean;
+    onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
+  }, signal?: AbortSignal): Promise<TurnWaitResult>;
+  /** Structured conversion directly on an ephemeral source thread. */
+  normalizeInThread?(options: {
+    threadId: string;
+    cwd: string;
+    prompt: string;
+    model?: string;
+    outputSchema: Record<string, unknown>;
     onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
   }, signal?: AbortSignal): Promise<TurnWaitResult>;
   /** The App Server's default model selection (when present). Used to make the
@@ -1622,7 +1632,7 @@ export class WorkflowManager {
    * alike — whose instructions carry the full per-round context (original
    * task, approved plan, implementation summary, changed files, test
    * results, workspace evidence), the review scope and the item-by-item
-   * coverage gate, convert the readable review through an ephemeral fork,
+   * coverage gate, convert the readable review through a private conversion turn (in-place for ephemeral sources),
    * and apply the blocking gate, no-change termination and cycle limits.
    * Every store write goes through the atomic update primitive; any write
    * that races a cancellation is suppressed and the cancelled record is
@@ -1795,6 +1805,7 @@ export class WorkflowManager {
         ...(model ? { model } : {}),
         cwd: record.cwd,
         outputSchema: ALIGN_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+        sourceEphemeral: true,
         // The alignment fork is ephemeral: its thread/turn pair is the exact
         // active cancel target WHILE it runs, but the fork id is never
         // persisted (reviewerThreadId keeps pointing at the durable task).
@@ -1897,6 +1908,7 @@ export class WorkflowManager {
         cwd: after.cwd,
         ...(model ? { model } : {}),
         outputSchema: REVIEW_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+        sourceEphemeral: true,
         onStarted: (started) => this.registerEphemeralTurn(after.id, started.threadId, started.turnId, "reviewer"),
       }, signal);
     } finally {
@@ -2113,7 +2125,7 @@ export class WorkflowManager {
     // create a conversion fork for a cancelled workflow.
     const beforeFork = await this.store.load(workflowId);
     if (!beforeFork || beforeFork.phase === "cancelled") return beforeFork!;
-    // One ephemeral conversion of a visible reply; every failure path FAILS
+    // One private structured conversion of a visible reply; every failure path FAILS
     // the workflow terminally and never writes a plan.
     const convert = async (visibleText: string): Promise<PlannerResult | WorkflowRecord> => {
       let normalized: TurnWaitResult;
@@ -2124,6 +2136,7 @@ export class WorkflowManager {
           prompt: plannerConvertPrompt(visibleText),
           ...(model ? { model } : {}),
           outputSchema: PLANNER_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+          sourceEphemeral: true,
           onStarted: (started) => this.registerEphemeralTurn(workflowId, started.threadId, started.turnId, "planner"),
         }, exec.signal);
       } catch (error) {

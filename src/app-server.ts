@@ -112,12 +112,14 @@ export interface ReviewerStartOptions {
 
 /** Options for an ephemeral-fork structured conversion turn. */
 export interface ForkConversionOptions {
-  /** The persistent source thread whose EPHEMERAL fork hosts the conversion. */
+  /** Source thread for the conversion. Ephemeral sources convert in-place;
+   * durable sources use an ephemeral fork. */
   threadId: string;
   cwd: string;
   prompt: string;
   model?: string;
   outputSchema: JsonObject;
+  sourceEphemeral?: boolean;
   onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
 }
 
@@ -654,6 +656,7 @@ export class CodexAppServerClient {
     options: ForkConversionOptions,
     signal?: AbortSignal,
   ): Promise<TurnWaitResult> {
+    if (options.sourceEphemeral) return this.normalizeInThread(options, signal);
     const forkThreadId = await this.forkThread(options.threadId, options.cwd, signal);
     try {
       return await this.startTurn(forkThreadId, {
@@ -671,6 +674,24 @@ export class CodexAppServerClient {
       }
       await this.unsubscribeThread(forkThreadId).catch(() => undefined);
     }
+  }
+
+  /** Convert directly on an ephemeral source thread. Ephemeral threads have
+   * no persisted rollout, so they cannot be used as the source of
+   * `thread/fork`; the visible turn and this JSON turn still share the same
+   * in-process context and the JSON never enters Desktop history. */
+  async normalizeInThread(
+    options: ForkConversionOptions,
+    signal?: AbortSignal,
+  ): Promise<TurnWaitResult> {
+    return this.startTurn(options.threadId, {
+      prompt: options.prompt,
+      ...(options.model ? { model: options.model } : {}),
+      effort: "low",
+      outputSchema: options.outputSchema,
+      conversion: true,
+      onStarted: options.onStarted,
+    }, signal);
   }
 
   /** Fork an existing thread with `ephemeral: true` (Codex's `thread/fork`).

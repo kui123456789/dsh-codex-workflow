@@ -257,8 +257,9 @@ export class ReviewExecution {
       }
 
       // Since 1.0.7 the visible review turn (startReview) produces a readable
-      // review; the structured verdict is derived by an EPHEMERAL fork of the
-      // workflow task, never written into the persisted task history. The fork
+      // review; the structured verdict is derived by a private conversion turn
+      // (in-place for this ephemeral Reviewer), never written into Desktop
+      // history. Durable compatibility callers may still use a fork; the fork
       // passes the SAME effective reviewer model (persisted override, bundle
       // config, or the resolved server default) so it never drifts to a
       // different default. The authoritative text is the rewrite turn's final
@@ -285,9 +286,9 @@ export class ReviewExecution {
             prompt: reviewConversionPrompt(authoritativeText, workflowId),
             ...(reviewerModel ? { model: reviewerModel } : {}),
             outputSchema: REVIEW_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
-            // The ephemeral conversion fork becomes the active reviewer turn for
-            // cancellation (in-process only — the fork id is never persisted, so
-            // reviewerThreadId keeps pointing at the durable workflow task).
+            sourceEphemeral: true,
+            // The private conversion turn becomes the active reviewer turn for
+            // cancellation (in-process only — its id is never persisted).
             onStarted: (started: { threadId: string; turnId: string }) => this.ctx.registerEphemeralTurn(workflowId, started.threadId, started.turnId, "reviewer"),
           }, exec.signal);
         } finally {

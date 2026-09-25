@@ -1,6 +1,6 @@
-# Release checklist — dsh-codex-workflow 1.1.7
+# Release checklist — dsh-codex-workflow 1.1.8
 
-This is the operator checklist for shipping the CURRENT release (1.1.7; keep this line in sync with `package.json` on every release). It assumes the automated gates
+This is the operator checklist for shipping the CURRENT release (1.1.8; keep this line in sync with `package.json` on every release). It assumes the automated gates
 succeeded; this page is about the things automation cannot cover, plus the
 rollback story. It never authorizes touching user credentials or configuration
 outside `$DSH_HOME/storages/dsh-codex-workflow/`.
@@ -38,7 +38,7 @@ Run `pnpm release:check` twice in a row and confirm:
      then restore `complex`;
    - while one workflow is active, send another qualifying request and confirm
      no second WorkflowRecord or Planner task is created.
-3. **Current acceptance path (1.1.7).** The manual harnesses this step used to
+3. **Current acceptance path (1.1.8).** The manual harnesses this step used to
    name (`pnpm lifecycle:accept`, `pnpm review-only:accept`) were REMOVED: they
    drove the pre-1.1.0 CLI-visible wiring and could no longer be trusted as
    evidence. Run instead:
@@ -54,7 +54,7 @@ Run `pnpm release:check` twice in a row and confirm:
    - one real bridge relay (Codex-led `dispatch` → `codex_workflow_submit`) and
      confirm the verdict returns to the originating task exactly once.
 
-   The bullets below are the HISTORICAL pre-1.1.7 acceptance script — keep them
+   The bullets below are the HISTORICAL pre-1.1.8 acceptance script — keep them
    only as a record of what used to be asserted. They must not be used as
    evidence for the ephemeral Reviewer path.
 4. Historical script (pre-1.1.0, no longer runnable — kept for reference):
@@ -179,7 +179,7 @@ Run `pnpm release:check` twice in a row and confirm:
 
 - Do not push to user `$DSH_HOME` outside `storages/dsh-codex-workflow`.
 - Do not modify or rotate any credentials (this plugin never stores them).
-- Create the `v1.1.7` Git tag and corresponding GitHub Release only after all
+- Create the `v1.1.8` Git tag and corresponding GitHub Release only after all
   automated and real-environment checks pass.
 - Do not commit or touch `docs/research/` or `docs/superpowers/` (untracked).
 

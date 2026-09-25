@@ -671,6 +671,39 @@ test("ephemeral Planner/Reviewer threads are never named or persisted for Deskto
   }
 });
 
+test("ephemeral source conversion stays on the same thread instead of forking", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-ephemeral-conversion-"));
+  const callsFile = join(directory, "calls.jsonl");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: { ...process.env, FAKE_CODEX_THREAD_PARAMS_MARKER: callsFile },
+  });
+  try {
+    const threadId = await codex.startThread({ cwd: directory, ephemeral: true });
+    const converted = await codex.normalizeInFork({
+      threadId,
+      cwd: directory,
+      prompt: "Convert this ephemeral reply",
+      outputSchema: PLANNER_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+      sourceEphemeral: true,
+    });
+    assert.equal(converted.kind, "completed");
+    const calls = (await readFile(callsFile, "utf8")).trim().split("\n").filter(Boolean)
+      .map((line) => JSON.parse(line) as { method: string; params: Record<string, any> });
+    assert.equal(calls.some((call) => call.method === "thread/fork"), false);
+    const turns = calls.filter((call) => call.method === "turn/start");
+    assert.equal(turns.length, 1);
+    assert.equal(turns[0]?.params.threadId, threadId);
+    assert.ok(turns[0]?.params.outputSchema);
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("1.1.2: a Reviewer task whose NAME cannot be set is released, never left holding a writer", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-reviewer-namefail-"));
   const callsFile = join(directory, "calls.jsonl");

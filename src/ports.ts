@@ -53,6 +53,7 @@ export type CodexTurnPort = Pick<
   | "readAppendedTurnText"
   | "forkThread"
   | "normalizeInFork"
+  | "normalizeInThread"
   | "resolveDefaultModel"
   | "health"
   | "start"
