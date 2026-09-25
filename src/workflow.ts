@@ -47,6 +47,8 @@ import { ThreadGateway } from "./application/app-server/thread-gateway.js";
 import { TurnGateway } from "./application/app-server/turn-gateway.js";
 import { WorkflowRuntimeState } from "./application/workflow-runtime-state.js";
 import { ReviewObservation } from "./application/review-observation.js";
+import { ReviewExecution } from "./application/review-execution.js";
+import { SubmissionExecution } from "./application/submission-execution.js";
 import type {
   AlignmentOutcome,
   PersistedTurnBaseline,
@@ -203,7 +205,7 @@ export type { ReviewInput };
  * the plugin has no way to release. Records that already carry a dedicated
  * Reviewer id are unaffected and keep their task.
  */
-function isSharedReviewerAlias(record: WorkflowRecord): boolean {
+export function isSharedReviewerAlias(record: WorkflowRecord): boolean {
   if (!record.reviewerThreadId) return false;
   return record.reviewerThreadId === record.plannerThreadId
     || record.reviewerThreadId === record.codexThreadId;
@@ -257,6 +259,8 @@ export class WorkflowManager {
   private readonly turnGateway: TurnGateway;
   private readonly plannerExecution: PlannerExecution;
   private readonly reviewObservation: ReviewObservation;
+  private readonly reviewExecution: ReviewExecution;
+  private readonly submissionExecution: SubmissionExecution;
   /** The only owner of in-process flow lifecycle state. */
   private readonly runtime = new WorkflowRuntimeState();
   /** Submission lease lifetime; heartbeats renew at ttl/3 while a callback
@@ -333,6 +337,51 @@ export class WorkflowManager {
       plannerPrompt,
       resumedAnswerPrompt,
       threadName,
+      errorMessage,
+    });
+    this.reviewExecution = new ReviewExecution({
+      store: this.store,
+      config: this.config,
+      runtime: this.runtime,
+      reviewObservation: this.reviewObservation,
+      turnGateway: this.turnGateway,
+      audit: this.audit,
+      trackNoChange: this.trackNoChange.bind(this),
+      createReviewerThread: this.createReviewerThread.bind(this),
+      prepareBoundReviewer: this.prepareBoundReviewer.bind(this),
+      renameLegacyReviewer: this.renameLegacyReviewer.bind(this),
+      releaseUnboundReviewer: this.releaseUnboundReviewer.bind(this),
+      reportCleanupNote: this.reportCleanupNote.bind(this),
+      readBackAppended: this.readBackAppended.bind(this),
+      alignReview: this.alignReview.bind(this),
+      reconcileReview: this.reconcileReview.bind(this),
+      computeReviewOutcome: this.computeReviewOutcome.bind(this),
+      registerActiveTurn: this.registerActiveTurn.bind(this),
+      registerEphemeralTurn: this.registerEphemeralTurn.bind(this),
+      startReviewWithTransientRetry: this.startReviewWithTransientRetry.bind(this),
+      startTurnWithTransientRetry: this.startTurnWithTransientRetry.bind(this),
+      releaseReviewerSubscription: this.releaseReviewerSubscription.bind(this),
+      flushCleanupNotes: this.flushCleanupNotes.bind(this),
+      errorMessage,
+    });
+    this.submissionExecution = new SubmissionExecution({
+      store: this.store,
+      config: this.config,
+      runtime: this.runtime,
+      callback: this.callback,
+      bridgeQueue: this.bridgeQueue,
+      reviewerGateway: this.reviewerGateway,
+      reviewObservation: this.reviewObservation,
+      leaseTtlMs: this.leaseTtlMs,
+      boundedCleanup: this.boundedCleanup.bind(this),
+      enqueueStagedVerdict: this.enqueueStagedVerdict.bind(this),
+      enqueueSubmissionNotice: this.enqueueSubmissionNotice.bind(this),
+      stageSubmissionFailure: this.stageSubmissionFailure.bind(this),
+      renameLegacyReviewer: this.renameLegacyReviewer.bind(this),
+      reportCleanupNote: this.reportCleanupNote.bind(this),
+      flushCleanupNotes: this.flushCleanupNotes.bind(this),
+      alignReview: this.alignReview.bind(this),
+      reconcileReview: this.reconcileReview.bind(this),
       errorMessage,
     });
   }
@@ -1197,7 +1246,7 @@ export class WorkflowManager {
    * conditional on the submission id and never moves a finished submission
    * backwards.
    */
-  private async runSubmissionCallback(
+  private runSubmissionCallback(
     workflowId: string,
     submissionId: string,
     prompt: string,
@@ -1205,344 +1254,8 @@ export class WorkflowManager {
     signal?: AbortSignal,
     lease?: ManagerLease,
   ): Promise<WorkflowRecord> {
-    let current = seed;
-    const roundStartAttempt = current.submissionAttempts ?? 0;
-    let leaseLost = false;
-    // Every state write must stay fenced to THIS lease (submissionId + token +
-    // epoch): a stale owner can never rewrite a submission the lease moved on.
-    const isCurrent = (record: WorkflowRecord) =>
-      record.submissionId === submissionId
-      && !submissionTerminal(record.submissionState)
-      && (!lease || (record.submissionLeaseToken === lease.owner && record.submissionLeaseEpoch === lease.epoch));
-    const updateCurrent = async (fn: (record: WorkflowRecord) => void): Promise<WorkflowRecord> => {
-      const outcome = await this.store.update(workflowId, (r) => {
-        if (!isCurrent(r)) return;
-        fn(r);
-      }, { ignoreCancelled: false });
-      current = outcome.record;
-      return current;
-    };
-    lease?.heartbeat(this.leaseTtlMs / 3, () => {
-      // We lost the lease (renew changed 0 rows): another process owns the
-      // callback now. Kill our child and stop writing state — the stale
-      // callback must never enqueue a verdict or regress the new owner's
-      // received/applied/delivered back to sending/retrying/failed.
-      leaseLost = true;
-      this.callback?.cancelSubmission(workflowId, submissionId);
-    });
-    try {
-      for (let attempt = (current.submissionAttempts ?? 0) + 1; ; attempt += 1) {
-        if (this.runtime.stopped || signal?.aborted || leaseLost) return current;
-        const sending = await updateCurrent((r) => {
-          r.submissionState = "sending";
-          r.submissionAttempts = attempt;
-          r.submissionRetryAt = undefined;
-        });
-        if (sending.submissionId !== submissionId || submissionTerminal(sending.submissionState)) {
-          return sending; // cancelled or re-claimed by another restarter
-        }
-        await this.reviewObservation.mark(workflowId, "review_native_turn", "Running Reviewer turn");
-        let outcome:
-          | { kind: "verdict"; verdict: ReviewResult }
-          | { kind: "retryable_busy"; reason?: string };
-        try {
-          // 1.1.0: only the workflow's OWN dedicated Reviewer task is ever
-          // released. The Planner/origin task is not a review target any more
-          // (an external writer holding it must never block a review), and a
-          // legacy shared alias is not resumed at all — the dispatcher binds a
-          // dedicated Reviewer instead.
-          // 1.1.2: only an App Server-created Reviewer can be rendered in Codex
-          // Desktop. A legacy CLI-created task (`source='exec'`) is handed over
-          // as UNBOUND so the dispatcher creates a visible replacement; the old
-          // task is left intact and merely renamed for humans.
-          const boundReviewer = current.reviewerThreadId
-            && !isSharedReviewerAlias(current)
-            && current.reviewerThreadOrigin === "app-server"
-            ? current.reviewerThreadId
-            : undefined;
-          // The helper owns the "may this be renamed?" rule (dedicated, legacy
-          // only — never the Planner/origin task), so it is simply called.
-          if (!boundReviewer) await this.renameLegacyReviewer(current, workflowId);
-          if (boundReviewer) {
-            // 1.1.4: signal-free but BOUNDED — a handoff that never settles must
-            // not wedge the round (or cancel/teardown) either.
-           const handoffNote = await this.boundedCleanup("external handoff", () => (
-              this.reviewerGateway.externalRelease(boundReviewer)
-                ?? this.reviewerGateway.unsubscribe(boundReviewer)
-            ));
-            this.reportCleanupNote(workflowId, handoffNote);
-          }
-          outcome = await this.callback!.send({
-            workflowId,
-            submissionId,
-            codexThreadId: current.codexThreadId!,
-            cwd: current.cwd,
-            prompt,
-            // The original task/plan context lets the background dispatcher
-            // enforce the SAME visible-review display contract as the
-            // DSH-led path (task language + four readable sections).
-            task: current.task,
-            ...(current.planMarkdown ? { planMarkdown: current.planMarkdown } : {}),
-            // A legacy shared alias is handed over as UNBOUND so the
-            // dispatcher creates the dedicated Reviewer instead of resuming
-            // the Planner/origin task.
-            reviewerThreadId: boundReviewer,
-            reviewerName: `DSH Reviewer: ${workflowId}`,
-            ...(current.reviewerModel || this.config.reviewerModel
-              ? { model: current.reviewerModel || this.config.reviewerModel }
-              : {}),
-            effort: current.reviewerEffort ?? this.config.reviewerEffort,
-            onThread: async (threadId) => {
-              const registered = await updateCurrent((r) => {
-                r.reviewerThreadId = threadId;
-                r.reviewerThreadOrigin = "app-server";
-              });
-              if (registered.reviewerThreadId !== threadId) {
-                throw new Error("submission no longer owns the reviewer thread");
-              }
-            },
-            onStarted: async ({ threadId, turnId }) => {
-              const registered = await updateCurrent((r) => {
-                r.reviewerThreadId = threadId;
-                r.reviewerThreadOrigin = "app-server";
-                r.reviewerTurnId = turnId;
-                r.activeTurnId = turnId;
-                r.lastProgressAt = new Date().toISOString();
-                r.lastProgressMessage = "Reviewer turn is running";
-              });
-              if (registered.reviewerThreadId !== threadId || registered.reviewerTurnId !== turnId) {
-                throw new Error("submission no longer owns the active reviewer turn");
-              }
-            },
-          }, signal);
-        } catch (error) {
-          if (leaseLost) return current; // we were taken over mid-flight: write nothing
-          if (
-            error instanceof CodexInvalidThreadError
-            || error instanceof CodexNoVerdictError
-            || error instanceof CodexCallbackProcessError
-          ) {
-            const failed = await this.stageSubmissionFailure(updateCurrent, workflowId, submissionId, error.message);
-            await this.enqueueSubmissionNotice(workflowId, submissionId, failed, signal);
-            return current;
-          }
-          if (signal?.aborted || this.runtime.stopped) {
-            // A cancelled/teardown abort must never leave the submission stuck
-            // at `sending` with no backoff: persist a recoverable `retrying`
-            // state (skip only during teardown, when the store is closing — a
-            // restart reclaims the recoverable `sending` record anyway).
-            if (!this.runtime.stopped && !leaseLost) {
-              await updateCurrent((r) => {
-                r.submissionState = "retrying";
-                r.submissionError = "interrupted: callback aborted before a verdict";
-                r.submissionCallbackReason = "callback aborted (cancel/restart)";
-                r.submissionRetryAt = Date.now() + this.config.callbackRetryBaseMs;
-                r.callbackState = "retrying";
-              }).catch(() => undefined);
-            }
-            throw error;
-          }
-          const message = errorMessage(error);
-          // 1.1.1: the SHARED transient classification (server_overloaded /
-          // at capacity / 429 / 5xx / dropped streams / writer held elsewhere)
-          // so a temporary capacity problem can never be filed as an unknown,
-          // terminal-looking callback failure.
-          const busyReason = /Codex turn timed out|timed out/i.test(message)
-            ? "turn timeout"
-            : transientReason(message) ?? "unknown callback failure";
-          outcome = { kind: "retryable_busy", reason: busyReason };
-        }
-        if (leaseLost) return current; // never write or enqueue after losing the lease
-        // 1.0.10 authority outcome of this review call, shared by the conflict
-        // refusal and the staging pipeline below. An unresolved conflict
-        // restores the PRE-REVIEW phase (executing/fixing as the workflow was
-        // when this submission started).
-        const priorPhase: WorkflowPhase = current.phase === "fixing" ? "fixing" : "executing";
-        let contractConflict: ReviewConflictInfo | undefined;
-        if (outcome.kind === "verdict") {
-          // 1.0.10 REVIEW AUTHORITY ALIGNMENT on the bridge path: the verdict
-          // must align with the authority hierarchy before it may be staged.
-          // One invisible alignment fork checks the result; on conflict the
-          // SAME visible task gets ONE reconciliation turn and the corrected
-          // verdict is re-normalized and re-aligned. An unresolved conflict
-          // NEVER stages/applies (no latestReview, no cycle, no fix prompt);
-          // two CONSECUTIVE unresolved conflicts block the workflow. An
-          // authority-machinery failure (fork/turn/timeout) keeps the
-          // submission RETRYABLE like any normalization failure.
-          let verdict = applyReviewConsistency(outcome.verdict);
-          let contractFailed = false;
-          try {
-        await this.reviewObservation.mark(workflowId, "review_alignment", "Checking Review authority alignment", null);
-            // The alignment prompt receives the PREVIOUSLY APPLIED review and
-            // THIS submission's fix summary (both persisted on the record), so
-            // a legitimately carried-forward finding is never misjudged as a
-            // generic conflict.
-            const alignment = await this.alignReview(current, verdict, signal, current.pendingReviewRequest);
-            if (!alignment.aligned) {
-              await this.reviewObservation.mark(workflowId, "review_reconciliation", "Reconciling Review findings", null);
-              const reconciled = await this.reconcileReview(current, verdict, alignment.conflicts, signal, current.pendingReviewRequest);
-              contractConflict = {
-                conflicts: alignment.conflicts,
-                reconciled: true,
-                resolved: reconciled.aligned,
-                at: new Date().toISOString(),
-              };
-              if (reconciled.aligned) {
-                verdict = reconciled.result;
-              } else {
-                contractFailed = true;
-              }
-            }
-          } catch (error) {
-            if (leaseLost) return current;
-            if (signal?.aborted || this.runtime.stopped) throw error;
-            // The authority machinery itself failed (fork/turn/parse/invalid
-            // semantics/preservation): retryable infrastructure, never a
-            // verdict, never a consumed cycle. The concrete reason is kept so
-            // a stuck submission is diagnosable.
-            outcome = { kind: "retryable_busy", reason: `review authority alignment failed: ${errorMessage(error)}` };
-          }
-          if (outcome.kind === "retryable_busy") {
-            // fall through to the shared busy handling below (marks retrying).
-          } else if (contractFailed) {
-            const failures = (current.reviewContractFailures ?? 0) + 1;
-            const blocked = failures >= 2;
-            const conflicted = await updateCurrent((r) => {
-              if (r.submissionId !== submissionId || submissionTerminal(r.submissionState)) return;
-              r.latestReviewConflict = contractConflict;
-              r.reviewContractFailures = failures;
-              r.submissionState = "failed";
-              r.submissionError = "reviewer contract conflict: the review conflicts with the authority hierarchy and was not reconciled after one correction attempt; no code changes are required";
-              r.callbackState = "failed";
-              if (blocked) {
-                r.phase = "blocked";
-                r.error = `reviewer contract failure: the review conflicts with the authority hierarchy and was not reconciled after ${failures} consecutive review calls; no code changes are required`;
-              } else {
-                r.phase = priorPhase;
-                r.error = "review contract conflict: the review conflicts with the authority hierarchy and was not reconciled; no code changes are required — the next submission may retry";
-              }
-              if (!r.submissionNotice || r.submissionNotice.command.submissionId !== submissionId) {
-                const command: SubmissionNoticeCommand = {
-                  version: 1,
-                  kind: "submission_notice",
-                  requestId: newRequestId(),
-                  createdAt: new Date().toISOString(),
-                  workflowId,
-                  submissionId,
-                  codexThreadId: r.codexThreadId!,
-                  dshSessionId: r.dshSessionId,
-                  level: "error",
-                  message: blocked
-                    ? `Codex Reviewer 契约故障：审查意见与权威层级（原始任务/批准计划）冲突且连续 ${failures} 次审查未能在一次纠正中对齐；无需修改代码。`
-                    : `Codex Reviewer 审查意见与权威层级（原始任务/批准计划）冲突且一次纠正未对齐；无需修改代码，可以再次提交审查。`,
-                };
-                r.submissionNotice = { command, state: "prepared" };
-              }
-            });
-            if (conflicted.submissionId !== submissionId) return conflicted;
-            // Delivery of the contract-failure diagnostic (never a fix prompt).
-            await this.enqueueSubmissionNotice(workflowId, submissionId, conflicted, signal)
-              .catch(() => undefined);
-            return conflicted;
-          } else {
-            // The authority validated the verdict (or the reconciliation
-            // corrected it): hand the aligned verdict to the staging pipeline.
-            outcome = { kind: "verdict", verdict };
-          }
-        }
-        if (outcome.kind === "verdict") {
-          await this.reviewObservation.mark(workflowId, "review_finalizing", "Finalizing Review status", null);
-          if (!this.bridgeQueue) {
-            const committed = await updateCurrent((r) => {
-              r.submissionState = "waiting_verdict";
-              r.submissionError = undefined;
-              r.callbackState = "waiting_verdict";
-            });
-            return committed;
-          }
-          // Phase A: persist the FULL verdict command BEFORE touching the queue.
-          // requestId and createdAt are minted exactly once, here; recovery
-          // re-enqueues this exact command so requestId+createdAt+commandHash
-          // are identical every time.
-          let stagedRequestId: string | undefined;
-          const staged = await updateCurrent((r) => {
-            stagedRequestId = newRequestId();
-            const command: SubmitVerdictCommand = {
-              version: 1,
-              kind: "submit_verdict",
-              requestId: stagedRequestId,
-              createdAt: new Date().toISOString(),
-              workflowId,
-              codexThreadId: r.codexThreadId ?? current.codexThreadId!,
-              submissionId,
-              // Route the verdict to the runtime owning the workflow session.
-              dshSessionId: r.dshSessionId,
-              verdict: outcome.verdict,
-            };
-            r.submissionState = "verdict_ready";
-            r.stagedVerdict = { command, createdAt: command.createdAt };
-            r.submissionError = undefined;
-            r.submissionRetryAt = undefined;
-            // 1.0.10: a reconciliation-corrected verdict records the
-            // auto-correction on the durable record (status surface), and an
-            // ALIGNED verdict (with or without reconciliation) ends the
-            // unresolved-conflict streak — a later NON-consecutive conflict
-            // must never accumulate towards the two-strike block.
-            if (contractConflict) r.latestReviewConflict = contractConflict;
-            r.reviewContractFailures = 0;
-          });
-          if (staged.submissionId !== submissionId || submissionTerminal(staged.submissionState)) return staged;
-          // Phase B: idempotent enqueue of the exact staged command.
-          const enqueued = await this.enqueueStagedVerdict(workflowId, submissionId, staged, signal);
-          if (enqueued !== "committed") return enqueued;
-          // Phase C: mark received; the staged identity is KEPT until applied
-          // so a conflicting manual verdict can never jump ahead of it. A
-          // verdict already applied by the queue pump in the meantime is
-          // terminal and wins.
-          const received = await updateCurrent((r) => {
-            if (r.stagedVerdict?.command.requestId !== stagedRequestId) return;
-            r.submissionState = "received";
-            r.callbackState = "idle";
-          });
-          return received;
-        }
-        const busy = await updateCurrent((r) => {
-          r.submissionState = "retrying";
-          r.submissionError = `codex thread busy or rate limited${outcome.reason ? ` (${outcome.reason})` : ""}`;
-          r.submissionCallbackReason = outcome.reason ?? "busy";
-          r.callbackState = "retrying";
-        });
-        if (busy.submissionId !== submissionId || submissionTerminal(busy.submissionState)) return busy;
-        const attemptsThisRound = attempt - roundStartAttempt;
-        if (attemptsThisRound >= this.config.callbackMaxAttempts) {
-          const retryDelayMs = callbackRecoveryDelay(this.config.callbackRetryBaseMs, attemptsThisRound);
-          await updateCurrent((r) => {
-            r.submissionState = "retrying";
-            r.submissionError = `codex thread busy after ${attemptsThisRound} attempts in this round (${outcome.reason ?? "busy"}); recovery will retry`;
-            r.submissionCallbackReason = outcome.reason ?? "busy";
-            r.submissionRetryAt = Date.now() + retryDelayMs;
-            r.callbackState = "retrying";
-          });
-          return current;
-        }
-        // The bridge submission cadence stays governed by `callbackRetryBaseMs`
-        // (the recovery loop's own knob); the 1.1.1 transient policy governs the
-        // MODEL calls (CLI audit + visible turns), not this queue cadence.
-        await delay(this.config.callbackRetryBaseMs * 2 ** (attemptsThisRound - 1), signal);
-        if (signal?.aborted) throw abortError(signal);
-      }
-    } catch (error) {
-      if (signal?.aborted || this.runtime.stopped) throw error;
-      const failed = await this.stageSubmissionFailure(updateCurrent, workflowId, submissionId, errorMessage(error));
-      await this.enqueueSubmissionNotice(workflowId, submissionId, failed, signal);
-      return current;
-    } finally {
-      lease?.stopHeartbeat();
-      await this.reviewObservation.finish(workflowId);
-      await this.flushCleanupNotes(workflowId);
-    }
+    return this.submissionExecution.run(workflowId, submissionId, prompt, seed, signal, lease);
   }
-
   private async stageSubmissionFailure(
     updateCurrent: (fn: (record: WorkflowRecord) => void) => Promise<WorkflowRecord>,
     workflowId: string,
@@ -2062,459 +1775,9 @@ export class WorkflowManager {
    * that races a cancellation is suppressed and the cancelled record is
    * returned.
    */
-  private async reviewOnce(
-    workflowId: string,
-    input: ReviewInput,
-    exec: ToolRunContext,
-  ): Promise<WorkflowRecord> {
-    const pre = await this.store.load(workflowId);
-    const priorPhase: WorkflowPhase = pre?.phase === "fixing" ? "fixing" : "executing";
-    const entering = await this.reviewObservation.begin(workflowId, {
-      enterReviewing: true,
-      step: "reviewing",
-      message: "Review started; collecting workspace evidence",
-    });
-    if (entering.suppressed) return entering.record;
-    let current = entering.record;
-    let reviewerClaimed = false;
-    let reviewerThreadId: string | undefined;
-    // 1.1.6: pin the App Server child for the whole round. Without the pin the
-    // idle window can fall between creating the Reviewer and its first turn,
-    // and the respawned process answers `thread not found` for that new thread.
-    this.turnGateway.beginRound();
-    try {
-      const evidence = await collectEvidence({
-        cwd: current.cwd,
-        maxDiffBytes: this.config.reviewDiffMaxBytes,
-        changedFiles: input.changedFiles,
-      });
-      const git = await isGitRepository(current.cwd);
-
-      const evidenceCommit = await this.store.update(workflowId, (r) => {
-        r.latestReviewEvidence = evidence;
-        this.trackNoChange(r, evidence);
-      }, { ignoreCancelled: false });
-      if (evidenceCommit.suppressed) return evidenceCommit.record;
-      current = evidenceCommit.record;
-
-      // 1.1.2: the VISIBLE review turn ALWAYS runs on the App Server now, even
-      // when a CLI audit is configured. A Reviewer task created by
-      // `codex exec` is stored with `source='exec'`, is never returned by
-      // `thread/list` (measured 0/15, versus 62/72 App Server threads) and
-      // therefore cannot be rendered in Codex Desktop at all — the readable
-      // review was landing in a task the user could not open. The CLI keeps
-      // only the internal conversions (normalize/align), which run in
-      // independent `--ephemeral` sessions and never create a durable thread.
-
-      // The durable visible REVIEWER task (1.1.0). A review always runs on a
-      // DEDICATED Reviewer thread — never the Planner task, never the bridge
-      // origin task — because Codex Desktop keeps a writer lock on every
-      // thread it has loaded: resuming a shared task made reviews fail with
-      // `thread-store conflict: thread <id> already has an active writer`, a
-      // lock the plugin cannot release. A legacy record whose reviewerThreadId
-      // still aliases the shared task is migrated lazily (a dedicated Reviewer
-      // is created below). The readable review contract + FULL per-round
-      // context (workflow identity, original task, approved plan,
-      // implementation summary, changed files, test results, workspace
-      // evidence) are ALSO injected as the thread's developer instructions
-      // (refreshed before every round) — but only as an AUXILIARY channel: a
-      // real App Server native review turn does not reliably see hidden
-      // thread-settings instructions, so verdict correctness never depends on
-      // them. The complete context and the coverage gate ride the
-      // `review/start` custom target on every path (see below).
-      const reviewerModel = current.reviewerModel
-        || this.config.reviewerModel
-        || await this.turnGateway.resolveDefaultModel?.(exec.signal)
-        || undefined;
-      const contract = reviewContractInstructions(current, input, evidence);
-      reviewerThreadId = current.reviewerThreadId;
-      // 1.1.0/1.1.2: a Reviewer is reused only when it is a DEDICATED thread the
-      // App Server created. A legacy shared alias (1.1.0) or a legacy CLI task
-      // (1.1.2: `source='exec'`, invisible in Desktop, no name) is migrated
-      // lazily: the old thread is left untouched (best-effort renamed) and a
-      // visible Reviewer is created below.
-      const legacyReviewer = reviewerThreadId
-        && (isSharedReviewerAlias(current) || current.reviewerThreadOrigin !== "app-server")
-        ? reviewerThreadId
-        : undefined;
-      if (legacyReviewer) {
-        await this.renameLegacyReviewer(current, workflowId);
-        reviewerThreadId = undefined;
-      }
-      if (!reviewerThreadId) {
-        // 1.1.3: creation runs under the shared transient retry, and a retry
-        // after a failed configuration reuses the SAME task id.
-        reviewerThreadId = await this.createReviewerThread({
-          cwd: current.cwd,
-          name: `DSH Reviewer: ${workflowId}`,
-          workflowId,
-          ...(reviewerModel ? { model: reviewerModel } : {}),
-          developerInstructions: contract,
-        }, exec.signal);
-        let threadCommit;
-        try {
-          threadCommit = await this.store.update(workflowId, (r) => {
-            r.reviewerThreadId = reviewerThreadId!;
-            r.reviewStep = "review_native_turn";
-            r.lastProgressAt = new Date().toISOString();
-            r.lastProgressMessage = "Running Reviewer turn";
-            // 1.1.2 visibility marker: only App Server threads are renderable.
-            r.reviewerThreadOrigin = "app-server";
-          }, { ignoreCancelled: false });
-        } catch (error) {
-          // The created task could not be bound: release its hold before the
-          // failure propagates, so a failed round cannot leave it loaded.
-          this.reportCleanupNote(workflowId, await this.releaseUnboundReviewer(reviewerThreadId));
-          throw error;
-        }
-        if (threadCommit.suppressed) {
-          // A concurrent cancel won the CAS: the task is never bound, so it is
-          // released here instead of being left subscribed under a cancelled
-          // workflow (the task remains in the Codex store, unbound).
-          this.reportCleanupNote(workflowId, await this.releaseUnboundReviewer(reviewerThreadId));
-          return threadCommit.record;
-        }
-        current = threadCommit.record;
-        reviewerClaimed = true;
-      } else {
-        // 1.1.3: resume + instruction refresh under the shared transient retry
-        // (a visible Reviewer can be open in Codex Desktop, which holds its
-        // writer lock until the user closes it).
-        await this.prepareBoundReviewer(reviewerThreadId, current.cwd, contract, exec.signal, workflowId);
-        reviewerClaimed = true;
-      }
-
-      if (current.reviewerThreadId === reviewerThreadId && current.reviewStep !== "review_native_turn") {
-        await this.reviewObservation.mark(workflowId, "review_native_turn", "Running Reviewer turn");
-      }
-
-      // Git AND non-Git reviews use the SAME `review/start` custom target. Its
-      // instructions carry the FULL per-round context (original task, approved
-      // plan, implementation summary, changed files, test results, workspace
-      // evidence), the review scope (for Git: the current staged/unstaged/
-      // untracked changes to be confirmed with an independent read-only `git
-      // status`/`git diff`) and the item-by-item coverage gate — a native
-      // review turn sees these directly, so the verdict never depends on
-      // hidden thread settings.
-      // Capture the PERSISTED-turn baseline BEFORE the native review turn
-      // starts: the appended (newly-persisted) turn will be detected against
-      // these ids, because the `review/start` RPC turn id is NOT guaranteed
-      // to equal the persisted `thread.turns[].id` (real App Server
-      // evidence). The baseline read is metadata-only and never touches the
-      // thread's writer.
-      const reviewBaseline = await this.turnGateway.captureTurnBaseline?.(reviewerThreadId, exec.signal);
-      // 1.1.2: the visible review turn runs through the SAME transient-retry
-      // wrapper as every other visible turn (1.1.1 parity on the App Server
-      // path). A retried attempt re-registers its own turn, so the active-turn
-      // mapping always points at the newest turn.
-      const review = await this.startReviewWithTransientRetry({
-        threadId: reviewerThreadId,
-        cwd: current.cwd,
-        detached: false,
-        target: { type: "custom", instructions: reviewInstructions(current, input, evidence, git) },
-        // The App Server reports the ACTUAL review task id through onStarted
-        // (an inline review may return a different thread). Enforce the 1.0.8
-        // invariant AT THE START — before registerActiveTurn or any store
-        // write — so a mismatched id can NEVER be persisted as
-        // reviewerThreadId or enter the active-turn map: interrupt the rogue
-        // turn and fail the round retryably. registerActiveTurn is only
-        // reached for the exact workflow task.
-        onStarted: async (started) => {
-          if (started.threadId !== reviewerThreadId) {
-            await this.turnGateway.interrupt?.(started.threadId, started.turnId).catch(() => undefined);
-            throw new Error(`review/start returned task ${started.threadId}, expected the workflow task ${reviewerThreadId}; refusing to persist a second visible task`);
-          }
-          await this.registerActiveTurn(workflowId, started.threadId, started.turnId, "reviewer");
-        },
-      }, exec.signal);
-      // Second net for the same invariant: a mismatched return value is
-      // rejected fail-closed — the round becomes retryable and the persisted
-      // reviewerThreadId is untouched (registerActiveTurn never saw it).
-      if (review.threadId !== reviewerThreadId) {
-        throw new Error(`review/start returned task ${review.threadId}, expected the workflow task ${reviewerThreadId}; refusing to persist a second visible task`);
-      }
-      const afterReview = await this.store.load(workflowId);
-      if (!afterReview || afterReview.phase === "cancelled") {
-        // The review turn is no longer the active target; a later cancel must
-        // never interrupt it (or the completed Planner task).
-        this.runtime.activeTurns.delete(workflowId);
-        return afterReview!;
-      }
-      current = afterReview;
-      await this.reviewObservation.mark(workflowId, "review_readback", "Reading persisted Reviewer result", null);
-      // BOTH the visible review turn AND the ephemeral normalization turn must
-      // have genuinely completed (`status === "completed"`, not just the
-      // `completed` kind): interrupted/failed/timed-out turns carry no usable
-      // text and their residual text must never be parsed or applied. The
-      // failure falls back to the retryable phase without consuming a cycle.
-      if (review.result.kind !== "completed" || review.result.status !== "completed") {
-        if (review.result.kind !== "completed") throw new Error("review unexpectedly requested user input");
-        // Keep the UPSTREAM diagnostic in the message: `reason` alone is just
-        // "turn failed", which hides why the round failed (the 1.1.1 lesson).
-        const detail = review.result.error ? `: ${review.result.error}` : "";
-        throw new Error(`${review.result.reason ?? `review turn ${review.result.status}`}${detail}`);
-      }
-
-      // 1.0.7 display contract, ENFORCED ON THE PERSISTED HISTORY. The
-      // authoritative display text is what `thread/read(includeTurns: true)`
-      // returns for the turn appended since the pre-review baseline on the
-      // durable workflow task — the streamed/`turn/completed` aggregation
-      // (`review.result.text`) can differ from what Codex Desktop actually
-      // persists, so it alone must never gate the contract. Validate the
-      // READ-BACK text (non-empty,
-      // readable Markdown — never a JSON envelope — the four required sections
-      // verdict/findings/test gaps/summary, and the original task's language
-      // for Chinese tasks) BEFORE the ephemeral normalization. When the
-      // persisted native review violates it, run ONE ordinary visible rewrite
-      // turn on the SAME durable workflow task (no outputSchema, read-only/
-      // network disabled/approval never enforced per turn, low effort, silent),
-      // which only re-presents the SAME verdict/findings/test-gaps in the
-      // task's language with the fixed readable sections — it never re-reviews
-      // and never creates a second visible task. The rewrite turn is persisted
-      // like any visible turn; its READ-BACK final message becomes the
-      // authoritative text for the ephemeral conversion. A missing/ambiguous
-      // read-back and a still-violating rewrite are retryable failures — NEVER
-      // a silent fallback to the in-memory text.
-      const persistedNative = await this.readBackAppended(reviewerThreadId, reviewBaseline, exec.signal);
-      if (!persistedNative) throw new Error("persisted review read-back missing or ambiguous");
-      let authoritativeText = persistedNative.text;
-      const displayError = reviewDisplayError(authoritativeText, current);
-      if (displayError) {
-        // An EMPTY review has nothing to re-present: a rewrite turn would have
-        // to invent one (a hidden re-review), which the contract forbids — so
-        // fail retryably without a rewrite turn.
-        if (authoritativeText.trim().length === 0) {
-          throw new Error(`review is empty`);
-        }
-        // Baseline BEFORE the rewrite turn, exactly like the native turn: the
-        // rewrite's persisted output is detected as an APPENDED turn, never by
-        // assuming the `turn/start` RPC id equals the persisted rollout id.
-        const rewriteBaseline = await this.turnGateway.captureTurnBaseline?.(reviewerThreadId, exec.signal);
-        await this.reviewObservation.mark(workflowId, "review_display_rewrite", "Rewriting Reviewer display output", null);
-        const rewrite = await this.startTurnWithTransientRetry(reviewerThreadId, {
-          prompt: reviewRewritePrompt(authoritativeText, current),
-          ...(reviewerModel ? { model: reviewerModel } : {}),
-          effort: "low",
-          silentReview: true,
-          // The rewrite turn is a VISIBLE turn on the same durable thread:
-          // persist thread/turn so codex_workflow_cancel and teardown can
-          // interrupt exactly this turn while it runs.
-          onStarted: (started) => this.registerActiveTurn(workflowId, started.threadId, started.turnId, "reviewer"),
-        }, exec.signal);
-        const afterRewrite = await this.store.load(workflowId);
-        if (!afterRewrite || afterRewrite.phase === "cancelled") {
-          // Never leave the completed rewrite turn as the active cancel target.
-          this.runtime.activeTurns.delete(workflowId);
-          return afterRewrite!;
-        }
-        current = afterRewrite;
-        if (rewrite.kind !== "completed" || rewrite.status !== "completed") {
-          if (rewrite.kind !== "completed") throw new Error("review rewrite unexpectedly requested user input");
-          throw new Error(rewrite.status === "interrupted"
-            ? "review rewrite turn interrupted"
-            : (rewrite.reason ?? `review rewrite turn ${rewrite.status}`));
-        }
-        // The rewrite's AUTHORITY is its persisted history, read back exactly
-        // like the native turn's — never the in-memory aggregation. A
-        // missing/ambiguous read-back of the rewrite is also retryable.
-        const persistedRewrite = await this.readBackAppended(reviewerThreadId, rewriteBaseline, exec.signal);
-        if (!persistedRewrite) throw new Error("persisted rewrite read-back missing or ambiguous");
-        const rewrittenError = reviewDisplayError(persistedRewrite.text, current);
-        if (rewrittenError) {
-          throw new Error(`corrected review still violates the display contract: ${rewrittenError}`);
-        }
-        authoritativeText = persistedRewrite.text;
-      }
-
-      // Since 1.0.7 the visible review turn (startReview) produces a readable
-      // review; the structured verdict is derived by an EPHEMERAL fork of the
-      // workflow task, never written into the persisted task history. The fork
-      // passes the SAME effective reviewer model (persisted override, bundle
-      // config, or the resolved server default) so it never drifts to a
-      // different default. The authoritative text is the rewrite turn's final
-      // message when a display-rewrite ran, otherwise the native review text.
-      // 1.1.2: with a CLI audit configured, the STRUCTURED CONVERSION stays on
-      // the CLI. `--ephemeral` means it neither creates nor resumes a durable
-      // thread, so it cannot pollute the Codex task list the way the visible
-      // review turn used to. Only the visible turn moved to the App Server.
-      let result: ReviewResult;
-      if (this.audit) {
-        result = applyReviewConsistency(await this.audit.normalize({
-          visibleText: authoritativeText,
-          cwd: current.cwd,
-          workflowId,
-          ...(reviewerModel ? { model: reviewerModel } : {}),
-        }, exec.signal));
-      } else {
-        await this.reviewObservation.mark(workflowId, "review_conversion", "Converting Reviewer result", null);
-        let normalized: TurnWaitResult;
-        try {
-          normalized = await this.turnGateway.normalizeInFork({
-            threadId: review.threadId,
-            cwd: current.cwd,
-            prompt: reviewConversionPrompt(authoritativeText, workflowId),
-            ...(reviewerModel ? { model: reviewerModel } : {}),
-            outputSchema: REVIEW_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
-            // The ephemeral conversion fork becomes the active reviewer turn for
-            // cancellation (in-process only — the fork id is never persisted, so
-            // reviewerThreadId keeps pointing at the durable workflow task).
-            onStarted: (started) => this.registerEphemeralTurn(workflowId, started.threadId, started.turnId, "reviewer"),
-          }, exec.signal);
-        } finally {
-          this.runtime.activeTurns.delete(workflowId);
-        }
-        const afterNormalize = await this.store.load(workflowId);
-        if (!afterNormalize || afterNormalize.phase === "cancelled") return afterNormalize!;
-        current = afterNormalize;
-        if (normalized.kind !== "completed") throw new Error("review normalization unexpectedly requested user input");
-        if (normalized.status !== "completed") {
-          throw new Error(normalized.reason ?? `review normalization turn ${normalized.status}`);
-        }
-
-        result = applyReviewConsistency(parseReview(normalized.text));
-      }
-      // 1.0.10 REVIEW AUTHORITY ALIGNMENT: after the visible review is
-      // normalized into the public ReviewResult, an INVISIBLE ephemeral fork
-      // checks every finding/test gap against the authority hierarchy
-      // (reproducible critical/high defect > original task > approved plan >
-      // previous applied findings > generic suggestions). A conflict does NOT
-      // overwrite latestReview, does NOT consume a cycle and does NOT ask DSH
-      // to fix: ONE visible reconciliation turn on the SAME durable task asks
-      // the Reviewer to rewrite the verdict per the hierarchy, then the
-      // corrected review is re-normalized and re-aligned. Only an aligned
-      // verdict is applied (one business cycle). Two consecutive unresolved
-      // conflicts block the workflow with a reportable contract failure.
-      let applied: ReviewResult | undefined;
-      let conflictInfo: ReviewConflictInfo | undefined;
-      await this.reviewObservation.mark(workflowId, "review_alignment", "Checking Review authority alignment", null);
-      const alignment = await this.alignReview(current, result, exec.signal, input);
-      if (alignment.aligned) {
-        applied = result;
-      } else {
-        await this.reviewObservation.mark(workflowId, "review_reconciliation", "Reconciling Review findings");
-        const reconciled = await this.reconcileReview(current, result, alignment.conflicts, exec.signal, input);
-        conflictInfo = {
-          conflicts: alignment.conflicts,
-          reconciled: true,
-          resolved: reconciled.aligned,
-          at: new Date().toISOString(),
-        };
-        if (reconciled.aligned) applied = reconciled.result;
-      }
-      if (!applied) {
-        // Unresolved conflict: restore the pre-review phase (blocked after
-        // two CONSECUTIVE unresolved conflicts). NO latestReview, NO cycle,
-        // NO fixing prompt — the reviewer contract failed, not the code.
-        this.runtime.activeTurns.delete(workflowId);
-        const conflictCommit = await this.store.update(workflowId, (r) => {
-          if (r.phase !== "reviewing") return;
-          r.latestReviewConflict = conflictInfo;
-          r.reviewContractFailures = (r.reviewContractFailures ?? 0) + 1;
-          const blocked = (r.reviewContractFailures ?? 0) >= 2;
-          r.phase = blocked ? "blocked" : priorPhase;
-          r.error = blocked
-            ? "reviewer contract failure: the review conflicts with the authority hierarchy and was not reconciled after "
-              + `${r.reviewContractFailures} consecutive review calls; no code changes are required`
-            : "review contract conflict: the review conflicts with the authority hierarchy and was not reconciled "
-              + "after one correction attempt; no code changes are required — the next review call may retry";
-          r.processState = blocked ? "completed" : "failed";
-          r.activeTurnId = undefined;
-          r.lastProgressAt = new Date().toISOString();
-          r.lastProgressMessage = blocked ? "Review completed with a contract block" : "Review failed; retry is available";
-        }, { ignoreCancelled: false });
-        if (conflictCommit.suppressed) return conflictCommit.record;
-        if (conflictCommit.record.phase === "blocked") {
-          // A contract failure MUST be reported to the user as such — but it
-          // is never a fix instruction and never re-enters the repair loop.
-          exec.deferContext(pluginMessage(
-            `Workflow ${workflowId} is blocked by a REVIEWER CONTRACT FAILURE: two consecutive reviews conflicted with the authority hierarchy (original task / approved plan) and the reconciliation turned could not align them. No code changes are required. Report the remaining findings and the conflict details to the user:\n${formatFindings(result)}`,
-          ));
-        }
-        return conflictCommit.record;
-      }
-      // Compute the outcome inside the atomic commit so the cycle count seen by
-      // the outcome policy includes this round; the message is only injected
-      // after the commit confirmed we were not cancelled in the meantime.
-      let outcomeMessage: string | undefined;
-      await this.reviewObservation.mark(workflowId, "review_finalizing", "Finalizing Review status");
-      const commit = await this.store.update(workflowId, (r) => {
-        r.latestReview = applied!;
-        // A cycle is consumed only now that a structured verdict is applied:
-        // infrastructure failures never eat a cycle, so retries stay possible.
-        r.reviewCycles += 1;
-        // An aligned review ends the unresolved-conflict streak; the last
-        // conflict stays visible in status (audit of the auto-correction).
-        r.reviewContractFailures = 0;
-        if (conflictInfo) r.latestReviewConflict = { ...conflictInfo, resolved: true };
-        const outcome = this.computeReviewOutcome(r, applied!);
-        outcomeMessage = outcome.message;
-        r.noChangeReviewRounds = outcome.noChangeReviewRounds ?? r.noChangeReviewRounds;
-        r.phase = outcome.phase;
-        r.error = outcome.error;
-        r.processState = "completed";
-        r.activeTurnId = undefined;
-        r.lastProgressAt = new Date().toISOString();
-        r.lastProgressMessage = "Review completed";
-        if (r.reviewStartedAt) {
-          const started = Date.parse(r.reviewStartedAt);
-          if (Number.isFinite(started)) r.reviewElapsedMs = Math.max(0, Date.now() - started);
-        }
-      }, { ignoreCancelled: false });
-      if (commit.suppressed) return commit.record;
-      if (outcomeMessage) exec.deferContext(pluginMessage(outcomeMessage));
-      return commit.record;
-    } catch (error) {
-      // A concurrent cancel wins over failure handling: never overwrite a
-      // cancelled record. Otherwise an infrastructure failure (evidence/review/
-      // normalize throw) returns the workflow to its RETRYABLE phase and
-      // records the error — it must not burn a cycle or become failed, so the
-      // same workflow can later receive its first real verdict.
-      // The visible turn (review/rewrite) is no longer running or was never
-      // registered: clear the in-process active-turn mapping so a later cancel
-      // can never interrupt a completed turn through a stale map entry.
-      this.runtime.activeTurns.delete(workflowId);
-      const failed = await this.store.update(workflowId, (r) => {
-        if (r.phase !== "reviewing") return;
-        r.phase = priorPhase;
-        r.error = errorMessage(error);
-        r.processState = "failed";
-        r.activeTurnId = undefined;
-        r.lastProgressAt = new Date().toISOString();
-        r.lastProgressMessage = "Review failed; retry is available";
-      }, { ignoreCancelled: false });
-      if (failed.suppressed) return failed.record;
-      throw error;
-    } finally {
-      const releaseNote = reviewerClaimed && reviewerThreadId
-        ? await this.releaseReviewerSubscription(reviewerThreadId)
-        : undefined;
-      this.reportCleanupNote(workflowId, releaseNote);
-      await this.reviewObservation.finish(workflowId);
-      await this.flushCleanupNotes(workflowId);
-      // The pin is released LAST: the cleanup above still runs on this child.
-      this.turnGateway.endRound();
-    }
+  private reviewOnce(workflowId: string, input: ReviewInput, exec: ToolRunContext): Promise<WorkflowRecord> {
+    return this.reviewExecution.run(workflowId, input, exec);
   }
-
-  /**
-   * 1.1.2 visibility repair, best-effort: give a LEGACY, DEDICATED Reviewer task
-   * a readable title.
-   *
-   * A thread created by `codex exec` is stored by the App Server with
-   * `source='exec'`, is never returned by `thread/list` (measured: 0 of 15 exec
-   * threads listed, versus 62 of 72 App Server threads) and therefore cannot be
-   * rendered in Codex Desktop — renaming cannot change that, only a newly
-   * created App Server Reviewer can. This call exists purely so a human reading
-   * the task store can tell what the orphan was; it must NEVER block or fail the
-   * migration that replaces it. `thread/name/set` works on a thread that is not
-   * loaded, so it takes no writer lock.
-   *
-   * The record — not a bare id — decides whether a rename is allowed at all:
-   *   - an id that still ALIASES the Planner/origin task is that task's own
-   *     title and must never be overwritten (the 1.1.0 alias migration never
-   *     renamed it either);
-   *   - an App Server Reviewer is already visible and keeps its real name.
-   */
   private async renameLegacyReviewer(record: WorkflowRecord, workflowId: string): Promise<void> {
     const threadId = record.reviewerThreadId;
     if (!threadId) return;
@@ -3274,7 +2537,7 @@ export function executionPrompt(record: WorkflowRecord): string {
  * task, approved plan, implementation summary, changed files, test results,
  * and the captured workspace evidence (status, bounded diff, truncation
  * notice). Git and non-Git workspaces get the SAME contract. */
-function reviewContextBlock(record: WorkflowRecord, input: ReviewInput, evidence: ReviewEvidence): string {
+export function reviewContextBlock(record: WorkflowRecord, input: ReviewInput, evidence: ReviewEvidence): string {
   const submission = record.origin === "codex_bridge"
     ? `SUBMISSION: ${record.submissionId ?? "(unknown)"}\n`
     : "";
@@ -3322,7 +2585,7 @@ SUMMARY: a short readable summary`;
  * native `review/start` turn may not reliably see hidden thread-settings
  * instructions, so the complete context and the coverage gate always ride
  * the custom target's instructions on every path (Git included). */
-function reviewContractInstructions(record: WorkflowRecord, input: ReviewInput, evidence: ReviewEvidence): string {
+export function reviewContractInstructions(record: WorkflowRecord, input: ReviewInput, evidence: ReviewEvidence): string {
   return `${visibleReviewContract(record)}
 
 ${reviewContextBlock(record, input, evidence)}`;
@@ -3364,7 +2627,7 @@ ITEM-BY-ITEM COVERAGE:
  * thread-settings developer instructions. In Git repositories the scope pins
  * the review to the current staged/unstaged/untracked changes and requires
  * an independent read-only `git status`/`git diff` check. */
-function reviewInstructions(record: WorkflowRecord, input: ReviewInput, evidence: ReviewEvidence, git: boolean): string {
+export function reviewInstructions(record: WorkflowRecord, input: ReviewInput, evidence: ReviewEvidence, git: boolean): string {
   return `Review the current workspace read-only. Focus on correctness, regressions, security, and missing tests. Do not edit files. ${visibleReviewContract(record)}
 
 ${reviewRequirementGate(record, git)}
@@ -3414,7 +2677,7 @@ const SUBMISSION_ACTIVE = new Set<SubmissionState>(["queued", "sending", "waitin
 const SUBMISSION_TERMINAL = new Set<SubmissionState>(["applied", "delivered", "failed"]);
 const RECOVERABLE_STATES = new Set<SubmissionState>(["queued", "sending", "retrying"]);
 
-function callbackRecoveryDelay(baseMs: number, attemptsThisRound: number): number {
+export function callbackRecoveryDelay(baseMs: number, attemptsThisRound: number): number {
   return Math.min(5 * 60 * 1000, baseMs * 2 ** Math.min(attemptsThisRound, 8));
 }
 
@@ -3432,7 +2695,7 @@ function submissionActive(state: SubmissionState | undefined): boolean {
   return state !== undefined && SUBMISSION_ACTIVE.has(state);
 }
 
-function submissionTerminal(state: SubmissionState | undefined): boolean {
+export function submissionTerminal(state: SubmissionState | undefined): boolean {
   return state !== undefined && SUBMISSION_TERMINAL.has(state);
 }
 
@@ -3442,7 +2705,7 @@ function submissionTerminal(state: SubmissionState | undefined): boolean {
  * no-ops. The heartbeat renews the lease for long callback runs; when a renew
  * returns false (changes=0, ownership lost) the onLost hook fires so the
  * owner can abort its child and stop writing state. */
-interface ManagerLease {
+export interface ManagerLease {
   readonly owner: string;
   readonly epoch: number;
   renew(): Promise<boolean>;
@@ -3521,7 +2784,7 @@ function parsePlanner(text: string): PlannerResult {
   };
 }
 
-function parseReview(text: string): ReviewResult {
+export function parseReview(text: string): ReviewResult {
   const value = parseJsonObject(text);
   if (value.verdict !== "pass" && value.verdict !== "changes_requested") throw new Error("invalid review verdict");
   return {
@@ -3539,7 +2802,7 @@ function parseReview(text: string): ReviewResult {
  * changes_requested (the blocking/non-blocking gate then applies), while a
  * changes_requested with nothing actionable is rejected outright.
  */
-function applyReviewConsistency(result: ReviewResult): ReviewResult {
+export function applyReviewConsistency(result: ReviewResult): ReviewResult {
   const hasContent = result.findings.length > 0 || result.testGaps.length > 0;
   if (result.verdict === "pass" && hasContent) {
     return { ...result, verdict: "changes_requested" };
@@ -3615,7 +2878,7 @@ export function formatFindings(review: ReviewResult): string {
   return [...findings, ...review.testGaps.map((gap) => `Test gap: ${gap}`)].join("\n") || review.summary;
 }
 
-function pluginMessage(text: string) {
+export function pluginMessage(text: string) {
   return createUserMessage({
     content: [{ type: "text", text }],
     source: noticeSource("Codex workflow continuation"),
@@ -3632,11 +2895,11 @@ function threadName(prefix: string, text: string): string {
   return `${prefix}: ${compact.slice(0, 72)}`;
 }
 
-function errorMessage(error: unknown): string {
+export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function delay(ms: number, signal?: AbortSignal): Promise<void> {
+export function delay(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolvePromise, reject) => {
     const timer = setTimeout(() => {
       signal?.removeEventListener("abort", onAbort);
@@ -3651,6 +2914,6 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function abortError(signal: AbortSignal): Error {
+export function abortError(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error("operation aborted");
 }

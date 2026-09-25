@@ -10,7 +10,7 @@
 | # | 阶段 | 范围 | 状态 |
 |---|---|---|---|
 | 1 | **ports / facades** | 声明端口层，不改任何行为；`src/index.ts` 仍是唯一 composition root | ✅ 完成（本次提交） |
-| 2 | WorkflowManager 内部拆分 | planner-flow / review-flow / submission-flow / lifecycle + 窄 `WorkflowContext`，保留 active-turn、heartbeat、stop、cancel、recovery 的单一所有权 | 🟡 Planner 创建/继续状态机已移入 `planner-execution.ts`，Review 观测/心跳/陈旧恢复已移入 `review-observation.ts`；Review/Submission 主状态机仍在 facade 内 |
+| 2 | WorkflowManager 内部拆分 | planner-flow / review-flow / submission-flow / lifecycle + 窄 `WorkflowContext`，保留 active-turn、heartbeat、stop、cancel、recovery 的单一所有权 | ✅ Planner、Review、Submission 主状态机已移入 execution modules；facade 只保留兼容入口和少量 CAS delivery helpers |
 | 3 | App Server 拆分 | process-transport / thread-gateway / turn-gateway / reviewer-gateway；JSON-RPC、子进程与 waiter 状态不得泄漏到业务流程 | 🟡 process-transport + Reviewer gateway 已提取；thread/turn gateway 待继续 |
 | 4 | Bridge Runtime 拆分 | queue-pump / session-router / delivery-coordinator / terminal-relay-guard；Bridge 依赖窄 port | 🟡 queue/session/delivery/terminal guard 已提取；runtime 现在只通过 `BridgeQueuePort` 与 `BridgeDeliveryPort` 调用队列和工作流交付 |
 | 5 | CoordinationStore 拆分 | coordination-database / lease-repository / queue-repository / workflow-repository / live-session-repository / legacy-import；共享同一 SQLite 连接与事务 | 🟡 `LeaseRepositorySql`、`LiveSessionRepositorySql`、`QueueRepositorySql` 已承载真实 SQL；prune/legacy-import 入口仍由 facade 编排 |
@@ -41,11 +41,12 @@
 ## 阶段 2（flow boundaries）— 当前提交
 
 新增 `src/application/planner-flow.ts`、`review-flow.ts`、`submission-flow.ts`、
-`lifecycle-flow.ts`、`planner-execution.ts`、`review-observation.ts` 和
+`lifecycle-flow.ts`、`planner-execution.ts`、`review-observation.ts`、
+`review-execution.ts`、`submission-execution.ts` 和
 `workflow-runtime-state.ts`。`WorkflowManager` 仍是兼容 facade，DSH tools、BridgeRuntime
 和 npm consumers 的 public surface 不变；Planner 的建 workflow/建线程/可见回合/继续输入
 状态机已由 `PlannerExecution` 持有，审查观测、心跳、陈旧判定和 finish 状态由
-`ReviewObservation` 持有。active turns、foreground/background tasks、recovery、heartbeat
+`ReviewObservation`、`ReviewExecution`、`SubmissionExecution` 持有。active turns、foreground/background tasks、recovery、heartbeat
 和 teardown 的可变状态仍集中在 runtime state，避免拆分后出现第二份取消所有权。
 
 **阶段门禁**：此前门禁为 `pnpm typecheck`、`pnpm test`（438/438）；Planner/Review
@@ -139,5 +140,5 @@ Bridge queue/delivery port 迁移由全量测试覆盖，最终 `release:check` 
 - `pnpm host:check`：`ok=true`，DSH `0.1.7-rc.2`、插件 `1.1.5`、8 tools、卸载成功、peer compatible。
 
 仍明确保留在后续范围的只有 CoordinationStore 的 prune/legacy-import 编排，以及
-WorkflowManager 的 Review/Submission 主状态机；它们没有被用空壳 adapter 冒充完成，当前
-调用链和取消/恢复所有权已经由上述模块实际承载。
+WorkflowManager 中少量外部 verdict 的 CAS delivery helpers；它们没有被用空壳 adapter 冒充
+完成，Planner/Review/Submission 主调用链和取消/恢复所有权已经由上述模块实际承载。
