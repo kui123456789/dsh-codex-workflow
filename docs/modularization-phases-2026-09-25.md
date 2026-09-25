@@ -13,7 +13,7 @@
 | 2 | WorkflowManager 内部拆分 | planner-flow / review-flow / submission-flow / lifecycle + 窄 `WorkflowContext`，保留 active-turn、heartbeat、stop、cancel、recovery 的单一所有权 | 🟡 流程边界已提取；内部状态机仍在 facade 内，后续继续拆分 |
 | 3 | App Server 拆分 | process-transport / thread-gateway / turn-gateway / reviewer-gateway；JSON-RPC、子进程与 waiter 状态不得泄漏到业务流程 | 🟡 process-transport 已提取；gateway 拆分待继续 |
 | 4 | Bridge Runtime 拆分 | queue-pump / session-router / delivery-coordinator / terminal-relay-guard；Bridge 依赖窄 port | 🟡 queue/session/delivery 边界已提取；terminal guard 待继续 |
-| 5 | CoordinationStore 拆分 | coordination-database / lease-repository / queue-repository / workflow-repository / live-session-repository / legacy-import；共享同一 SQLite 连接与事务 | ⏳ 未开始 |
+| 5 | CoordinationStore 拆分 | coordination-database / lease-repository / queue-repository / workflow-repository / live-session-repository / legacy-import；共享同一 SQLite 连接与事务 | 🟡 repository seams 已声明；SQL/事务实现待迁移 |
 | 6 | 状态模型 v2 | `WorkflowRecord` 升 schemaVersion 2（identity/planning/execution/review/submission/bridge/desktop）+ 纯函数 v1→v2 迁移；迁移前备份 coord.sqlite；未知版本/损坏记录进入可诊断错误；对外 status/show/CLI/DSH tool 由 serializer 保持兼容 | ⏳ 未开始（风险最高） |
 | 7 | 测试与清理 | 先提取 fixture 再拆 suite；删除前做全仓引用检查；`lifecycle-acceptance.mjs` / `review-only-acceptance.mjs` 与两个无引用 fixture 待清理 | 🟡 清理已完成（见下）；suite 拆分未开始 |
 
@@ -57,6 +57,13 @@ stdio spawn、逐行读取、优雅关闭和有界 kill escalation。`CodexAppSe
 thread-gateway、turn-gateway 和 reviewer-gateway 提供了稳定的进程传输 seam。
 
 **阶段门禁**：`pnpm typecheck`、App Server/Callback 定向测试（63/63）通过。
+
+## 阶段 5（repository seams）— 当前提交
+
+新增 `src/application/coordination/repositories.ts`，为 Queue、Lease、LiveSession 和
+Workflow persistence 提供窄 repository adapters。它们当前包住兼容的 CoordinationStore/
+WorkflowStore 实现，保持单 SQLite 连接、DELETE journal 和事务语义不变；下一步再把 SQL
+实现逐个移入 infrastructure repository，而不让 Bridge/Workflow 流程重新依赖整张 facade。
 
 ## 阶段 4（bridge flow boundaries）— 当前提交
 
