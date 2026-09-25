@@ -14,7 +14,7 @@
 | 3 | App Server 拆分 | process-transport / thread-gateway / turn-gateway / reviewer-gateway；JSON-RPC、子进程与 waiter 状态不得泄漏到业务流程 | 🟡 process-transport 已提取；gateway 拆分待继续 |
 | 4 | Bridge Runtime 拆分 | queue-pump / session-router / delivery-coordinator / terminal-relay-guard；Bridge 依赖窄 port | 🟡 queue/session/delivery 边界已提取；terminal guard 待继续 |
 | 5 | CoordinationStore 拆分 | coordination-database / lease-repository / queue-repository / workflow-repository / live-session-repository / legacy-import；共享同一 SQLite 连接与事务 | 🟡 repository seams 已声明；SQL/事务实现待迁移 |
-| 6 | 状态模型 v2 | `WorkflowRecord` 升 schemaVersion 2（identity/planning/execution/review/submission/bridge/desktop）+ 纯函数 v1→v2 迁移；迁移前备份 coord.sqlite；未知版本/损坏记录进入可诊断错误；对外 status/show/CLI/DSH tool 由 serializer 保持兼容 | 🟡 v1/v2 serializer + 幂等迁移已完成；备份/损坏恢复门禁待继续 |
+| 6 | 状态模型 v2 | `WorkflowRecord` 升 schemaVersion 2（identity/planning/execution/review/submission/bridge/desktop）+ 纯函数 v1→v2 迁移；迁移前备份 coord.sqlite；未知版本/损坏记录进入可诊断错误；对外 status/show/CLI/DSH tool 由 serializer 保持兼容 | 🟡 serializer、幂等迁移和启动备份已完成；损坏记录隔离门禁待继续 |
 | 7 | 测试与清理 | 先提取 fixture 再拆 suite；删除前做全仓引用检查；`lifecycle-acceptance.mjs` / `review-only-acceptance.mjs` 与两个无引用 fixture 待清理 | 🟡 清理已完成（见下）；suite 拆分未开始 |
 
 ## 阶段 7（清理）— 已完成的部分
@@ -66,8 +66,8 @@ thread-gateway、turn-gateway 和 reviewer-gateway 提供了稳定的进程传�
 facade 不变。旧 flat v1 记录会通过纯函数迁移，v2 迁移幂等，未知 schema 版本会明确报错。
 本提交还让 CoordinationStore/CLI 的 raw JSON 读取走同一 serializer。
 
-**尚未完成**：启动时 coord.sqlite 备份、损坏记录隔离/诊断，以及完整 schema-v2 外部
-serializer 门禁；这些留在阶段 6 的下一提交。
+**尚未完成**：损坏记录隔离/诊断（当前会 fail closed 并返回明确 schema 错误），以及完整
+schema-v2 外部 serializer 门禁；这些留在阶段 6 的下一提交。
 
 ## 阶段 5（repository seams）— 当前提交
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -299,6 +299,21 @@ test("a failing update does not poison the per-workflow chain", async () => {
     const outcome = await store.update("wf-chain", (r) => { r.phase = "fixing"; });
     assert.equal(outcome.suppressed, false);
     assert.equal((await store.load("wf-chain"))?.phase, "fixing");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("workflow store creates a pre-schema-v2 database backup before opening an existing DB", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-schema-backup-"));
+  try {
+    const first = new WorkflowStore(directory);
+    await first.init();
+    first.close();
+    const second = new WorkflowStore(directory);
+    await second.init();
+    await access(join(directory, "coord.sqlite.pre-schema-v2.bak"));
+    second.close();
   } finally {
     await rmClosed(directory);
   }

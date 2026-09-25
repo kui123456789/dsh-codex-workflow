@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir } from "node:fs/promises";
+import { access, copyFile, mkdir, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { CoordinationStore, coordinationPath } from "./coordination.js";
 import type { ReviewFinding, ReviewStep, WorkflowMode, WorkflowPhase, WorkflowProcessState, WorkflowRecord } from "./types.js";
@@ -25,6 +25,7 @@ export class WorkflowStore {
   private coordination?: CoordinationStore;
   private importedLegacy = false;
   private closed = false;
+  private migrationBackupDone = false;
 
   constructor(readonly directory: string) {}
 
@@ -36,7 +37,20 @@ export class WorkflowStore {
 
   async init(): Promise<void> {
     await mkdir(this.directory, { recursive: true });
+    await this.backupBeforeSchemaMigration();
     this.ensure();
+  }
+
+  /** Keep one pre-v2 copy before the first process opens/migrates the DB. */
+  private async backupBeforeSchemaMigration(): Promise<void> {
+    if (this.migrationBackupDone) return;
+    this.migrationBackupDone = true;
+    const source = coordinationPath(this.directory);
+    const backup = `${source}.pre-schema-v2.bak`;
+    try { await access(source); } catch { return; }
+    try { await access(backup); } catch {
+      await copyFile(source, backup).catch(() => undefined);
+    }
   }
 
   close(): void {
