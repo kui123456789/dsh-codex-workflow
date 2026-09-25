@@ -15,6 +15,7 @@ import { DeliveryCoordinator } from "./application/bridge/delivery-coordinator.j
 import { QueuePump } from "./application/bridge/queue-pump.js";
 import { SessionRouter } from "./application/bridge/session-router.js";
 import { TerminalRelayGuard } from "./application/bridge/terminal-relay-guard.js";
+import { LiveSessionRepositoryAdapter, WorkflowRepositoryAdapter } from "./application/coordination/repositories.js";
 
 export interface AgentRegistryLike {
   get(id: string): Agent | undefined;
@@ -111,6 +112,8 @@ export class BridgeRuntime {
   private stopped = false;
   private stopPromise?: Promise<void>;
   private readonly terminalRelayGuard: TerminalRelayGuard;
+  private readonly liveSessionRepository: LiveSessionRepositoryAdapter;
+  private readonly workflowRepository: WorkflowRepositoryAdapter;
   private readonly store: BridgeStore;
   private readonly agents: AgentRegistryLike;
   private readonly options: BridgeRuntimeOptions & {
@@ -150,6 +153,8 @@ export class BridgeRuntime {
       timeoutMs: this.options.terminalRelayTimeoutMs,
       isStopped: () => this.stopped,
     });
+    this.liveSessionRepository = new LiveSessionRepositoryAdapter(store.coordinationHandle);
+    this.workflowRepository = new WorkflowRepositoryAdapter(options.workflowStore);
   }
 
   startInternal(): void {
@@ -205,7 +210,7 @@ export class BridgeRuntime {
     // release them. A refresh queued after stop() sees `this.stopped` and
     // writes nothing, so live_sessions can never be resurrected.
     await this.sessionsChain.then(() => undefined, () => undefined);
-    await this.store.coordinationHandle.releaseOwnerSessions(this.claimOwner);
+    await this.liveSessionRepository.releaseOwnerSessions(this.claimOwner);
   }
 
   /**
@@ -236,12 +241,12 @@ export class BridgeRuntime {
       .sort((left, right) => left.sessionId.localeCompare(right.sessionId));
     const snapshot = JSON.stringify(rows);
     if (!force && snapshot === this.sessionSnapshot) return;
-    this.store.coordinationHandle.refreshOwnerSessions(this.claimOwner, rows, this.store.leaseMs, now);
+    this.liveSessionRepository.refreshOwnerSessions(this.claimOwner, rows, this.store.leaseMs, now);
     this.sessionSnapshot = snapshot;
     // Preserve audit rows, but close old workflows whose owning DSH session has
     // disappeared. A two-lease grace period lets a normal runtime restart
     // re-register the same session before it is considered abandoned.
-    await this.options.workflowStore.abandonOrphaned(
+    await this.workflowRepository.abandonOrphaned(
       rows.map((row) => row.sessionId),
       this.store.leaseMs * 2,
       now,
@@ -261,7 +266,7 @@ export class BridgeRuntime {
         return this.agents.get(command.target.dshSessionId) !== undefined;
       }
       // cwd-based dispatch: route by the shared live-session registry.
-      const live = this.store.coordinationHandle.liveSessionsForCwd(cwdKey(command.target.cwd));
+      const live = this.liveSessionRepository.liveSessionsForCwd(cwdKey(command.target.cwd));
       if (live.length === 0) return false; // nobody owns it yet: WAIT, never steal
       if (live.length === 1) {
         return live[0]!.runtimeOwner === this.claimOwner; // only the unique owner
@@ -276,7 +281,7 @@ export class BridgeRuntime {
     // Resolve the REAL session from the shared workflow record; never trust
     // the command's own dshSessionId (a forged/stale target must not let a
     // wrong runtime apply first).
-    const session = this.store.coordinationHandle.workflowSessionOf(verdict.workflowId);
+    const session = this.liveSessionRepository.workflowSessionOf(verdict.workflowId);
     if (!session) {
       // Workflow genuinely does not exist: allow ONE runtime to claim it and
       // produce the terminal no_such_workflow receipt.
@@ -515,7 +520,7 @@ export class BridgeRuntime {
     // cwd-based dispatch: decide against the GLOBAL live-session registry, not
     // just this runtime's view, so same-cwd multi-session ambiguity is a
     // deterministic terminal error and a single session routes to its owner.
-    const live = this.store.coordinationHandle.liveSessionsForCwd(cwdKey(command.target.cwd));
+    const live = this.liveSessionRepository.liveSessionsForCwd(cwdKey(command.target.cwd));
     if (live.length === 0) {
       return { kind: "retryable", reason: `no live DSH session matches cwd ${command.target.cwd}` };
     }
