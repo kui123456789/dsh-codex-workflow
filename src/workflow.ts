@@ -44,6 +44,7 @@ import { SubmissionFlow } from "./application/submission-flow.js";
 import { ReviewerGateway } from "./application/app-server/reviewer-gateway.js";
 import { ThreadGateway } from "./application/app-server/thread-gateway.js";
 import { TurnGateway } from "./application/app-server/turn-gateway.js";
+import { WorkflowRuntimeState } from "./application/workflow-runtime-state.js";
 import type {
   AlignmentOutcome,
   PersistedTurnBaseline,
@@ -253,35 +254,8 @@ export class WorkflowManager {
   private readonly reviewerGateway: ReviewerGateway;
   private readonly threadGateway: ThreadGateway;
   private readonly turnGateway: TurnGateway;
-  private readonly pending = new Map<string, TurnNeedsInputResult>();
-  private readonly nudgedTurns = new Set<string>();
-  private readonly recovering = new Set<string>();
-  private readonly recoveringNotices = new Set<string>();
-  /** In-process exact mapping of the CURRENTLY ACTIVE turn per workflow —
-   * visible (persistent-thread) turns AND ephemeral conversion-fork turns.
-   * `cancel` interrupts this mapping first so it always hits the thread/turn
-   * pair that is genuinely running right now: an ephemeral fork turn is
-   * interrupted on the FORK thread and can never be mispaired with the
-   * persisted thread id, and a completed visible turn is never interrupted.
-   * Ephemeral entries are never persisted. */
-  private readonly activeTurns = new Map<string, { threadId: string; turnId: string; kind: "planner" | "reviewer"; ephemeral: boolean }>();
-  /** Foreground tool flows (Planner start/continue, DSH-led review/review-only
-   * including their ephemeral normalization) that teardown must interrupt and
-   * AWAIT before the App Server stops and the stores close — otherwise a
-   * late-resolving turn could write into a closed store. */
-  private readonly foreground = new Set<Promise<unknown>>();
-  /** Manager-owned background tasks that must settle before teardown. */
-  private readonly backgroundTasks = new Set<Promise<unknown>>();
-  /** Per-submission lifecycle signals. Tool-call signals are deliberately not
-   * used once a durable submission has been queued. */
-  private readonly submissionControllers = new Map<string, AbortController>();
-  /** Teardown gate: once set, no new callback send may start and in-flight
-   * recovery is aborted so no child can be (re)spawned after stop(). */
-  private stopped = false;
-  private stopPromise?: Promise<void>;
-  private readonly lifecycleController = new AbortController();
-  private recoveryChain?: Promise<void>;
-  private activeRecovery = false;
+  /** The only owner of in-process flow lifecycle state. */
+  private readonly runtime = new WorkflowRuntimeState();
   /** Submission lease lifetime; heartbeats renew at ttl/3 while a callback
    * runs, so only crashed owners are ever taken over. */
   private readonly leaseTtlMs: number;
@@ -289,9 +263,6 @@ export class WorkflowManager {
   private readonly retryNow: () => number;
   private readonly retrySleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly retryRandom: () => number;
-  /** DSH-owned Review heartbeat timers. They never depend on model output. */
-  private readonly reviewHeartbeats = new Map<string, NodeJS.Timeout>();
-
   constructor(
     private readonly store: WorkflowStore,
     private readonly codex: CodexGateway,
@@ -335,6 +306,11 @@ export class WorkflowManager {
     this.threadGateway = new ThreadGateway(this.codex);
     this.turnGateway = new TurnGateway(this.codex);
   }
+
+  /** Compatibility view retained for the existing single-flight recovery test. */
+  private get activeRecovery(): boolean { return this.runtime.activeRecovery; }
+  /** Compatibility view retained for active-turn lifecycle assertions. */
+  private get activeTurns() { return this.runtime.activeTurns; }
 
   // ---------------------------------------------------------------- facade
   // Public compatibility surface. New consumers use the flow objects above;
@@ -413,18 +389,13 @@ export class WorkflowManager {
   }
 
   /** Start a durable Review attempt and its independent heartbeat. */
-  /** 1.1.4: best-effort cleanup notes collected during a round, keyed by workflow
-   * id. They are flushed AFTER the round's terminal observation write, because
-   * that write replaces `lastProgressMessage`. */
-  private cleanupNotes = new Map<string, string[]>();
-
   private async beginReviewObservation(
     workflowId: string,
     options: { enterReviewing?: boolean; step?: ReviewStep; message?: string } = {},
   ) {
     // A new round starts with an empty note buffer: a note left by an earlier
     // round that never flushed must never be attributed to this one.
-    this.cleanupNotes.delete(workflowId);
+    this.runtime.cleanupNotes.delete(workflowId);
     const now = new Date().toISOString();
     const outcome = await this.store.update(workflowId, (record) => {
       if (options.enterReviewing !== false) record.phase = "reviewing";
@@ -447,13 +418,13 @@ export class WorkflowManager {
       void this.markReviewProgress(workflowId).catch(() => undefined);
     }, this.reviewHeartbeatMs());
     timer.unref();
-    this.reviewHeartbeats.set(workflowId, timer);
+    this.runtime.reviewHeartbeats.set(workflowId, timer);
   }
 
   private stopReviewHeartbeat(workflowId: string): void {
-    const timer = this.reviewHeartbeats.get(workflowId);
+    const timer = this.runtime.reviewHeartbeats.get(workflowId);
     if (timer) clearInterval(timer);
-    this.reviewHeartbeats.delete(workflowId);
+    this.runtime.reviewHeartbeats.delete(workflowId);
   }
 
   /** Persist only safe phase diagnostics; never model text or raw JSONL. */
@@ -707,33 +678,33 @@ export class WorkflowManager {
    * first has truly finished tearing down.
    */
   private async stopInternal(): Promise<void> {
-    if (this.stopPromise) return this.stopPromise;
+    if (this.runtime.stopPromise) return this.runtime.stopPromise;
     const task = this.doStop();
-    this.stopPromise = task;
+    this.runtime.stopPromise = task;
     return task;
   }
 
   private async doStop(): Promise<void> {
-    if (this.stopped) return;
-    this.stopped = true;
-    this.lifecycleController.abort();
-    for (const controller of this.submissionControllers.values()) controller.abort();
+    if (this.runtime.stopped) return;
+    this.runtime.stopped = true;
+    this.runtime.lifecycleController.abort();
+    for (const controller of this.runtime.submissionControllers.values()) controller.abort();
     // Interrupt every ACTIVE foreground turn (visible Planner/Reviewer or
     // ephemeral normalization fork) so the foreground tool flows settle via
     // their own abort/interrupt paths instead of timing out into a closed
     // store. Background Reviewer turns are interrupted by callback.stop().
-    for (const active of this.activeTurns.values()) {
+    for (const active of this.runtime.activeTurns.values()) {
       void this.turnGateway.interrupt(active.threadId, active.turnId).catch(() => undefined);
     }
-    const foreground = [...this.foreground];
+    const foreground = [...this.runtime.foreground];
     const callbackStop = this.callback?.stop();
-    const chain = this.recoveryChain;
-    this.recoveryChain = undefined;
+    const chain = this.runtime.recoveryChain;
+    this.runtime.recoveryChain = undefined;
     if (chain) await chain.catch(() => undefined);
     // Wait for EVERY manager-owned task to settle (foreground tool flows AND
     // background recovery-derived tasks; they observe the abort and the
     // interrupts and stop writing/enqueueing/spawning).
-    const tasks = [...this.backgroundTasks];
+    const tasks = [...this.runtime.backgroundTasks];
     await Promise.allSettled([...tasks, ...foreground]);
     await callbackStop;
   }
@@ -742,9 +713,9 @@ export class WorkflowManager {
    * before stopping the App Server and closing the stores. Registered at the
    * method boundary so even a tool call that dies mid-flight is awaited. */
   private trackForeground(task: Promise<unknown>): Promise<unknown> {
-    this.foreground.add(task);
+    this.runtime.foreground.add(task);
     void task.finally(() => {
-      this.foreground.delete(task);
+      this.runtime.foreground.delete(task);
     }).catch(() => undefined);
     return task;
   }
@@ -753,9 +724,9 @@ export class WorkflowManager {
    * before closing the stores; late store/enqueue writes are impossible after
    * stop() returns. */
   private trackBackground(task: Promise<unknown>): void {
-    this.backgroundTasks.add(task);
+    this.runtime.backgroundTasks.add(task);
     void task.finally(() => {
-      this.backgroundTasks.delete(task);
+      this.runtime.backgroundTasks.delete(task);
     }).catch(() => undefined);
   }
 
@@ -772,7 +743,7 @@ export class WorkflowManager {
   ): void {
     const key = this.submissionTaskKey(workflowId, submissionId);
     const controller = new AbortController();
-    this.submissionControllers.set(key, controller);
+    this.runtime.submissionControllers.set(key, controller);
     const task = this.runSubmissionCallback(workflowId, submissionId, prompt, seed, controller.signal, lease)
       .catch(() => undefined)
       .finally(async () => {
@@ -785,8 +756,8 @@ export class WorkflowManager {
           r.submissionLeaseEpoch = undefined;
           r.submissionLeaseUntil = undefined;
         }, { ignoreCancelled: true }).catch(() => undefined);
-        if (this.submissionControllers.get(key) === controller) {
-          this.submissionControllers.delete(key);
+        if (this.runtime.submissionControllers.get(key) === controller) {
+          this.runtime.submissionControllers.delete(key);
         }
       });
     this.trackBackground(task);
@@ -1216,7 +1187,7 @@ export class WorkflowManager {
     // Plan-mode-resolved model) so continue/restart and the conversion fork
     // all run with the SAME model the original planner turn used.
     let plannerModel = record.plannerModel || this.config.plannerModel || undefined;
-    const pending = this.pending.get(workflowId);
+    const pending = this.runtime.pending.get(workflowId);
     if (pending) {
       outcome = await this.turnGateway.continueTurn(pending, answers, exec.signal);
     } else {
@@ -1446,7 +1417,7 @@ export class WorkflowManager {
     });
     try {
       for (let attempt = (current.submissionAttempts ?? 0) + 1; ; attempt += 1) {
-        if (this.stopped || signal?.aborted || leaseLost) return current;
+        if (this.runtime.stopped || signal?.aborted || leaseLost) return current;
         const sending = await updateCurrent((r) => {
           r.submissionState = "sending";
           r.submissionAttempts = attempt;
@@ -1540,12 +1511,12 @@ export class WorkflowManager {
             await this.enqueueSubmissionNotice(workflowId, submissionId, failed, signal);
             return current;
           }
-          if (signal?.aborted || this.stopped) {
+          if (signal?.aborted || this.runtime.stopped) {
             // A cancelled/teardown abort must never leave the submission stuck
             // at `sending` with no backoff: persist a recoverable `retrying`
             // state (skip only during teardown, when the store is closing — a
             // restart reclaims the recoverable `sending` record anyway).
-            if (!this.stopped && !leaseLost) {
+            if (!this.runtime.stopped && !leaseLost) {
               await updateCurrent((r) => {
                 r.submissionState = "retrying";
                 r.submissionError = "interrupted: callback aborted before a verdict";
@@ -1609,7 +1580,7 @@ export class WorkflowManager {
             }
           } catch (error) {
             if (leaseLost) return current;
-            if (signal?.aborted || this.stopped) throw error;
+            if (signal?.aborted || this.runtime.stopped) throw error;
             // The authority machinery itself failed (fork/turn/parse/invalid
             // semantics/preservation): retryable infrastructure, never a
             // verdict, never a consumed cycle. The concrete reason is kept so
@@ -1746,7 +1717,7 @@ export class WorkflowManager {
         if (signal?.aborted) throw abortError(signal);
       }
     } catch (error) {
-      if (signal?.aborted || this.stopped) throw error;
+      if (signal?.aborted || this.runtime.stopped) throw error;
       const failed = await this.stageSubmissionFailure(updateCurrent, workflowId, submissionId, errorMessage(error));
       await this.enqueueSubmissionNotice(workflowId, submissionId, failed, signal);
       return current;
@@ -1793,7 +1764,7 @@ export class WorkflowManager {
     signal?: AbortSignal,
   ): Promise<void> {
     const notice = record.submissionNotice;
-    if (!notice || notice.state === "delivered" || !this.bridgeQueue || this.stopped || signal?.aborted) return;
+    if (!notice || notice.state === "delivered" || !this.bridgeQueue || this.runtime.stopped || signal?.aborted) return;
     try {
       await this.bridgeQueue.enqueue(notice.command);
       await this.store.update(workflowId, (r) => {
@@ -1823,7 +1794,7 @@ export class WorkflowManager {
     const stagedVerdict = staged.stagedVerdict;
     if (!stagedVerdict) return staged;
     for (let attempt = 1; ; attempt += 1) {
-      if (this.stopped || signal?.aborted) return staged;
+      if (this.runtime.stopped || signal?.aborted) return staged;
       try {
         await this.bridgeQueue!.enqueue(stagedVerdict.command);
         return "committed";
@@ -1873,21 +1844,21 @@ export class WorkflowManager {
    */
   private recoverCallbacksInternal(): Promise<number> {
     if (!this.callback) return Promise.resolve(0);
-    if (this.stopped) return Promise.resolve(0); // teardown gate: nothing to recover, never touch a closing store
-    if (this.activeRecovery) return Promise.resolve(0);
-    this.activeRecovery = true;
-    const chain = this.runRecovery(this.lifecycleController.signal);
+    if (this.runtime.stopped) return Promise.resolve(0); // teardown gate: nothing to recover, never touch a closing store
+    if (this.runtime.activeRecovery) return Promise.resolve(0);
+    this.runtime.activeRecovery = true;
+    const chain = this.runRecovery(this.runtime.lifecycleController.signal);
     // Keep the chain for teardown without letting a failure escape start().
-    this.recoveryChain = Promise.resolve(chain).then(() => undefined, () => undefined);
+    this.runtime.recoveryChain = Promise.resolve(chain).then(() => undefined, () => undefined);
     return chain.finally(() => {
-      this.activeRecovery = false;
+      this.runtime.activeRecovery = false;
     });
   }
 
   private async runRecovery(signal: AbortSignal): Promise<number> {
     let recovered = 0;
     for (const loaded of await this.store.list()) {
-      if (signal.aborted || this.stopped) break;
+      if (signal.aborted || this.runtime.stopped) break;
       let record = loaded;
       if (record.origin !== "codex_bridge") continue;
       const submissionId = record.submissionId;
@@ -1896,12 +1867,12 @@ export class WorkflowManager {
       const notice = record.submissionNotice;
       if (notice && notice.state !== "delivered") {
         const noticeId = notice.command.requestId;
-        if (!this.recoveringNotices.has(noticeId)) {
-          this.recoveringNotices.add(noticeId);
+        if (!this.runtime.recoveringNotices.has(noticeId)) {
+          this.runtime.recoveringNotices.add(noticeId);
           recovered += 1;
           this.trackBackground(
             this.enqueueSubmissionNotice(record.id, submissionId, record, signal)
-              .finally(() => this.recoveringNotices.delete(noticeId)),
+              .finally(() => this.runtime.recoveringNotices.delete(noticeId)),
           );
         }
         if (record.submissionState === "failed") continue;
@@ -1929,23 +1900,23 @@ export class WorkflowManager {
 
       // Verdict obtained but never enqueued: durable two-phase recovery.
       if (record.submissionState === "verdict_ready" && record.stagedVerdict) {
-        if (this.recovering.has(submissionId)) continue;
-        this.recovering.add(submissionId);
+        if (this.runtime.recovering.has(submissionId)) continue;
+        this.runtime.recovering.add(submissionId);
         this.trackBackground(
           this.recoverStagedVerdict(record.id, submissionId, record, signal)
-            .finally(() => this.recovering.delete(submissionId)),
+            .finally(() => this.runtime.recovering.delete(submissionId)),
         );
         continue;
       }
 
       if (!RECOVERABLE_STATES.has(record.submissionState as SubmissionState)) continue;
       if ((record.submissionRetryAt ?? 0) > Date.now()) continue;
-      if (this.recovering.has(submissionId)) continue;
+      if (this.runtime.recovering.has(submissionId)) continue;
       // Cross-process claim gate: a live lease (another DSH process) means the
       // submission is being handled right now; only expired leases are taken.
       const lease = await this.acquireSubmissionLease(record.id, submissionId);
       if (!lease) continue;
-      this.recovering.add(submissionId);
+      this.runtime.recovering.add(submissionId);
       const claimed = await this.store.update(record.id, (r) => {
         if (r.submissionId !== submissionId) return false;
         if (!RECOVERABLE_STATES.has(r.submissionState as SubmissionState)) return false;
@@ -1961,7 +1932,7 @@ export class WorkflowManager {
         return true;
       }, { ignoreCancelled: false });
       if (claimed.suppressed || !claimed.result) {
-        this.recovering.delete(submissionId);
+        this.runtime.recovering.delete(submissionId);
         await lease.release().catch(() => undefined);
         continue; // another restarter won the atomic claim
       }
@@ -1969,7 +1940,7 @@ export class WorkflowManager {
       const seed = claimed.record;
       const input = seed.pendingReviewRequest;
       if (!input) {
-        this.recovering.delete(submissionId);
+        this.runtime.recovering.delete(submissionId);
         await lease.release().catch(() => undefined);
         await this.store.update(seed.id, (r) => {
           if (r.submissionId !== submissionId) return;
@@ -1987,7 +1958,7 @@ export class WorkflowManager {
       this.trackBackground(
         this.runSubmissionCallback(seed.id, submissionId, prompt, seed, signal, lease)
           .finally(() => {
-            this.recovering.delete(submissionId);
+            this.runtime.recovering.delete(submissionId);
             return (async () => {
               await lease.release().catch(() => undefined);
               // Clear the record-level lease fence after the callback finishes.
@@ -2164,7 +2135,7 @@ export class WorkflowManager {
     // no dispatcher is injected.
     const reviewerActive =
       this.callback?.activeReview?.(record.id) === true
-      || this.activeTurns.get(record.id)?.kind === "reviewer"
+      || this.runtime.activeTurns.get(record.id)?.kind === "reviewer"
       || (record.processState === "running" && record.phase === "reviewing" && Boolean(record.reviewerTurnId));
     return { ...record, reviewerActive };
   }
@@ -2184,7 +2155,7 @@ export class WorkflowManager {
    */
   private async cancelInternal(workflowId: string, exec: ToolRunContext): Promise<WorkflowRecord> {
     const agent = requireAgent(exec);
-    const active = this.activeTurns.get(workflowId);
+    const active = this.runtime.activeTurns.get(workflowId);
     let target: { threadId: string; turnId: string } | undefined;
     const outcome = await this.store.update(workflowId, (r) => {
       if (r.dshSessionId !== agent.id) throw new Error("workflow belongs to another DSH session");
@@ -2231,7 +2202,7 @@ export class WorkflowManager {
     }
     // Cancel the active Reviewer operation, if any; cancelled is terminal for it too.
     if (outcome.record.submissionId) {
-      this.submissionControllers
+      this.runtime.submissionControllers
         .get(this.submissionTaskKey(workflowId, outcome.record.submissionId))
         ?.abort();
     }
@@ -2250,8 +2221,8 @@ export class WorkflowManager {
     // never nudge DSH to "finish the fixes".
     if (record.error && /review(er)? contract (conflict|failure)/i.test(record.error)) return;
     const key = `${record.id}:${turn}`;
-    if (this.nudgedTurns.has(key)) return;
-    this.nudgedTurns.add(key);
+    if (this.runtime.nudgedTurns.has(key)) return;
+    this.runtime.nudgedTurns.add(key);
     const action = record.origin === "codex_bridge"
       ? "call codex_workflow_submit with workflowId " + record.id + ", a concise implementation summary, changed files, and test results so the originating Codex task can review the result"
       : "call codex_workflow_review with workflowId " + record.id + ", a concise implementation summary, changed files, and test results before ending this turn";
@@ -2451,7 +2422,7 @@ export class WorkflowManager {
       if (!afterReview || afterReview.phase === "cancelled") {
         // The review turn is no longer the active target; a later cancel must
         // never interrupt it (or the completed Planner task).
-        this.activeTurns.delete(workflowId);
+        this.runtime.activeTurns.delete(workflowId);
         return afterReview!;
       }
       current = afterReview;
@@ -2518,7 +2489,7 @@ export class WorkflowManager {
         const afterRewrite = await this.store.load(workflowId);
         if (!afterRewrite || afterRewrite.phase === "cancelled") {
           // Never leave the completed rewrite turn as the active cancel target.
-          this.activeTurns.delete(workflowId);
+          this.runtime.activeTurns.delete(workflowId);
           return afterRewrite!;
         }
         current = afterRewrite;
@@ -2575,7 +2546,7 @@ export class WorkflowManager {
             onStarted: (started) => this.registerEphemeralTurn(workflowId, started.threadId, started.turnId, "reviewer"),
           }, exec.signal);
         } finally {
-          this.activeTurns.delete(workflowId);
+          this.runtime.activeTurns.delete(workflowId);
         }
         const afterNormalize = await this.store.load(workflowId);
         if (!afterNormalize || afterNormalize.phase === "cancelled") return afterNormalize!;
@@ -2619,7 +2590,7 @@ export class WorkflowManager {
         // Unresolved conflict: restore the pre-review phase (blocked after
         // two CONSECUTIVE unresolved conflicts). NO latestReview, NO cycle,
         // NO fixing prompt — the reviewer contract failed, not the code.
-        this.activeTurns.delete(workflowId);
+        this.runtime.activeTurns.delete(workflowId);
         const conflictCommit = await this.store.update(workflowId, (r) => {
           if (r.phase !== "reviewing") return;
           r.latestReviewConflict = conflictInfo;
@@ -2686,7 +2657,7 @@ export class WorkflowManager {
       // The visible turn (review/rewrite) is no longer running or was never
       // registered: clear the in-process active-turn mapping so a later cancel
       // can never interrupt a completed turn through a stale map entry.
-      this.activeTurns.delete(workflowId);
+      this.runtime.activeTurns.delete(workflowId);
       const failed = await this.store.update(workflowId, (r) => {
         if (r.phase !== "reviewing") return;
         r.phase = priorPhase;
@@ -2760,16 +2731,16 @@ export class WorkflowManager {
    * silently discarded. */
   private reportCleanupNote(workflowId: string | undefined, note: string | undefined): void {
     if (!workflowId || !note) return;
-    const notes = this.cleanupNotes.get(workflowId) ?? [];
+    const notes = this.runtime.cleanupNotes.get(workflowId) ?? [];
     notes.push(note);
-    this.cleanupNotes.set(workflowId, notes);
+    this.runtime.cleanupNotes.set(workflowId, notes);
   }
 
   /** Append every buffered cleanup note to the round's terminal progress message. */
   private async flushCleanupNotes(workflowId: string): Promise<void> {
-    const notes = this.cleanupNotes.get(workflowId);
+    const notes = this.runtime.cleanupNotes.get(workflowId);
     if (!notes || notes.length === 0) return;
-    this.cleanupNotes.delete(workflowId);
+    this.runtime.cleanupNotes.delete(workflowId);
     await this.store.update(workflowId, (record) => {
       record.lastProgressMessage = [record.lastProgressMessage, ...notes].filter(Boolean).join(" — ");
       record.lastProgressAt = new Date().toISOString();
@@ -2927,7 +2898,7 @@ export class WorkflowManager {
     } finally {
       // Every ending path — completion, cancel, timeout — drops the mapping so
       // a completed fork turn can never be interrupted by a later cancel.
-      this.activeTurns.delete(record.id);
+      this.runtime.activeTurns.delete(record.id);
     }
     const after = await this.store.load(record.id);
     if (!after || after.phase === "cancelled") throw new Error("workflow cancelled during review authority alignment");
@@ -3012,7 +2983,7 @@ export class WorkflowManager {
         onStarted: (started) => this.registerActiveTurn(record.id, started.threadId, started.turnId, "reviewer"),
       }, signal);
     } finally {
-      this.activeTurns.delete(record.id);
+      this.runtime.activeTurns.delete(record.id);
     }
     const after = await this.store.load(record.id);
     if (!after || after.phase === "cancelled") throw new Error("workflow cancelled during review reconciliation");
@@ -3039,7 +3010,7 @@ export class WorkflowManager {
         onStarted: (started) => this.registerEphemeralTurn(after.id, started.threadId, started.turnId, "reviewer"),
       }, signal);
     } finally {
-      this.activeTurns.delete(after.id);
+      this.runtime.activeTurns.delete(after.id);
     }
     if (corrected.kind !== "completed") throw new Error("review reconciliation normalization unexpectedly requested user input");
     if (corrected.status !== "completed") {
@@ -3074,7 +3045,7 @@ export class WorkflowManager {
     turnId: string,
     kind: "planner" | "reviewer",
   ): Promise<void> {
-    this.activeTurns.set(workflowId, { threadId, turnId, kind, ephemeral: false });
+    this.runtime.activeTurns.set(workflowId, { threadId, turnId, kind, ephemeral: false });
     const outcome = await this.store.update(workflowId, (r) => {
       if (kind === "planner") {
         r.plannerThreadId = threadId;
@@ -3092,7 +3063,7 @@ export class WorkflowManager {
     if (outcome.suppressed) {
       // Cancelled while the turn was being registered: kill the turn we just
       // started, never the record.
-      this.activeTurns.delete(workflowId);
+      this.runtime.activeTurns.delete(workflowId);
       await this.turnGateway.interrupt(threadId, turnId).catch(() => undefined);
     }
   }
@@ -3110,13 +3081,13 @@ export class WorkflowManager {
     turnId: string,
     kind: "planner" | "reviewer",
   ): Promise<void> {
-    this.activeTurns.set(workflowId, { threadId, turnId, kind, ephemeral: true });
+    this.runtime.activeTurns.set(workflowId, { threadId, turnId, kind, ephemeral: true });
     const record = await this.store.load(workflowId);
     if (record?.processState === "running" && kind === "reviewer") {
       await this.markReviewProgress(workflowId, undefined, "Reviewer conversion turn is running", turnId);
     }
     if (!record || record.phase === "cancelled") {
-      this.activeTurns.delete(workflowId);
+      this.runtime.activeTurns.delete(workflowId);
       await this.turnGateway.interrupt(threadId, turnId).catch(() => undefined);
     }
   }
@@ -3216,7 +3187,7 @@ export class WorkflowManager {
     cwd?: string,
   ): Promise<WorkflowRecord> {
     if (outcome.kind === "needs_input") {
-      this.pending.set(workflowId, outcome);
+      this.runtime.pending.set(workflowId, outcome);
       const commit = await this.store.update(workflowId, (r) => {
         r.phase = "waiting_input";
         r.questions = outcome.request.questions;
@@ -3225,7 +3196,7 @@ export class WorkflowManager {
       }, { ignoreCancelled: false });
       return commit.record;
     }
-    this.pending.delete(workflowId);
+    this.runtime.pending.delete(workflowId);
     if (outcome.status !== "completed") throw new Error(outcome.error ?? `planner turn ${outcome.status}`);
     // Visible-reply contract (HARD conditions, independent of the final item
     // type — a Plan-mode turn may legitimately complete as a `plan` item on
@@ -3259,7 +3230,7 @@ export class WorkflowManager {
       } catch (error) {
         return this.failPlannerNormalization(workflowId, errorMessage(error));
       } finally {
-        this.activeTurns.delete(workflowId);
+        this.runtime.activeTurns.delete(workflowId);
       }
       if (normalized.kind !== "completed" || normalized.status !== "completed") {
         return this.failPlannerNormalization(
@@ -3299,12 +3270,12 @@ export class WorkflowManager {
         // persistence failure, process error — must drop the active-turn
         // mapping, so a stale completed/failed turn can never be interrupted
         // by a later cancel.
-        this.activeTurns.delete(workflowId);
+        this.runtime.activeTurns.delete(workflowId);
       }
       if (completion.kind === "needs_input") {
         // The completion turn asked for user input: fall back to the normal
         // waiting_input machinery (user answers via codex_workflow_continue).
-        this.pending.set(workflowId, completion);
+        this.runtime.pending.set(workflowId, completion);
         const commit = await this.store.update(workflowId, (r) => {
           r.phase = "waiting_input";
           r.questions = completion.request.questions;
