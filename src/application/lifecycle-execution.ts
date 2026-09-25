@@ -120,24 +120,10 @@ export class LifecycleExecution {
     const outcome = await this.ctx.store.update(workflowId, (r) => {
       if (r.dshSessionId !== agent.id) throw new Error("workflow belongs to another DSH session");
       if (!active) {
-        // Persisted fallback, ONLY for the distinct-Reviewer layout
-        // (review_only task, or a legacy record with its own reviewer id):
-        // there the persisted reviewer pair points at a review task that is
-        // never the planning task, so interrupting its last-known turn keeps
-        // the pre-1.0.8 contract. Since 1.0.8, planned/bridge workflows
-        // share ONE task (`reviewerThreadId === plannerThreadId`): a
-        // persisted turn id there may be an ALREADY-COMPLETED Planner or
-        // review turn, and a completed turn must never receive an
-        // `turn/interrupt` — the genuinely running turn is covered by the
-        // in-process active-turn map, by registerActiveTurn's
-        // suppressed-registration interrupt, and by the callback latch.
-        if (r.reviewerThreadId && r.reviewerTurnId && r.reviewerThreadId !== r.plannerThreadId) {
-          target = { threadId: r.reviewerThreadId, turnId: r.reviewerTurnId };
-        }
-        // The planner pair is never a fallback target: `plannerTurnId` is
-        // only persisted for COMPLETED planner turns (while the planner is
-        // running, the active-turn map covers it), so it must never receive
-        // an interrupt.
+        // New Planner/Reviewer ids are ephemeral and never persisted. Legacy
+        // ids remain diagnostic only, so cancellation never resumes or
+        // interrupts a historical Desktop task. A genuinely running turn is
+        // always represented by the in-process active-turn map.
       }
       r.phase = "cancelled";
       r.processState = "cancelled";

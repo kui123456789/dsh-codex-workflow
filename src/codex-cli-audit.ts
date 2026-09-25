@@ -156,6 +156,7 @@ export class CodexCliAuditDispatcher implements CodexCliAuditGateway {
         model: request.model,
         effort: request.effort,
         threadId: resumeThreadId,
+        ephemeral: request.ephemeral === true,
       }),
       onNewThread: async (id) => {
         threadId = id;
@@ -327,7 +328,7 @@ export class CodexCliAuditDispatcher implements CodexCliAuditGateway {
   }
 
   private visibleThreadId(request: CodexCallbackRequest): string {
-    return request.reviewerThreadId ?? request.codexThreadId;
+    return request.reviewerThreadId ?? request.codexThreadId ?? "ephemeral";
   }
 
   /** Build every codex exec invocation in one place so visible review,
@@ -338,10 +339,11 @@ export class CodexCliAuditDispatcher implements CodexCliAuditGateway {
     model?: string;
     effort?: ReasoningEffort;
     threadId?: string;
+    ephemeral?: boolean;
     schemaFile?: string;
   }): string[] {
     const args = ["exec"];
-    if (input.schemaFile) args.push("--ephemeral");
+    if (input.schemaFile || input.ephemeral) args.push("--ephemeral");
     args.push("--json");
     if (input.schemaFile) args.push("--output-schema", input.schemaFile);
     const model = input.model?.trim();

@@ -95,7 +95,8 @@ export class AppServerCodexCallbackDispatcher {
     if (!this.codex.startReviewerThread) throw new Error("codex gateway has no startReviewerThread");
     const options = {
       cwd: request.cwd,
-      name: request.reviewerName ?? `DSH Reviewer: ${request.workflowId}`,
+      ...(request.reviewerName ? { name: request.reviewerName } : {}),
+      ...(request.ephemeral ? { ephemeral: true } : {}),
     };
     const shell = this.codex.startReviewerThreadShell?.bind(this.codex);
     const configure = this.codex.configureReviewerThread?.bind(this.codex);
@@ -204,7 +205,9 @@ export class AppServerCodexCallbackDispatcher {
     // does not know that thread and answers `thread not found`.
     this.codex.beginRound?.();
     try {
-      reviewerThreadId = request.reviewerThreadId;
+      // New ephemeral rounds ignore any legacy persisted Reviewer id. This is
+      // the guard that prevents the callback from ever resuming a Desktop task.
+      reviewerThreadId = request.ephemeral ? undefined : request.reviewerThreadId;
       // 1.1.0: a review NEVER runs on the origin (source) task. A dedicated
       // Reviewer task is created instead, so an external writer holding the
       // user's Codex task (Codex Desktop keeps a writer lock on every thread
@@ -262,7 +265,9 @@ export class AppServerCodexCallbackDispatcher {
       // (newly-persisted) turn is later detected against these ids, because
       // the `turn/start` RPC id is NOT guaranteed to equal the persisted
       // `thread.turns[].id` (real App Server evidence).
-      const visibleBaseline = await this.codex.captureTurnBaseline(reviewerThreadId, signal);
+      const visibleBaseline = request.ephemeral
+        ? undefined
+        : await this.codex.captureTurnBaseline(reviewerThreadId, signal);
       const result = await this.codex.startTurn(reviewerThreadId, {
         prompt: request.prompt,
         ...(request.model ? { model: request.model } : {}),
@@ -348,7 +353,9 @@ export class AppServerCodexCallbackDispatcher {
       // history since the pre-turn baseline (never the RPC turn id — real App
       // Server evidence shows native review RPC turn ids that never appear in
       // the persisted rollout history). Missing/ambiguous -> retryable.
-      const persistedNative = await this.codex.readAppendedTurnText(reviewerThreadId, visibleBaseline, signal);
+      const persistedNative = request.ephemeral
+        ? { text: result.text ?? "" }
+        : await this.codex.readAppendedTurnText(reviewerThreadId, visibleBaseline!, signal);
       if (!persistedNative) {
         this.interruptOrigins.delete(key);
         return { kind: "retryable_busy", reason: "persisted review read-back missing or ambiguous" };
@@ -358,7 +365,9 @@ export class AppServerCodexCallbackDispatcher {
       if (displayError) {
         if (authoritativeText.trim().length > 0) {
           // Baseline BEFORE the rewrite turn, exactly like the native turn.
-          const rewriteBaseline = await this.codex.captureTurnBaseline(reviewerThreadId, signal);
+          const rewriteBaseline = request.ephemeral
+            ? undefined
+            : await this.codex.captureTurnBaseline(reviewerThreadId, signal);
           const rewrite = await this.codex.startTurn(reviewerThreadId, {
             prompt: reviewRewritePrompt(authoritativeText, displayContext),
             ...(request.model ? { model: request.model } : {}),
@@ -388,7 +397,9 @@ export class AppServerCodexCallbackDispatcher {
             // The rewrite's AUTHORITY is its persisted history — the turn
             // APPENDED since the rewrite baseline — never the in-memory text.
             // A missing/ambiguous rewrite read-back is retryable too.
-            const persistedRewrite = await this.codex.readAppendedTurnText(reviewerThreadId, rewriteBaseline, signal);
+            const persistedRewrite = request.ephemeral
+              ? { text: rewrite.text ?? "" }
+              : await this.codex.readAppendedTurnText(reviewerThreadId, rewriteBaseline!, signal);
             if (!persistedRewrite) {
               rewrittenError = "persisted rewrite read-back missing or ambiguous";
             } else {
@@ -422,23 +433,31 @@ export class AppServerCodexCallbackDispatcher {
       // for cancellation but is NEVER persisted, so reviewerThreadId keeps
       // pointing at the durable visible workflow task.
       const effectiveModel = request.model || await this.codex.resolveDefaultModel(signal) || undefined;
-      const converted = await this.codex.normalizeInFork({
-        threadId: reviewerThreadId,
-        cwd: request.cwd,
+      const conversionOptions = {
         prompt: reviewConversionPrompt(authoritativeText, request.workflowId),
         ...(effectiveModel ? { model: effectiveModel } : {}),
+        effort: "low" as const,
         outputSchema: REVIEW_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
-        onStarted: async (started) => {
+        conversion: true,
+        onStarted: async (started: { threadId: string; turnId: string }) => {
           this.active.set(key, started);
           if (this.isLatched(key, request.workflowId)) {
-            // Cancel arrived while the fork RPCs were in flight: interrupt the
-            // freshly started ephemeral turn immediately.
             await this.codex.interrupt(started.threadId, started.turnId).catch(() => undefined);
             throw new Error("cancelled by user (latch)");
           }
           await request.onEphemeralStarted?.(started);
         },
-      }, signal);
+      };
+      const converted = request.ephemeral
+        ? await this.codex.startTurn(reviewerThreadId, conversionOptions, signal)
+        : await this.codex.normalizeInFork({
+          threadId: reviewerThreadId,
+          cwd: request.cwd,
+          prompt: conversionOptions.prompt,
+          ...(effectiveModel ? { model: effectiveModel } : {}),
+          outputSchema: conversionOptions.outputSchema,
+          onStarted: conversionOptions.onStarted,
+        }, signal);
       this.active.delete(key);
       // 1.0.7 failure semantics: the NORMALIZATION (ephemeral conversion)
       // missing/unsuccessful/invalid output is an infrastructure-class

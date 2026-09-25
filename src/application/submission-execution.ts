@@ -8,7 +8,8 @@ import { ReviewObservation } from "./review-observation.js";
 import type { WorkflowRuntimeState } from "./workflow-runtime-state.js";
 import { transientReason } from "../transient-retry.js";
 import type { ReviewConflictInfo, ReviewInput, ReviewResult, SubmissionState, WorkflowConfig, WorkflowPhase, WorkflowRecord } from "../types.js";
-import { applyReviewConsistency, abortError, callbackRecoveryDelay, delay, errorMessage, isSharedReviewerAlias, submissionTerminal } from "../workflow.js";
+import { applyReviewConsistency, abortError, callbackRecoveryDelay, delay, errorMessage, submissionTerminal } from "../workflow.js";
+import type { CodexReviewEndEvent } from "../review-events.js";
 
 type AnyFn = (...args: any[]) => any;
 
@@ -25,7 +26,6 @@ export interface SubmissionExecutionContext {
   enqueueStagedVerdict: AnyFn;
   enqueueSubmissionNotice: AnyFn;
   stageSubmissionFailure: AnyFn;
-  renameLegacyReviewer: AnyFn;
   reportCleanupNote: AnyFn;
   flushCleanupNotes: AnyFn;
   alignReview: AnyFn;
@@ -48,6 +48,7 @@ export class SubmissionExecution {
     let current = seed;
     const roundStartAttempt = current.submissionAttempts ?? 0;
     let leaseLost = false;
+    let reviewEndDetail: Pick<CodexReviewEndEvent, "verdict" | "result" | "visibleText" | "summary" | "error"> | undefined;
     // Every state write must stay fenced to THIS lease (submissionId + token +
     // epoch): a stale owner can never rewrite a submission the lease moved on.
     const isCurrent = (record: WorkflowRecord) =>
@@ -95,14 +96,10 @@ export class SubmissionExecution {
           // Desktop. A legacy CLI-created task (`source='exec'`) is handed over
           // as UNBOUND so the dispatcher creates a visible replacement; the old
           // task is left intact and merely renamed for humans.
-          const boundReviewer = current.reviewerThreadId
-            && !isSharedReviewerAlias(current)
-            && current.reviewerThreadOrigin === "app-server"
-            ? current.reviewerThreadId
-            : undefined;
-          // The helper owns the "may this be renamed?" rule (dedicated, legacy
-          // only — never the Planner/origin task), so it is simply called.
-          if (!boundReviewer) await this.ctx.renameLegacyReviewer(current, workflowId);
+          // New callback rounds always create an ephemeral Reviewer. Legacy
+          // durable bindings remain diagnostic state and are never resumed or
+          // handed off to an external Desktop writer.
+          const boundReviewer: undefined = undefined;
           if (boundReviewer) {
             // 1.1.4: signal-free but BOUNDED — a handoff that never settles must
             // not wedge the round (or cancel/teardown) either.
@@ -128,29 +125,28 @@ export class SubmissionExecution {
             // the Planner/origin task.
             reviewerThreadId: boundReviewer,
             reviewerName: `DSH Reviewer: ${workflowId}`,
+            ephemeral: true,
             ...(current.reviewerModel || this.ctx.config.reviewerModel
               ? { model: current.reviewerModel || this.ctx.config.reviewerModel }
               : {}),
             effort: current.reviewerEffort ?? this.ctx.config.reviewerEffort,
             onThread: async (threadId) => {
               const registered = await updateCurrent((r) => {
-                r.reviewerThreadId = threadId;
-                r.reviewerThreadOrigin = "app-server";
+                // Ephemeral Reviewer ids are process-local and must never be
+                // persisted as Desktop-visible durable bindings.
+                r.reviewerThreadOrigin = "app-server-ephemeral";
               });
-              if (registered.reviewerThreadId !== threadId) {
-                throw new Error("submission no longer owns the reviewer thread");
-              }
+              void threadId;
+              if (registered.submissionId !== submissionId) throw new Error("submission no longer owns the reviewer thread");
             },
             onStarted: async ({ threadId, turnId }) => {
               const registered = await updateCurrent((r) => {
-                r.reviewerThreadId = threadId;
-                r.reviewerThreadOrigin = "app-server";
                 r.reviewerTurnId = turnId;
                 r.activeTurnId = turnId;
                 r.lastProgressAt = new Date().toISOString();
                 r.lastProgressMessage = "Reviewer turn is running";
               });
-              if (registered.reviewerThreadId !== threadId || registered.reviewerTurnId !== turnId) {
+              if (registered.submissionId !== submissionId || registered.reviewerTurnId !== turnId) {
                 throw new Error("submission no longer owns the active reviewer turn");
               }
             },
@@ -200,6 +196,7 @@ export class SubmissionExecution {
         const priorPhase: WorkflowPhase = current.phase === "fixing" ? "fixing" : "executing";
         let contractConflict: ReviewConflictInfo | undefined;
         if (outcome.kind === "verdict") {
+          reviewEndDetail = { verdict: outcome.verdict.verdict, result: outcome.verdict, summary: outcome.verdict.summary };
           // 1.0.10 REVIEW AUTHORITY ALIGNMENT on the bridge path: the verdict
           // must align with the authority hierarchy before it may be staged.
           // One invisible alignment fork checks the result; on conflict the
@@ -378,7 +375,7 @@ export class SubmissionExecution {
       return current;
     } finally {
       lease?.stopHeartbeat();
-      await this.ctx.reviewObservation.finish(workflowId);
+      await this.ctx.reviewObservation.finish(workflowId, undefined, reviewEndDetail);
       await this.ctx.flushCleanupNotes(workflowId);
     }
   }

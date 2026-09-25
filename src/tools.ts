@@ -126,7 +126,7 @@ export function createWorkflowTools(manager: WorkflowManager, config: WorkflowCo
   return [
     defineTool({
       name: "codex_workflow_start",
-      description: "Start the Codex planning workflow before making changes. DSH may call this autonomously when the installed auto-trigger policy matches the user's development task. Call it at most once per task/session: Codex inspects the bound workspace read-only and returns the plan that this same DSH session must execute, test, and submit to the existing Codex task for review.",
+      description: "Start the DSH-led Codex planning workflow before making changes. DSH may call this autonomously when the installed auto-trigger policy matches the user's development task. Codex runs through the NPM CLI App Server in a hidden ephemeral thread; the plan is returned to this DSH session and shown in the Codex Review right sidebar. Call it at most once per task/session. The normal DSH-led path does not open Codex Desktop or use dispatch_plan.",
       parameters: {
         task: { type: "string", required: true, description: "The complete coding task for Codex to plan." },
         plannerModel: { type: "string", description: "Optional Codex planner model override." },
@@ -149,7 +149,7 @@ export function createWorkflowTools(manager: WorkflowManager, config: WorkflowCo
     }),
     defineTool({
       name: "codex_workflow_review",
-      description: "Append an independent read-only Codex review to this workflow's dedicated Reviewer task: since 1.1.0 a review always runs on its own task, never on the Planner task or the Codex origin task (a foreign writer holding that task, such as Codex Desktop, would otherwise block the review). Call after implementing the plan and after every repair round; re-reviews reuse the same dedicated Reviewer task.",
+      description: "Run an independent read-only Codex review of this DSH workflow after implementation and after every repair round. The NPM CLI App Server uses a fresh hidden ephemeral Reviewer thread, so no Codex Desktop task is created or resumed. Progress and the readable verdict automatically appear in the DSH Codex Review right sidebar.",
       parameters: {
         workflowId: { type: "string", required: true },
         implementationSummary: { type: "string", required: true },
@@ -166,7 +166,7 @@ export function createWorkflowTools(manager: WorkflowManager, config: WorkflowCo
     }),
     defineTool({
       name: "codex_workflow_review_only",
-      description: "Review the current workspace with an independent read-only Codex Reviewer without running the Planner. Reuses the same evidence, verdict-gate, no-change and cycle-limit pipeline as normal reviews.",
+      description: "Review the current workspace with an independent read-only Codex Reviewer without running the Planner. The review runs in a hidden NPM CLI App Server ephemeral thread and appears in the DSH Codex Review right sidebar. It uses the same evidence, verdict-gate, no-change and cycle-limit pipeline as normal reviews.",
       parameters: {
         task: { type: "string", description: "Optional scope of the review; a sensible default is used when omitted." },
         implementationSummary: { type: "string", required: true },
@@ -188,7 +188,7 @@ export function createWorkflowTools(manager: WorkflowManager, config: WorkflowCo
     }),
     defineTool({
       name: "codex_workflow_submit",
-      description: "Queue the implementation of a Codex-bridge workflow for background Codex review. Returns immediately after durable persistence; the verdict or a terminal error will automatically wake this same DSH session.",
+      description: "Queue a workflow explicitly created by the Codex-led bridge for background review. Use this only when the workflow origin is codex_bridge and an external Codex task id is already stored. The Reviewer itself runs in a hidden NPM CLI App Server ephemeral thread; the verdict returns to this DSH session and the Codex Review right sidebar.",
       parameters: {
         workflowId: { type: "string", required: true },
         implementationSummary: { type: "string", required: true },

@@ -173,25 +173,12 @@ export interface WorkflowRecord {
    * all reuse the SAME model instead of falling back to a different default.
    * Optional for records written by older versions. */
   plannerModel?: string;
-  /** Read-only source thread that hosted the first detached review (review-only
-   * workflows); kept for diagnostics and restart recovery. */
+  /** Legacy source thread id retained for diagnostics only. */
   sourceThreadId?: string;
   reviewerThreadId?: string;
-  /**
-   * 1.1.2: which side created `reviewerThreadId`.
-   *
-   * `"app-server"` = created through `thread/start` on the App Server, which is
-   * the ONLY kind Codex Desktop can render: the App Server stores it with
-   * `source='vscode'` and returns it from `thread/list`. A thread created by
-   * `codex exec` is stored with `source='exec'`, is NEVER returned by
-   * `thread/list` (measured: 0/15 listed, versus 62/72 `vscode` threads) and
-   * therefore cannot be opened in the Desktop UI at all — it also carries no
-   * name. Records without this marker (everything written before 1.1.2) are
-   * migrated lazily: the next review creates a visible Reviewer and replaces
-   * the id, leaving the old thread untouched. Internal only — never surfaced
-   * through `show --json`.
-   */
-  reviewerThreadOrigin?: "app-server" | "cli";
+  /** Origin marker for legacy ids and new process-local ephemeral rounds.
+   * New records never persist the ephemeral id itself. */
+  reviewerThreadOrigin?: "app-server" | "app-server-ephemeral" | "cli";
   reviewerTurnId?: string;
   /** Effective reviewer model/effort, persisted so review-only overrides
    * survive into later repair rounds. Optional for old records. */

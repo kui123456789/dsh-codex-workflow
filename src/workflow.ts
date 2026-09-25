@@ -67,17 +67,19 @@ import type {
   WorkflowRecord,
 } from "./types.js";
 import type { CodexCliAuditGateway } from "./codex-cli-audit.js";
+import type { CodexWorkflowSessionEvent } from "./review-events.js";
 
 const execFileAsync = promisify(execFile);
 
 export interface CodexGateway {
-  startThread(options: { cwd: string; model?: string; name: string }, signal?: AbortSignal): Promise<string>;
+  startThread(options: { cwd: string; model?: string; name?: string; ephemeral?: boolean }, signal?: AbortSignal): Promise<string>;
   resumeThread(threadId: string, cwd: string, signal?: AbortSignal): Promise<void>;
   startTurn(threadId: string, options: {
     prompt: string;
     model?: string;
     effort?: WorkflowConfig["plannerEffort"];
     outputSchema?: Record<string, unknown>;
+    conversion?: boolean;
     planMode?: boolean;
     /** Pin the turn to the silent single-message review mode (non-collaborative
      * "default" mode with the silent-review developer instructions at protocol
@@ -143,9 +145,10 @@ export interface CodexGateway {
    * gate ride the `review/start` custom target on every round. */
   startReviewerThread?(options: {
     cwd: string;
-    name: string;
+    name?: string;
     model?: string;
     developerInstructions?: string;
+    ephemeral?: boolean;
   }, signal?: AbortSignal): Promise<string>;
   /** 1.1.3: `thread/start` alone (see `startReviewerThreadShell`). Optional:
    * when a gateway provides BOTH this and `configureReviewerThread`, the
@@ -153,16 +156,18 @@ export interface CodexGateway {
    * one orphan task per attempt. */
   startReviewerThreadShell?(options: {
     cwd: string;
-    name: string;
+    name?: string;
     model?: string;
     developerInstructions?: string;
+    ephemeral?: boolean;
   }, signal?: AbortSignal): Promise<string>;
   /** 1.1.3: settings + display name of an already created Reviewer task. */
   configureReviewerThread?(threadId: string, options: {
     cwd: string;
-    name: string;
+    name?: string;
     model?: string;
     developerInstructions?: string;
+    ephemeral?: boolean;
   }, signal?: AbortSignal): Promise<void>;
   /** Refresh the per-round readable contract/context as developer instructions
    * on the durable Reviewer thread before a re-review runs. AUXILIARY channel
@@ -206,12 +211,6 @@ export type { ReviewInput };
  * the plugin has no way to release. Records that already carry a dedicated
  * Reviewer id are unaffected and keep their task.
  */
-export function isSharedReviewerAlias(record: WorkflowRecord): boolean {
-  if (!record.reviewerThreadId) return false;
-  return record.reviewerThreadId === record.plannerThreadId
-    || record.reviewerThreadId === record.codexThreadId;
-}
-
 /**
  * 1.1.1 retry criterion, shared by EVERY visible turn (planner, completion,
  * visible review, display rewrite, reconciliation).
@@ -272,6 +271,7 @@ export class WorkflowManager {
   private readonly retryNow: () => number;
   private readonly retrySleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly retryRandom: () => number;
+  private readonly agents?: { get(id: string): Agent | undefined };
   constructor(
     private readonly store: WorkflowStore,
     private readonly codex: CodexGateway,
@@ -282,7 +282,9 @@ export class WorkflowManager {
     /** 1.1.1 test seams for the transient-retry backoff (never wait for real
      * time in a test). Production passes nothing and uses real timers. */
     retryHooks: { sleep?: (ms: number, signal?: AbortSignal) => Promise<void>; now?: () => number; random?: () => number } = {},
+    agents?: { get(id: string): Agent | undefined },
   ) {
+    this.agents = agents;
     this.leaseTtlMs = config.leaseTtlMs ?? 60_000;
     this.retryNow = retryHooks.now ?? Date.now;
     this.retrySleep = retryHooks.sleep ?? ((ms, signal) => delay(ms, signal));
@@ -320,6 +322,7 @@ export class WorkflowManager {
       heartbeatMs: config.reviewHeartbeatMs ?? 15_000,
       staleMs: config.reviewStaleMs ?? 60_000,
       isSubmissionActive: submissionActive,
+      emit: (record, event) => this.emitSessionEvent(record, event),
     });
     this.plannerExecution = new PlannerExecution({
       store: this.store,
@@ -350,11 +353,8 @@ export class WorkflowManager {
       audit: this.audit,
       trackNoChange: this.trackNoChange.bind(this),
       createReviewerThread: this.createReviewerThread.bind(this),
-      prepareBoundReviewer: this.prepareBoundReviewer.bind(this),
-      renameLegacyReviewer: this.renameLegacyReviewer.bind(this),
       releaseUnboundReviewer: this.releaseUnboundReviewer.bind(this),
       reportCleanupNote: this.reportCleanupNote.bind(this),
-      readBackAppended: this.readBackAppended.bind(this),
       alignReview: this.alignReview.bind(this),
       reconcileReview: this.reconcileReview.bind(this),
       computeReviewOutcome: this.computeReviewOutcome.bind(this),
@@ -379,7 +379,6 @@ export class WorkflowManager {
       enqueueStagedVerdict: this.enqueueStagedVerdict.bind(this),
       enqueueSubmissionNotice: this.enqueueSubmissionNotice.bind(this),
       stageSubmissionFailure: this.stageSubmissionFailure.bind(this),
-      renameLegacyReviewer: this.renameLegacyReviewer.bind(this),
       reportCleanupNote: this.reportCleanupNote.bind(this),
       flushCleanupNotes: this.flushCleanupNotes.bind(this),
       alignReview: this.alignReview.bind(this),
@@ -578,41 +577,6 @@ export class WorkflowManager {
   }
 
   /**
-   * 1.1.3: prepare an ALREADY BOUND Reviewer task for a round — resume it and
-   * refresh its per-round instructions — retrying the WHOLE stage on a
-   * transient conflict.
-   *
-   * The plugin never releases a lock held by another process; it only releases
-   * its OWN subscription before backing off, so a half-prepared attempt cannot
-   * keep the task loaded while it waits:
-   *   - `thread/resume` is what ACQUIRES the subscription, so a failed resume
-   *     holds nothing and needs no release;
-   *   - a successful resume followed by a failed settings refresh DID acquire
-   *     it, so that subscription is released before the retry re-resumes.
-   * A spent budget leaves the round retryable with no cycle and no contract
-   * failure (the caller's catch restores the pre-review phase).
-   */
-  private async prepareBoundReviewer(
-    threadId: string,
-    cwd: string,
-    contract: string,
-    signal?: AbortSignal,
-    workflowId?: string,
-  ): Promise<void> {
-    await this.retryTransientControl(async () => {
-      await this.reviewerGateway.resume(threadId, cwd, signal);
-      try {
-        // Auxiliary refresh of the hidden channel; never load-bearing.
-        const refresh = this.reviewerGateway.updateInstructions(threadId, cwd, contract, signal);
-        if (refresh) await refresh;
-      } catch (error) {
-        this.reportCleanupNote(workflowId, await this.releaseUnboundReviewer(threadId, signal));
-        throw error;
-      }
-    }, signal);
-  }
-
-  /**
    * 1.1.3: create the visible Reviewer task under the same bounded transient
    * retry. `thread/start` runs ONCE — every retry re-configures the SAME task
    * id — so a flaky settings/name call can never leak one orphan task per
@@ -626,7 +590,8 @@ export class WorkflowManager {
     let threadId: string | undefined;
     try {
       return await this.retryTransientControl(async () => {
-        threadId ??= await this.reviewerGateway.startShell(options, signal) ?? await this.reviewerGateway.start(options, signal);
+        threadId ??= await this.reviewerGateway.startShell({ ...options, ephemeral: true }, signal)
+          ?? await this.reviewerGateway.start({ ...options, ephemeral: true }, signal);
         const configured = this.reviewerGateway.configure(threadId, options, signal);
         if (configured) await configured;
         return threadId;
@@ -1063,7 +1028,7 @@ export class WorkflowManager {
       throw new Error(`workflow ${workflowId} cannot be reviewed from phase ${record.phase}`);
     }
     if (record.mode !== "review_only") {
-      if (!record.planMarkdown || !record.plannerThreadId) throw new Error(`workflow ${workflowId} has no completed plan`);
+      if (!record.planMarkdown) throw new Error(`workflow ${workflowId} has no completed plan`);
     }
     return this.trackForeground(this.reviewOnce(workflowId, input, exec)) as Promise<WorkflowRecord>;
   }
@@ -1237,6 +1202,20 @@ export class WorkflowManager {
     lease?: ManagerLease,
   ): Promise<WorkflowRecord> {
     return this.submissionExecution.run(workflowId, submissionId, prompt, seed, signal, lease);
+  }
+
+  /** Append UI-only workflow state to the owning DSH session. The event log is
+   * the browser's durable source for the Codex right sidebar; failures here
+   * never change the workflow verdict or tool result. */
+  private emitSessionEvent(record: WorkflowRecord, event: CodexWorkflowSessionEvent): void {
+    const agent = this.agents?.get(record.dshSessionId);
+    if (!agent) return;
+    try {
+      agent.session.append(event.type, event.data as never);
+    } catch {
+      // A session can be disposing while a background callback settles. The
+      // coordination record remains authoritative and will be shown on reload.
+    }
   }
   private async stageSubmissionFailure(
     updateCurrent: (fn: (record: WorkflowRecord) => void) => Promise<WorkflowRecord>,
@@ -1652,15 +1631,6 @@ export class WorkflowManager {
   private reviewOnce(workflowId: string, input: ReviewInput, exec: ToolRunContext): Promise<WorkflowRecord> {
     return this.reviewExecution.run(workflowId, input, exec);
   }
-  private async renameLegacyReviewer(record: WorkflowRecord, workflowId: string): Promise<void> {
-    const threadId = record.reviewerThreadId;
-    if (!threadId) return;
-    if (isSharedReviewerAlias(record)) return;
-    if (record.reviewerThreadOrigin === "app-server") return;
-    await this.reviewerGateway.rename(threadId, `DSH Reviewer (legacy, not renderable in Desktop): ${workflowId}`)
-      ?.catch(() => undefined);
-  }
-
   /** 1.1.2: release the App Server hold on a Reviewer task that could NOT be
    * bound to its workflow — the binding write was suppressed by a concurrent
    * cancel, or it failed. The task itself stays in the Codex store (a thread
@@ -1767,20 +1737,6 @@ export class WorkflowManager {
     return this.boundedCleanup("reviewer release", () => this.reviewerGateway.unsubscribe(threadId));
   }
 
-  /** Fail-closed read-back of the turn appended to the durable Reviewer thread
-   * since its pre-turn baseline: exactly one new COMPLETED persisted turn
-   * must exist, otherwise — a gateway without the read-back capability, no
-   * baseline, zero appended turns (missing) or several (ambiguous) — this
-   * returns `undefined`. It NEVER falls back to the in-memory streamed text. */
-  private async readBackAppended(
-    threadId: string,
-    baseline: PersistedTurnBaseline | undefined,
-    signal?: AbortSignal,
-  ): Promise<{ text: string; itemType?: string } | undefined> {
-    if (!this.turnGateway.readAppendedTurnText || !baseline) return undefined;
-    return this.turnGateway.readAppendedTurnText(threadId, baseline, signal);
-  }
-
   /** 1.0.10 Review Authority alignment: an INVISIBLE ephemeral fork of the
    * durable workflow task checks the normalized ReviewResult against the
    * authority hierarchy (same model, low effort). The prompt carries the
@@ -1820,19 +1776,15 @@ export class WorkflowManager {
         }),
       }, signal);
     }
-    // The alignment fork's SOURCE is the durable workflow task: the Reviewer
-    // thread when persisted (DSH-led), otherwise the bridge source task.
-    const threadId = record.reviewerThreadId ?? record.codexThreadId;
-    if (!threadId) throw new Error("review authority alignment requires the workflow review thread");
     const model = record.reviewerModel
       || this.config.reviewerModel
       || await this.turnGateway.resolveDefaultModel?.(signal)
       || undefined;
     let normalized: TurnWaitResult;
     try {
+      const threadId = await this.threadGateway.startThread({ cwd: record.cwd, model, name: `DSH Review Alignment: ${record.id}`, ephemeral: true }, signal);
       normalized = await this.turnGateway.normalizeInFork({
         threadId,
-        cwd: record.cwd,
         prompt: reviewAlignPrompt(result, {
           workflowId: record.id,
           task: record.task,
@@ -1841,6 +1793,7 @@ export class WorkflowManager {
           fixSummary: input?.implementationSummary,
         }),
         ...(model ? { model } : {}),
+        cwd: record.cwd,
         outputSchema: ALIGN_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
         // The alignment fork is ephemeral: its thread/turn pair is the exact
         // active cancel target WHILE it runs, but the fork id is never
@@ -1880,19 +1833,13 @@ export class WorkflowManager {
     input?: ReviewInput,
   ): Promise<{ aligned: true; result: ReviewResult } | { aligned: false }> {
     if (this.audit) {
-      const threadId = record.reviewerThreadId ?? record.codexThreadId;
-      if (!threadId) throw new Error("review reconciliation requires the workflow review thread");
-      // 1.1.4: signal-free but BOUNDED — the CLI reconciliation below resumes the
-      // thread, so the handoff still has to happen, just never unboundedly.
-      const handoffNote = await this.boundedCleanup("external handoff", () => (
-        this.reviewerGateway.externalRelease(threadId)
-          ?? this.reviewerGateway.unsubscribe(threadId)
-      ));
-      this.reportCleanupNote(record.id, handoffNote);
+      // Reconciliation is an independent ephemeral CLI turn. It never resumes
+      // a Desktop task or the external bridge origin task.
       const corrected = await this.audit.reconcile({
         workflowId: record.id,
         submissionId: record.submissionId ?? `reconcile-${Date.now()}`,
-        codexThreadId: threadId,
+        codexThreadId: "ephemeral",
+        ephemeral: true,
         cwd: record.cwd,
         prompt: reviewReconcilePrompt(result, conflicts, {
           workflowId: record.id,
@@ -1909,15 +1856,8 @@ export class WorkflowManager {
       const recheck = await this.alignReview(record, corrected.verdict, signal, input);
       return recheck.aligned ? { aligned: true, result: corrected.verdict } : { aligned: false };
     }
-    // The reconciliation appends to the SAME durable workflow task the visible
-    // review came from: the persisted Reviewer thread, or the bridge source
-    // task when the thread id was never persisted.
-    const threadId = record.reviewerThreadId ?? record.codexThreadId;
-    if (!threadId) throw new Error("review reconciliation requires the workflow review thread");
     const model = record.reviewerModel || this.config.reviewerModel;
-    // Baseline BEFORE the reconciliation turn, exactly like the native
-    // review/rewrite turns: the appended turn is detected against these ids.
-    const baseline = await this.turnGateway.captureTurnBaseline?.(threadId, signal);
+    const threadId = await this.threadGateway.startThread({ cwd: record.cwd, model, name: `DSH Review Reconciliation: ${record.id}`, ephemeral: true }, signal);
     let reconcile: TurnWaitResult;
     try {
       reconcile = await this.startTurnWithTransientRetry(threadId, {
@@ -1928,11 +1868,12 @@ export class WorkflowManager {
         }),
         ...(model ? { model } : {}),
         effort: "low",
+        conversion: false,
         // The reconciliation is a VISIBLE turn on the same durable thread:
         // silent, non-collaborative, one final message — and the exact active
         // cancel/teardown target while it runs.
         silentReview: true,
-        onStarted: (started) => this.registerActiveTurn(record.id, started.threadId, started.turnId, "reviewer"),
+        onStarted: (started) => this.registerActiveTurn(record.id, started.threadId, started.turnId, "reviewer", true),
       }, signal);
     } finally {
       this.runtime.activeTurns.delete(record.id);
@@ -1945,18 +1886,15 @@ export class WorkflowManager {
         ? "review reconciliation turn interrupted"
         : (reconcile.reason ?? `review reconciliation turn ${reconcile.status}`));
     }
-    // The reconciliation's authority is its PERSISTED history, read back like
-    // the native review's — never the in-memory aggregation.
-    const persisted = await this.readBackAppended(threadId, baseline, signal);
-    if (!persisted) throw new Error("persisted reconciliation read-back missing or ambiguous");
-    const displayError = reviewDisplayError(persisted.text, after);
+    const visibleText = reconcile.text ?? "";
+    const displayError = reviewDisplayError(visibleText, after);
     if (displayError) throw new Error(`reconciled review violates the display contract: ${displayError}`);
     let corrected: TurnWaitResult;
     try {
       corrected = await this.turnGateway.normalizeInFork({
+        prompt: reviewConversionPrompt(visibleText, after.id),
         threadId,
         cwd: after.cwd,
-        prompt: reviewConversionPrompt(persisted.text, after.id),
         ...(model ? { model } : {}),
         outputSchema: REVIEW_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
         onStarted: (started) => this.registerEphemeralTurn(after.id, started.threadId, started.turnId, "reviewer"),
@@ -1996,13 +1934,14 @@ export class WorkflowManager {
     threadId: string,
     turnId: string,
     kind: "planner" | "reviewer",
+    ephemeral = false,
   ): Promise<void> {
-    this.runtime.activeTurns.set(workflowId, { threadId, turnId, kind, ephemeral: false });
+    this.runtime.activeTurns.set(workflowId, { threadId, turnId, kind, ephemeral });
     const outcome = await this.store.update(workflowId, (r) => {
-      if (kind === "planner") {
+      if (kind === "planner" && !ephemeral) {
         r.plannerThreadId = threadId;
         r.plannerTurnId = turnId;
-      } else {
+      } else if (kind === "reviewer" && !ephemeral) {
         r.reviewerThreadId = threadId;
         r.reviewerTurnId = turnId;
         if (r.processState === "running") {
@@ -2010,6 +1949,10 @@ export class WorkflowManager {
           r.lastProgressAt = new Date().toISOString();
           r.lastProgressMessage = "Reviewer turn is running";
         }
+      } else if (kind === "reviewer" && r.processState === "running") {
+        r.activeTurnId = turnId;
+        r.lastProgressAt = new Date().toISOString();
+        r.lastProgressMessage = "Reviewer turn is running";
       }
     }, { ignoreCancelled: false });
     if (outcome.suppressed) {
@@ -2146,6 +2089,10 @@ export class WorkflowManager {
         r.pendingInput = { turnId: outcome.turnId, itemId: outcome.request.itemId };
         if (model) r.plannerModel = model;
       }, { ignoreCancelled: false });
+      if (!commit.suppressed) this.emitSessionEvent(commit.record, {
+        type: "dsh-codex-workflow/plan-updated",
+        data: { workflowId, status: "waiting_input", questions: commit.record.questions, assumptions: commit.record.assumptions },
+      });
       return commit.record;
     }
     this.runtime.pending.delete(workflowId);
@@ -2215,7 +2162,7 @@ export class WorkflowManager {
           ...(model ? { model } : {}),
           effort: this.config.plannerEffort,
           planMode: true,
-          onStarted: (started) => this.registerActiveTurn(workflowId, started.threadId, started.turnId, "planner"),
+          onStarted: (started) => this.registerActiveTurn(workflowId, started.threadId, started.turnId, "planner", true),
         }, exec.signal);
       } finally {
         // EVERY ending path — completion, cancel, timeout, onStarted
@@ -2234,6 +2181,10 @@ export class WorkflowManager {
           r.pendingInput = { turnId: completion.turnId, itemId: completion.request.itemId };
           if (model) r.plannerModel = model;
         }, { ignoreCancelled: false });
+        if (!commit.suppressed) this.emitSessionEvent(commit.record, {
+          type: "dsh-codex-workflow/plan-updated",
+          data: { workflowId, status: "waiting_input", questions: commit.record.questions, assumptions: commit.record.assumptions },
+        });
         return commit.record;
       }
       if (completion.status !== "completed") {
@@ -2262,6 +2213,10 @@ export class WorkflowManager {
         r.assumptions = result.assumptions;
         if (model) r.plannerModel = model;
       }, { ignoreCancelled: false });
+      if (!commit.suppressed) this.emitSessionEvent(commit.record, {
+        type: "dsh-codex-workflow/plan-updated",
+        data: { workflowId, status: "waiting_input", questions: commit.record.questions, assumptions: commit.record.assumptions },
+      });
       return commit.record;
     }
     if (result.status === "ready" && result.planMarkdown?.trim()) {
@@ -2279,6 +2234,10 @@ export class WorkflowManager {
         r.pendingInput = undefined;
         if (model) r.plannerModel = model;
       }, { ignoreCancelled: false });
+      if (!commit.suppressed) this.emitSessionEvent(commit.record, {
+        type: "dsh-codex-workflow/plan-updated",
+        data: { workflowId, status: "ready", planMarkdown, questions: [], assumptions: commit.record.assumptions },
+      });
       if (!commit.suppressed) exec.deferContext(pluginMessage(executionPrompt(commit.record)));
       return commit.record;
     }
@@ -2288,6 +2247,10 @@ export class WorkflowManager {
       r.phase = "failed";
       r.error = result.message ?? "Codex planner did not return a usable plan";
     }, { ignoreCancelled: false });
+    if (!commit.suppressed) this.emitSessionEvent(commit.record, {
+      type: "dsh-codex-workflow/plan-updated",
+      data: { workflowId, status: "failed", questions: commit.record.questions, assumptions: commit.record.assumptions, message: commit.record.error },
+    });
     return commit.record;
   }
 

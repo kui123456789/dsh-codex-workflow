@@ -559,12 +559,14 @@ test("uses strict Codex-compatible object schemas", () => {
   assertStrictObjectSchema(REVIEW_OUTPUT_SCHEMA);
 });
 
-/** 1.1.2: the Reviewer task must be created by the APP SERVER — `source` is
+/** Compatibility: an explicit non-ephemeral Reviewer request still follows the
+ * old App Server naming contract for external callers. Workflow code always
+ * passes `ephemeral: true` (covered below). `source` is
  * fixed by the creation path, and `thread/list` (the Codex Desktop sidebar
  * source) only ever returns `source='vscode'` tasks. Measured on this host:
  * 62 of 72 non-archived `vscode` rows are listed, 0 of 15 `codex exec` rows are
  * — which is exactly why the plugin's CLI-created reviewers never rendered. */
-test("1.1.2: a Reviewer task is created on the App Server path and named without a resume", async () => {
+test("explicit durable Reviewer requests are named without a resume", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-reviewer-visible-"));
   const callsFile = join(directory, "calls.jsonl");
   const codex = new CodexAppServerClient({
@@ -633,6 +635,36 @@ test("1.1.2: a freshly created Reviewer has no rollout until its first turn runs
 
     // The turn produced the rollout, so the same task is resumable afterwards.
     await codex.resumeThread(reviewerId, directory);
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("ephemeral Planner/Reviewer threads are never named or persisted for Desktop", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-ephemeral-thread-"));
+  const callsFile = join(directory, "calls.jsonl");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: { ...process.env, FAKE_CODEX_THREAD_PARAMS_MARKER: callsFile },
+  });
+  try {
+    const id = await codex.startThread({ cwd: directory, name: "DSH Plan: hidden", ephemeral: true });
+    const reviewerId = await codex.startReviewerThread({
+      cwd: directory,
+      name: "DSH Reviewer: hidden",
+      developerInstructions: "private review",
+      ephemeral: true,
+    });
+    const calls = (await readFile(callsFile, "utf8")).trim().split("\n").filter(Boolean)
+      .map((line) => JSON.parse(line) as { method: string; params: Record<string, any> });
+    assert.ok(id && reviewerId);
+    assert.equal(calls.filter((call) => call.method === "thread/start").length, 2);
+    assert.ok(calls.filter((call) => call.method === "thread/start").every((call) => call.params.ephemeral === true));
+    assert.equal(calls.some((call) => call.method === "thread/name/set"), false);
   } finally {
     await codex.stop();
     await rm(directory, { recursive: true, force: true });

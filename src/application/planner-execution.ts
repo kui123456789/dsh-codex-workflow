@@ -12,7 +12,7 @@ export interface PlannerExecutionContext {
   requireAgent(exec: ToolRunContext): Agent;
   acquireCreateLease(sessionId: string): Promise<{ release(): Promise<boolean> } | undefined>;
   assertNoActiveWorkflow(sessionId: string): Promise<void>;
-  startThread(options: { cwd: string; model?: string; name: string }, signal?: AbortSignal): Promise<string>;
+  startThread(options: { cwd: string; model?: string; name?: string; ephemeral?: boolean }, signal?: AbortSignal): Promise<string>;
   resumeThread(threadId: string, cwd: string, signal?: AbortSignal): Promise<void>;
   startTurnWithRetry(
     threadId: string,
@@ -20,7 +20,7 @@ export interface PlannerExecutionContext {
     signal?: AbortSignal,
   ): Promise<TurnWaitResult>;
   continueTurn(pending: TurnNeedsInputResult, answers: Record<string, string[]>, signal?: AbortSignal): Promise<TurnWaitResult>;
-  registerActiveTurn(workflowId: string, threadId: string, turnId: string, kind: "planner" | "reviewer"): Promise<void> | void;
+  registerActiveTurn(workflowId: string, threadId: string, turnId: string, kind: "planner" | "reviewer", ephemeral?: boolean): Promise<void> | void;
   acceptPlannerOutcome(workflowId: string, outcome: TurnWaitResult, exec: ToolRunContext, model: string | undefined, cwd: string): Promise<WorkflowRecord>;
   owned(workflowId: string, exec: ToolRunContext): Promise<WorkflowRecord>;
   trackForeground<T>(task: Promise<T>): Promise<T>;
@@ -44,7 +44,7 @@ export class PlannerExecution {
 
   async continue(workflowId: string, answers: Record<string, string[]>, exec: ToolRunContext): Promise<WorkflowRecord> {
     const record = await this.ctx.owned(workflowId, exec);
-    if (record.phase !== "waiting_input" || !record.plannerThreadId) {
+    if (record.phase !== "waiting_input") {
       throw new Error(`workflow ${workflowId} is not waiting for planner input`);
     }
     let plannerModel = record.plannerModel || this.ctx.config.plannerModel || undefined;
@@ -62,14 +62,14 @@ export class PlannerExecution {
     plannerModel: string | undefined,
     onModel: (model: string) => void,
   ): Promise<TurnWaitResult> {
-    await this.ctx.resumeThread(record.plannerThreadId!, record.cwd, exec.signal);
-    return this.ctx.startTurnWithRetry(record.plannerThreadId!, {
-      prompt: this.ctx.resumedAnswerPrompt(answers),
+    const plannerThreadId = await this.ctx.startThread({ cwd: record.cwd, model: plannerModel, name: this.ctx.threadName("DSH Plan", record.task), ephemeral: true }, exec.signal);
+    return this.ctx.startTurnWithRetry(plannerThreadId, {
+      prompt: `${this.ctx.plannerPrompt(record.task)}\n\nThe previous planning attempt asked these questions and the user answered them:\n${this.ctx.resumedAnswerPrompt(answers)}\n\nContinue the same plan using these answers. Do not restart the task or ask the same questions again.`,
       ...(plannerModel ? { model: plannerModel } : {}),
       effort: this.ctx.config.plannerEffort,
       planMode: true,
       onModel,
-      onStarted: (started) => this.ctx.registerActiveTurn(record.id, started.threadId, started.turnId, "planner"),
+      onStarted: (started) => this.ctx.registerActiveTurn(record.id, started.threadId, started.turnId, "planner", true),
     }, exec.signal);
   }
 
@@ -110,9 +110,8 @@ export class PlannerExecution {
         cwd: record.cwd,
         ...(args.plannerModel || this.ctx.config.plannerModel ? { model: args.plannerModel || this.ctx.config.plannerModel } : {}),
         name: this.ctx.threadName("DSH Plan", args.task),
+        ephemeral: true,
       }, exec.signal);
-      const threadCommit = await this.ctx.store.update(record.id, (r) => { r.plannerThreadId = plannerThreadId; }, { ignoreCancelled: false });
-      if (threadCommit.suppressed) return threadCommit.record;
       let plannerModel = args.plannerModel || this.ctx.config.plannerModel || undefined;
       const outcome = await this.ctx.startTurnWithRetry(plannerThreadId, {
         prompt: this.ctx.plannerPrompt(record.task),
@@ -120,7 +119,7 @@ export class PlannerExecution {
         effort: args.plannerEffort ?? this.ctx.config.plannerEffort,
         planMode: true,
         onModel: (model) => { plannerModel = model; },
-        onStarted: (started) => this.ctx.registerActiveTurn(record.id, started.threadId, started.turnId, "planner"),
+        onStarted: (started) => this.ctx.registerActiveTurn(record.id, started.threadId, started.turnId, "planner", true),
       }, exec.signal);
       return this.ctx.acceptPlannerOutcome(record.id, outcome, exec, plannerModel, record.cwd);
     } catch (error) {

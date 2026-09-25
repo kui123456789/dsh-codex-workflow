@@ -1,6 +1,7 @@
 import type { WorkflowStore } from "../store.js";
 import type { ReviewStep, WorkflowProcessState, WorkflowRecord } from "../types.js";
 import { WorkflowRuntimeState } from "./workflow-runtime-state.js";
+import type { CodexReviewEndEvent, CodexWorkflowSessionEvent } from "../review-events.js";
 
 export interface ReviewObservationOptions {
   store: WorkflowStore;
@@ -8,6 +9,7 @@ export interface ReviewObservationOptions {
   heartbeatMs: number;
   staleMs: number;
   isSubmissionActive: (state: WorkflowRecord["submissionState"]) => boolean;
+  emit?: (record: WorkflowRecord, event: CodexWorkflowSessionEvent) => void;
 }
 
 /**
@@ -21,6 +23,7 @@ export class ReviewObservation {
   private readonly heartbeatMs: number;
   private readonly staleMs: number;
   private readonly isSubmissionActive: ReviewObservationOptions["isSubmissionActive"];
+  private readonly emit?: ReviewObservationOptions["emit"];
 
   constructor(options: ReviewObservationOptions) {
     this.store = options.store;
@@ -28,6 +31,7 @@ export class ReviewObservation {
     this.heartbeatMs = Math.max(250, options.heartbeatMs);
     this.staleMs = Math.max(1_000, options.staleMs);
     this.isSubmissionActive = options.isSubmissionActive;
+    this.emit = options.emit;
   }
 
   async begin(
@@ -47,7 +51,17 @@ export class ReviewObservation {
       record.activeTurnId = undefined;
       record.lastProgressMessage = options.message ?? "Review started";
     }, { ignoreCancelled: false });
-    if (!outcome.suppressed) this.startHeartbeat(workflowId);
+    if (!outcome.suppressed) {
+      this.startHeartbeat(workflowId);
+      const reviewId = `${workflowId}:${outcome.record.reviewAttempt ?? 1}`;
+      this.emit?.(outcome.record, {
+        type: "dsh-codex-workflow/review-start",
+        data: {
+          workflowId, reviewId, attempt: outcome.record.reviewAttempt ?? 1,
+          startedAt: now, mode: outcome.record.mode === "review_only" ? "review_only" : outcome.record.origin === "codex_bridge" ? "bridge" : "planned",
+        },
+      });
+    }
     return outcome;
   }
 
@@ -85,14 +99,21 @@ export class ReviewObservation {
       if (activeTurnId !== undefined) record.activeTurnId = activeTurnId ?? undefined;
       if (message) record.lastProgressMessage = message;
     }, { ignoreCancelled: false });
+    if (!outcome.suppressed) {
+      const reviewId = `${workflowId}:${outcome.record.reviewAttempt ?? 1}`;
+      this.emit?.(outcome.record, {
+        type: "dsh-codex-workflow/review-progress",
+        data: { workflowId, reviewId, step: outcome.record.reviewStep, processState: outcome.record.processState ?? "running", message: outcome.record.lastProgressMessage, elapsedMs: outcome.record.reviewElapsedMs, at: iso },
+      });
+    }
     return outcome.record;
   }
 
-  async finish(workflowId: string, fallbackState?: WorkflowProcessState): Promise<void> {
+  async finish(workflowId: string, fallbackState?: WorkflowProcessState, detail?: Pick<CodexReviewEndEvent, "verdict" | "result" | "visibleText" | "summary" | "error">): Promise<void> {
     this.stopHeartbeat(workflowId);
     const now = new Date();
     const iso = now.toISOString();
-    await this.store.update(workflowId, (record) => {
+    const outcome = await this.store.update(workflowId, (record) => {
       if (record.processState !== "running") return;
       const terminalState: WorkflowProcessState = record.phase === "cancelled"
         ? "cancelled"
@@ -119,6 +140,13 @@ export class ReviewObservation {
               ? "Review heartbeat became stale"
               : "Review failed; retry is available";
     }, { ignoreCancelled: true }).catch(() => undefined);
+    if (outcome && !outcome.suppressed) {
+      const reviewId = `${workflowId}:${outcome.record.reviewAttempt ?? 1}`;
+      this.emit?.(outcome.record, {
+        type: "dsh-codex-workflow/review-end",
+        data: { workflowId, reviewId, processState: outcome.record.processState ?? "failed", finishedAt: iso, ...detail },
+      });
+    }
   }
 
   async refreshStale(record: WorkflowRecord): Promise<WorkflowRecord> {

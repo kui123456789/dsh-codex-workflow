@@ -1,6 +1,6 @@
-# Release checklist — dsh-codex-workflow 1.1.6
+# Release checklist — dsh-codex-workflow 1.1.7
 
-This is the operator checklist for shipping the CURRENT release (1.1.6; keep this line in sync with `package.json` on every release). It assumes the automated gates
+This is the operator checklist for shipping the CURRENT release (1.1.7; keep this line in sync with `package.json` on every release). It assumes the automated gates
 succeeded; this page is about the things automation cannot cover, plus the
 rollback story. It never authorizes touching user credentials or configuration
 outside `$DSH_HOME/storages/dsh-codex-workflow/`.
@@ -38,7 +38,7 @@ Run `pnpm release:check` twice in a row and confirm:
      then restore `complex`;
    - while one workflow is active, send another qualifying request and confirm
      no second WorkflowRecord or Planner task is created.
-3. **Current acceptance path (1.1.x).** The manual harnesses this step used to
+3. **Current acceptance path (1.1.7).** The manual harnesses this step used to
    name (`pnpm lifecycle:accept`, `pnpm review-only:accept`) were REMOVED: they
    drove the pre-1.1.0 CLI-visible wiring and could no longer be trusted as
    evidence. Run instead:
@@ -47,17 +47,16 @@ Run `pnpm release:check` twice in a row and confirm:
    - `pnpm host:check` against the operator's installed DSH (it also asserts the
      declared peer range with the host's own evaluator);
    - one REAL review round (`codex_workflow_review_only`, or a DSH-led
-     `start` → `review`) and confirm: a dedicated Reviewer task is created with
-     `source='vscode'` and the name `DSH Reviewer: <workflowId>`, the verdict is
-     persisted, and the round RELEASES its subscription when it ends;
+     `start` → `review`) and confirm: `thread/start` receives
+     `ephemeral: true`, no `thread/name/set` or legacy `thread/resume` is sent,
+     no new plugin thread appears in Codex Desktop `thread/list`, and the
+     verdict plus progress appear in the DSH `Codex Review` right sidebar;
    - one real bridge relay (Codex-led `dispatch` → `codex_workflow_submit`) and
      confirm the verdict returns to the originating task exactly once.
 
-   The bullets below are the HISTORICAL pre-1.1.0 acceptance script — keep them
-   only as a record of what used to be asserted; several of them (single-task
-   history, `1.0.14`, `codex exec --json resume` reviewers) no longer describe
-   the plugin at all, because 1.1.0 made the Reviewer a dedicated task and 1.1.2
-   moved it to the App Server so it renders in Desktop.
+   The bullets below are the HISTORICAL pre-1.1.7 acceptance script — keep them
+   only as a record of what used to be asserted. They must not be used as
+   evidence for the ephemeral Reviewer path.
 4. Historical script (pre-1.1.0, no longer runnable — kept for reference):
    - the old harness used low reasoning and a 600-second turn timeout by default; When the account's default model is temporarily slow,
      pin an available model with `DSH_CODEX_LIFECYCLE_MODEL` rather than
@@ -180,7 +179,7 @@ Run `pnpm release:check` twice in a row and confirm:
 
 - Do not push to user `$DSH_HOME` outside `storages/dsh-codex-workflow`.
 - Do not modify or rotate any credentials (this plugin never stores them).
-- Create the `v1.1.6` Git tag and corresponding GitHub Release only after all
+- Create the `v1.1.7` Git tag and corresponding GitHub Release only after all
   automated and real-environment checks pass.
 - Do not commit or touch `docs/research/` or `docs/superpowers/` (untracked).
 

@@ -100,14 +100,13 @@ test("start/continue timeouts cover the four-turn planner worst path", () => {
 /** 1.1.0 tool-description regression: `codex_workflow_review` must describe the
  * DEDICATED-Reviewer lifecycle — a review always runs on the workflow's own
  * Reviewer task and never on the Planner task or the Codex origin task. */
-test("codex_workflow_review description reflects the dedicated Reviewer task", () => {
+test("codex_workflow_review description reflects the ephemeral DSH sidebar path", () => {
   const tools = createWorkflowTools({} as never, base);
   const review = tools.find((tool) => tool.name === "codex_workflow_review")!;
   const description = review.description ?? "";
-  assert.match(description, /dedicated Reviewer task/, "reviews run on the workflow's dedicated Reviewer task");
-  assert.match(description, /never on the Planner task/, "the Planner task is never a review target");
-  assert.match(description, /origin task/, "the Codex origin task is never a review target");
-  assert.match(description, /reuse the same dedicated Reviewer task/, "re-reviews reuse the same dedicated Reviewer task");
+  assert.match(description, /fresh hidden ephemeral Reviewer thread/);
+  assert.match(description, /no Codex Desktop task is created or resumed/);
+  assert.match(description, /right sidebar/);
   const reviewOnly = tools.find((tool) => tool.name === "codex_workflow_review_only")!;
   assert.ok(!/(existing Planner task|to this workflow's existing Codex task)/i.test(reviewOnly.description ?? ""),
     "review_only must not claim a Planner task");
@@ -119,7 +118,7 @@ test("codex_workflow_start description authorizes autonomous pre-change planning
   assert.match(description, /autonomously/i);
   assert.match(description, /before making changes/i);
   assert.match(description, /at most once per task\/session/i);
-  assert.match(description, /existing Codex task/i);
+  assert.match(description, /hidden ephemeral thread/);
 });
 
 test("long-running Codex tools keep extended timeouts while submit stays immediate", () => {

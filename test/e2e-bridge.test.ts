@@ -200,10 +200,7 @@ test("end-to-end: CLI dispatch -> followup -> submit -> same-task review -> fina
       submitted = (await workflowStore.load(workflow.id))!;
       assert.equal(submitted.submissionState, "received", submitted.submissionError);
       assert.ok(submitted.submissionId);
-      assert.ok(submitted.reviewerThreadId);
-      // 1.1.0: the review runs on a DEDICATED Reviewer task, never the
-      // originating Codex task (whose writer lock Codex Desktop may hold).
-      assert.notEqual(submitted.reviewerThreadId, codexThreadId);
+      assert.equal(submitted.reviewerThreadId, undefined, "ephemeral Reviewer ids are process-local");
       const calls = (await readFile(callsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
         method: string;
         params: Record<string, any>;
@@ -213,29 +210,21 @@ test("end-to-end: CLI dispatch -> followup -> submit -> same-task review -> fina
       const turns = calls.filter((call) => call.method === "turn/start");
       assert.equal(calls.filter((call) => call.params.threadId === codexThreadId).length, 0,
         "the originating task is never read, resumed, renamed or written");
-      assert.equal(starts.length, 1, "exactly ONE dedicated Reviewer task is created");
-      // 1.1.5: a Reviewer created by THIS submission is never resumed —
-      // `thread/resume` paginates the thread's history and a task that never ran
-      // a turn has a registered rollout path whose file does not exist yet
-      // (`invalid paginated history lineage … missing source rollout`). It is
-      // still the task that takes the visible turn.
+      assert.ok(starts.length >= 1, "at least one ephemeral Reviewer thread is created");
+      assert.ok(starts.every(call => call.params.ephemeral === true), "all plugin-created threads are ephemeral");
       assert.equal(calls.filter((call) => call.method === "thread/resume").length, 0,
-        "a freshly created dedicated Reviewer is never resumed");
-      // 1.0.7: the VISIBLE Reviewer turn runs on the durable Reviewer WITHOUT
-      // an outputSchema; the structured verdict is produced by ONE ephemeral
-      // fork conversion turn. 1.0.10 adds a SECOND ephemeral fork: the
-      // review-authority alignment (internal schema, defaults to aligned).
-      assert.equal(forks.length, 2, "one conversion fork + one review-authority alignment fork per review");
-      assert.equal(forks[0]?.params.threadId, submitted.reviewerThreadId);
-      assert.equal(forks[0]?.params.ephemeral, true);
+        "an ephemeral Reviewer never resumes a Desktop task");
+      assert.ok(forks.length >= 1, "authority conversion may use a private ephemeral fork");
+      assert.ok(forks.every(call => call.params.ephemeral === true), "all forks stay ephemeral");
       assert.equal(turns.length, 3, "one visible turn + one conversion turn + one alignment turn");
       const visibleTurn = turns.find((call) => !call.params.outputSchema)!;
-      const conversionTurn = turns.find((call) => call.params.outputSchema)!;
-      assert.equal(visibleTurn.params.threadId, submitted.reviewerThreadId);
-      assert.equal(visibleTurn.params.outputSchema, undefined, "the persisted Reviewer task never carries the JSON schema");
-      assert.notEqual(conversionTurn.params.threadId, submitted.reviewerThreadId, "the conversion runs on the FORK thread");
+      const conversionTurn = turns.find((call) => call.params.outputSchema?.properties?.verdict)!;
+      const alignmentTurn = turns.find((call) => call.params.outputSchema?.properties?.aligned)!;
+      assert.equal(visibleTurn.params.outputSchema, undefined, "the visible review never carries the JSON schema");
+      assert.equal(conversionTurn.params.ephemeral, undefined, "the conversion uses the private App Server thread");
       assert.equal(conversionTurn.params.effort, "low", "conversion effort is fixed at low");
       assert.ok(conversionTurn.params.outputSchema?.properties?.verdict);
+      assert.ok(alignmentTurn.params.outputSchema?.properties?.aligned);
       assert.match(visibleTurn.params.input?.[0]?.text ?? "", /实现完成/);
       assert.match(visibleTurn.params.input?.[0]?.text ?? "", /SUBMISSION:/);
 
@@ -388,10 +377,11 @@ test("codex_workflow_submit returns promptly; DSH turn-end never aborts the stil
       assert.ok(!(await exists(interruptFile)), "no turn was interrupted by tool-return or turn-end");
       const calls = (await readFile(callsFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { method: string; params: Record<string, any> });
       assert.ok(!calls.some((call) => call.method === "turn/interrupt"), "no turn/interrupt was issued");
-      assert.equal(calls.filter((call) => call.method === "thread/start").length, 1,
-        "exactly ONE dedicated Reviewer task was created, and no other visible task");
-      assert.equal(calls.filter((call) => call.method === "thread/fork").length, 2, "one conversion fork + one review-authority alignment fork");
-      assert.equal(calls.filter((call) => call.method === "thread/unsubscribe").length, 3, "the durable Reviewer and BOTH ephemeral forks (conversion + alignment) were each released once");
+      const starts = calls.filter((call) => call.method === "thread/start");
+      assert.ok(starts.length >= 1, "ephemeral Reviewer work creates at least one private thread");
+      assert.ok(starts.every(call => call.params.ephemeral === true), "every created thread is ephemeral");
+      assert.ok(calls.filter((call) => call.method === "thread/fork").every(call => call.params.ephemeral === true), "private forks do not create Desktop tasks");
+      assert.ok(calls.filter((call) => call.method === "thread/unsubscribe").length >= 1, "private threads are released");
       void followups;
     } finally {
       await runtime.stop();

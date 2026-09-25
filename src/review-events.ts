@@ -1,0 +1,216 @@
+import z, { type ZodType } from "zod";
+import type { SessionEvent } from "@deepseek-ai/dsh-session";
+import type { ProjectionDefinition } from "@deepseek-ai/dsh-session-projection";
+import type { PlannerQuestion, ReviewResult, ReviewStep, WorkflowProcessState } from "./types.js";
+
+export type CodexReviewId = string;
+
+export interface CodexPlanUpdatedEvent {
+  workflowId: string;
+  status: "planning" | "waiting_input" | "ready" | "failed";
+  planMarkdown?: string;
+  questions: PlannerQuestion[];
+  assumptions: string[];
+  message?: string;
+}
+
+export interface CodexReviewStartEvent {
+  workflowId: string;
+  reviewId: CodexReviewId;
+  attempt: number;
+  startedAt: string;
+  mode: "planned" | "review_only" | "bridge";
+}
+
+export interface CodexReviewProgressEvent {
+  workflowId: string;
+  reviewId: CodexReviewId;
+  step?: ReviewStep;
+  processState: WorkflowProcessState;
+  message?: string;
+  elapsedMs?: number;
+  at: string;
+}
+
+export interface CodexReviewEndEvent {
+  workflowId: string;
+  reviewId: CodexReviewId;
+  processState: WorkflowProcessState;
+  verdict?: ReviewResult["verdict"];
+  result?: ReviewResult;
+  visibleText?: string;
+  summary?: string;
+  error?: string;
+  finishedAt: string;
+}
+
+declare module "@deepseek-ai/dsh-session/types" {
+  interface SessionEventMap {
+    "dsh-codex-workflow/plan-updated": CodexPlanUpdatedEvent;
+    "dsh-codex-workflow/review-start": CodexReviewStartEvent;
+    "dsh-codex-workflow/review-progress": CodexReviewProgressEvent;
+    "dsh-codex-workflow/review-end": CodexReviewEndEvent;
+  }
+}
+
+export interface CodexPlanView {
+  workflowId: string;
+  status: CodexPlanUpdatedEvent["status"];
+  planMarkdown?: string;
+  questions: PlannerQuestion[];
+  assumptions: string[];
+  message?: string;
+}
+
+export interface CodexReviewView {
+  workflowId: string;
+  reviewId: CodexReviewId;
+  attempt: number;
+  startedAt: string;
+  finishedAt?: string;
+  processState: WorkflowProcessState;
+  step?: ReviewStep;
+  message?: string;
+  elapsedMs?: number;
+  verdict?: ReviewResult["verdict"];
+  result?: ReviewResult;
+  visibleText?: string;
+  summary?: string;
+  error?: string;
+}
+
+export interface CodexWorkflowProjectionState {
+  currentWorkflowId: string | null;
+  plan: CodexPlanView | null;
+  activeReview: CodexReviewView | null;
+  reviews: CodexReviewView[];
+  failure: string | null;
+}
+
+export interface CodexWorkflowProjection {
+  currentWorkflowId: string | null;
+  plan: CodexPlanView | null;
+  activeReview: CodexReviewView | null;
+  reviews: CodexReviewView[];
+}
+
+export type CodexWorkflowSessionEvent =
+  | { type: "dsh-codex-workflow/plan-updated"; data: CodexPlanUpdatedEvent }
+  | { type: "dsh-codex-workflow/review-start"; data: CodexReviewStartEvent }
+  | { type: "dsh-codex-workflow/review-progress"; data: CodexReviewProgressEvent }
+  | { type: "dsh-codex-workflow/review-end"; data: CodexReviewEndEvent };
+
+declare module "@deepseek-ai/dsh-session-projection/types" {
+  interface SessionProjectionStateMap {
+    codexWorkflow: CodexWorkflowProjectionState;
+  }
+  interface SessionProjectionMap {
+    codexWorkflow: CodexWorkflowProjection;
+  }
+}
+
+const reviewResultSchema = z.object({
+  verdict: z.enum(["pass", "changes_requested"]),
+  findings: z.array(z.any()),
+  testGaps: z.array(z.string()),
+  summary: z.string(),
+}).passthrough();
+
+const planSchema = z.object({
+  workflowId: z.string(),
+  status: z.enum(["planning", "waiting_input", "ready", "failed"]),
+  planMarkdown: z.string().optional(),
+  questions: z.array(z.any()),
+  assumptions: z.array(z.string()),
+  message: z.string().optional(),
+}).passthrough();
+
+const reviewSchema = z.object({
+  workflowId: z.string(),
+  reviewId: z.string(),
+  attempt: z.number().int().nonnegative(),
+  startedAt: z.string(),
+  finishedAt: z.string().optional(),
+  processState: z.enum(["running", "waiting", "completed", "failed", "cancelled", "stale"]),
+  step: z.enum([
+    "reviewing", "review_native_turn", "review_readback", "review_display_rewrite",
+    "review_conversion", "review_alignment", "review_reconciliation", "review_finalizing",
+  ]).optional(),
+  message: z.string().optional(),
+  elapsedMs: z.number().nonnegative().optional(),
+  verdict: z.enum(["pass", "changes_requested"]).optional(),
+  result: reviewResultSchema.optional(),
+  visibleText: z.string().optional(),
+  summary: z.string().optional(),
+  error: z.string().optional(),
+}).passthrough();
+
+const projectionSchema = z.object({
+  currentWorkflowId: z.string().nullable(),
+  plan: planSchema.nullable(),
+  activeReview: reviewSchema.nullable(),
+  reviews: z.array(reviewSchema),
+}) as unknown as ZodType<CodexWorkflowProjection>;
+
+const stateSchema = z.object({
+  currentWorkflowId: z.string().nullable(),
+  plan: planSchema.nullable(),
+  activeReview: reviewSchema.nullable(),
+  reviews: z.array(reviewSchema),
+  failure: z.string().nullable(),
+}) as unknown as ZodType<CodexWorkflowProjectionState>;
+
+function upsert(reviews: CodexReviewView[], next: CodexReviewView): CodexReviewView[] {
+  const index = reviews.findIndex(entry => entry.reviewId === next.reviewId);
+  if (index < 0) return [...reviews, next];
+  return reviews.map((entry, i) => i === index ? next : entry);
+}
+
+export function applyCodexWorkflowProjection(
+  state: CodexWorkflowProjectionState,
+  event: SessionEvent,
+): CodexWorkflowProjectionState {
+  if (state.failure !== null) return state;
+  try {
+    switch (event.type) {
+      case "dsh-codex-workflow/plan-updated": {
+        const plan: CodexPlanView = { workflowId: event.data.workflowId, status: event.data.status,
+          ...(event.data.planMarkdown === undefined ? {} : { planMarkdown: event.data.planMarkdown }),
+          questions: event.data.questions, assumptions: event.data.assumptions,
+          ...(event.data.message === undefined ? {} : { message: event.data.message }) };
+        return { ...state, currentWorkflowId: event.data.workflowId, plan };
+      }
+      case "dsh-codex-workflow/review-start": {
+        const review: CodexReviewView = { ...event.data, processState: "running" };
+        return { ...state, currentWorkflowId: event.data.workflowId, activeReview: review, reviews: upsert(state.reviews, review) };
+      }
+      case "dsh-codex-workflow/review-progress": {
+        const current = state.reviews.find(entry => entry.reviewId === event.data.reviewId)
+          ?? { workflowId: event.data.workflowId, reviewId: event.data.reviewId, attempt: 0, startedAt: event.data.at };
+        const review: CodexReviewView = { ...current, ...event.data };
+        return { ...state, currentWorkflowId: event.data.workflowId, activeReview: review, reviews: upsert(state.reviews, review) };
+      }
+      case "dsh-codex-workflow/review-end": {
+        const current = state.reviews.find(entry => entry.reviewId === event.data.reviewId)
+          ?? { workflowId: event.data.workflowId, reviewId: event.data.reviewId, attempt: 0, startedAt: event.data.finishedAt };
+        const review: CodexReviewView = { ...current, ...event.data };
+        return { ...state, currentWorkflowId: event.data.workflowId, activeReview: null, reviews: upsert(state.reviews, review) };
+      }
+      default:
+        return state;
+    }
+  } catch (error) {
+    return { ...state, failure: `codex workflow projection failed at session event ${event.seq}: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+export const codexWorkflowProjectionDefinition = {
+  key: "codexWorkflow",
+  stateSchema,
+  init: (): CodexWorkflowProjectionState => ({ currentWorkflowId: null, plan: null, activeReview: null, reviews: [], failure: null }),
+  apply: applyCodexWorkflowProjection,
+  wire: { viewSchema: projectionSchema, view: (state: CodexWorkflowProjectionState): CodexWorkflowProjection => ({
+    currentWorkflowId: state.currentWorkflowId, plan: state.plan, activeReview: state.activeReview, reviews: state.reviews,
+  }) },
+  stateVersion: 1,
+} satisfies ProjectionDefinition<"codexWorkflow", CodexWorkflowProjectionState>;

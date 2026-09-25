@@ -504,8 +504,8 @@ test("conflict + reconciled aligned applies the CORRECTED verdict in ONE busines
     assert.equal(gateway.reconcileServed, 1);
     // The reconciliation ran on the DEDICATED Reviewer task (1.1.0) — the
     // Planner task is never a review target.
-    assert.equal(gateway.reconcileCalls[0]!.threadId, after.reviewerThreadId);
-    assert.notEqual(gateway.reconcileCalls[0]!.threadId, after.plannerThreadId);
+    assert.equal(after.reviewerThreadId, undefined, "ephemeral Reviewer ids are not persisted");
+    assert.equal(gateway.reconcileCalls[0]!.threadId, "reviewer-thread");
     assert.match(gateway.reconcileCalls[0]!.prompt, /finding #0/);
     assert.match(gateway.reconcileCalls[0]!.prompt, /approved plan: exactly two test cases/);
   } finally {
@@ -587,7 +587,8 @@ test("demo-smoke regression: overreaching automated-test demand is refused and r
     assert.equal(after.phase, "passed", "the plan-conformant implementation passes without adding tests");
     assert.equal(after.reviewCycles, 1);
     assert.equal(after.latestReview?.verdict, "pass");
-    assert.equal(gateway.reconcileCalls[0]!.threadId, after.reviewerThreadId, "reconciliation reused the SAME dedicated Reviewer task");
+    assert.equal(after.reviewerThreadId, undefined, "ephemeral Reviewer ids are not persisted");
+    assert.equal(gateway.reconcileCalls[0]!.threadId, "reviewer-thread", "reconciliation stayed on the private Reviewer thread");
     assert.notEqual(gateway.reconcileCalls[0]!.threadId, after.plannerThreadId, "the Planner task is never a review target");
     assert.ok(deferred.some((message) => /passed workflow/.test(deferredText(message))));
   } finally {

@@ -59,7 +59,9 @@ export interface CodexAppServerOptions {
 export interface StartThreadOptions {
   cwd: string;
   model?: string;
-  name: string;
+  /** Durable threads may be named; ephemeral threads never enter Desktop history. */
+  name?: string;
+  ephemeral?: boolean;
 }
 
 export interface StartTurnOptions {
@@ -94,8 +96,9 @@ export interface StartTurnOptions {
 
 export interface ReviewerStartOptions {
   cwd: string;
-  name: string;
+  name?: string;
   model?: string;
+  ephemeral?: boolean;
   /** Readable review contract + full per-round context (original task, plan,
    * implementation summary, changed files, test results, workspace evidence)
    * injected as the Reviewer thread's developer instructions BEFORE the first
@@ -302,13 +305,15 @@ export class CodexAppServerClient {
       sandbox: "read-only",
       serviceName: "dsh-codex-workflow",
       sessionStartSource: "startup",
-      ephemeral: false,
+      ephemeral: options.ephemeral === true,
     };
     if (options.model) params.model = options.model;
     const response = await this.request<JsonObject>("thread/start", params, signal);
     const thread = object(response.thread);
     const threadId = string(thread.id, "thread/start result.thread.id");
-    await this.request("thread/name/set", { threadId, name: options.name }, signal);
+    if (options.ephemeral !== true && options.name) {
+      await this.request("thread/name/set", { threadId, name: options.name }, signal);
+    }
     return threadId;
   }
 
@@ -447,7 +452,7 @@ export class CodexAppServerClient {
       sandbox: "read-only",
       serviceName: "dsh-codex-workflow",
       sessionStartSource: "startup",
-      ephemeral: false,
+      ephemeral: options.ephemeral === true,
     };
     if (options.model) params.model = options.model;
     const response = await this.request<JsonObject>("thread/start", params, signal);
@@ -466,7 +471,9 @@ export class CodexAppServerClient {
       sandboxPolicy: { type: "readOnly", networkAccess: false },
       ...(options.developerInstructions ? { developerInstructions: options.developerInstructions } : {}),
     }, signal);
-    await this.request("thread/name/set", { threadId, name: options.name }, signal);
+    if (options.ephemeral !== true && options.name) {
+      await this.request("thread/name/set", { threadId, name: options.name }, signal);
+    }
   }
 
   async startReviewerThread(options: ReviewerStartOptions, signal?: AbortSignal): Promise<string> {

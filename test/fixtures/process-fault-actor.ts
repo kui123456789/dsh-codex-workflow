@@ -130,6 +130,7 @@ async function main(): Promise<number> {
     // production always binds the real App Server; this actor only needs the
     // verdict to reach phase A staging unchanged.
     const gateway = {
+      startThread: async () => "alignment-thread",
       normalizeInFork: async () => ({
         kind: "completed",
         threadId: "fork-thread",

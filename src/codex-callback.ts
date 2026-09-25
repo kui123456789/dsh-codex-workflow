@@ -20,6 +20,8 @@ export interface CodexCallbackRequest {
   /** Display name for the DEDICATED Reviewer task created for this review
    * (1.1.0). The origin task is never resumed or renamed. */
   reviewerName?: string;
+  /** Use an App Server ephemeral Reviewer with no Desktop history entry. */
+  ephemeral?: boolean;
   model?: string;
   effort?: ReasoningEffort;
   onThread?: (threadId: string) => Promise<void> | void;

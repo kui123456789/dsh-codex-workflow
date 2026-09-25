@@ -2,6 +2,17 @@
 
 All notable changes to `dsh-codex-workflow`.
 
+## [1.1.7] - 2026-09-26
+
+- Planner and Reviewer execution now uses Codex App Server ephemeral threads, so new workflow tasks stay out of Codex Desktop history and cannot be held by Desktop's writer lock.
+- Review lifecycle events are persisted in the DSH Session and exposed through the `codexWorkflow` projection.
+- Added a DSH Web client half with an automatically opened `Codex Review` right-sidebar tab for plans, progress, findings, test gaps and review history.
+- Legacy durable Planner/Reviewer ids remain readable for diagnostics but are never resumed or opened by new workflow rounds.
+- Restored the real-process staged-verdict crash test: recovery preserves the original request identity and remains idempotent across a second process.
+- Removed the unused `QueueRepositoryAdapter` and `LeaseRepositoryAdapter`; the active process transport remains wired through `app-server.ts`.
+- Removed 21 obsolete skipped tests that asserted the pre-1.1.7 persistent Reviewer/Desktop-lock design; active tests now cover ephemeral creation, fresh rounds, no naming, no resume and process-local cancellation.
+- Verification after these fixes: `pnpm verify`, `pnpm host:check` and `pnpm release:check` are required gates.
+
 ## [1.1.6] - 2026-09-25
 
 - **Modular workflow architecture.** Planner, Review, Submission and Lifecycle execution now live in application modules with a single shared runtime-state owner; App Server, Bridge and Coordination SQL operations use narrow gateways and repositories.

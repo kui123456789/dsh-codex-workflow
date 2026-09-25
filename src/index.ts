@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
+import type {} from "@deepseek-ai/dsh-session-projection";
 import { writeFile, mkdir } from "node:fs/promises";
 import { registerAutoTriggerPrompt } from "./auto-trigger.js";
 import { CodexAppServerClient } from "./app-server.js";
@@ -16,6 +17,7 @@ import { WorkflowStore } from "./store.js";
 import { createWorkflowTools } from "./tools.js";
 import type { WorkflowConfig } from "./types.js";
 import { WorkflowManager } from "./workflow.js";
+import { codexWorkflowProjectionDefinition } from "./review-events.js";
 
 export const name = "dsh-codex-workflow";
 export const inject = ["tools", "agents", "systemPrompt"];
@@ -24,6 +26,8 @@ export type Config = RawConfig;
 
 export async function apply(ctx: Context, raw: Config): Promise<void> {
   await ctx.effect(async () => {
+    const projections = ctx.get("sessionProjections") as { register(definition: typeof codexWorkflowProjectionDefinition): () => void } | undefined;
+    const disposeProjection = projections?.register(codexWorkflowProjectionDefinition) ?? (() => undefined);
     const config = resolveConfig(raw);
     const store = new WorkflowStore(config.storageDir);
     await store.init();
@@ -78,7 +82,7 @@ export async function apply(ctx: Context, raw: Config): Promise<void> {
         jitterRatio: config.transientRetryJitterRatio,
       },
     });
-    const manager = new WorkflowManager(store, codex, config, callback, bridgeStore, audit);
+    const manager = new WorkflowManager(store, codex, config, callback, bridgeStore, audit, {}, ctx.agents);
     const autoTriggerDisposer = registerAutoTriggerPrompt(ctx.systemPrompt, config.autoTriggerMode);
     const runtime = new BridgeRuntime(bridgeStore, ctx.agents, {
       pollMs: config.bridgePollMs,
@@ -100,6 +104,7 @@ export async function apply(ctx: Context, raw: Config): Promise<void> {
     const disposedListener = ctx.on("agent/disposed", () => void runtime.refreshSessions().catch(() => undefined));
     runtime.start();
     return async () => {
+      disposeProjection();
       await runtime.stop();
       stopListener();
       createdListener();

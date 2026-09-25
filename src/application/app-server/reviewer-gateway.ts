@@ -3,9 +3,9 @@ import type { WorkflowConfig } from "../../types.js";
 export interface ReviewerGatewayPort {
   resumeThread(threadId: string, cwd: string, signal?: AbortSignal): Promise<void>;
   updateReviewerInstructions?(threadId: string, cwd: string, instructions: string, signal?: AbortSignal): Promise<void>;
-  startReviewerThread?(options: { cwd: string; name: string; model?: string; developerInstructions?: string }, signal?: AbortSignal): Promise<string>;
-  startReviewerThreadShell?(options: { cwd: string; name: string; model?: string; developerInstructions?: string }, signal?: AbortSignal): Promise<string>;
-  configureReviewerThread?(threadId: string, options: { cwd: string; name: string; model?: string; developerInstructions?: string }, signal?: AbortSignal): Promise<void>;
+  startReviewerThread?(options: { cwd: string; name?: string; model?: string; developerInstructions?: string; ephemeral?: boolean }, signal?: AbortSignal): Promise<string>;
+  startReviewerThreadShell?(options: { cwd: string; name?: string; model?: string; developerInstructions?: string; ephemeral?: boolean }, signal?: AbortSignal): Promise<string>;
+  configureReviewerThread?(threadId: string, options: { cwd: string; name?: string; model?: string; developerInstructions?: string; ephemeral?: boolean }, signal?: AbortSignal): Promise<void>;
   unsubscribeThread?(threadId: string, signal?: AbortSignal): Promise<unknown>;
   releaseThreadForExternal?(threadId: string, signal?: AbortSignal): Promise<void>;
   nameThread?(threadId: string, name: string, signal?: AbortSignal): Promise<void>;
@@ -13,9 +13,10 @@ export interface ReviewerGatewayPort {
 
 export interface ReviewerStartOptions {
   cwd: string;
-  name: string;
+  name?: string;
   model?: string;
   developerInstructions?: string;
+  ephemeral?: boolean;
 }
 
 /** Deep seam for Reviewer lifecycle operations; retry policy remains in flows. */

@@ -32,6 +32,8 @@
         turnTimeoutMs: 600000
         idleProcessMs: 5000
         terminalRelayTimeoutMs: 60000
-        openCodexDesktopOnReview: true
+        # Reviews now use App Server ephemeral threads and render in DSH's
+        # right sidebar; keep the legacy deep-link switch disabled.
+        openCodexDesktopOnReview: false
         desktopOpenRetryBaseMs: 2000
         desktopOpenRetryMaxMs: 60000

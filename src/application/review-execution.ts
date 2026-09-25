@@ -6,9 +6,10 @@ import type { ToolRunContext } from "@deepseek-ai/dsh-tools";
 import type { CodexCliAuditGateway } from "../codex-cli-audit.js";
 import { ReviewObservation } from "./review-observation.js";
 import { TurnGateway } from "./app-server/turn-gateway.js";
-import { applyReviewConsistency, formatFindings, isSharedReviewerAlias, parseReview, pluginMessage, reviewConversionPrompt, reviewContractInstructions, reviewInstructions } from "../workflow.js";
+import { applyReviewConsistency, formatFindings, parseReview, pluginMessage, reviewConversionPrompt, reviewContractInstructions, reviewInstructions } from "../workflow.js";
 import type { ReviewConflictInfo, ReviewInput, ReviewResult, TurnWaitResult, WorkflowConfig, WorkflowPhase, WorkflowRecord } from "../types.js";
 import type { WorkflowRuntimeState } from "./workflow-runtime-state.js";
+import type { CodexReviewEndEvent } from "../review-events.js";
 
 type AnyFn = (...args: any[]) => any;
 
@@ -21,11 +22,8 @@ export interface ReviewExecutionContext {
   audit?: CodexCliAuditGateway;
   trackNoChange: AnyFn;
   createReviewerThread: AnyFn;
-  prepareBoundReviewer: AnyFn;
-  renameLegacyReviewer: AnyFn;
   releaseUnboundReviewer: AnyFn;
   reportCleanupNote: AnyFn;
-  readBackAppended: AnyFn;
   alignReview: AnyFn;
   reconcileReview: AnyFn;
   computeReviewOutcome: AnyFn;
@@ -58,6 +56,8 @@ export class ReviewExecution {
     let current = entering.record;
     let reviewerClaimed = false;
     let reviewerThreadId: string | undefined;
+    let visibleReviewText: string | undefined;
+    let reviewEndDetail: Pick<CodexReviewEndEvent, "verdict" | "result" | "visibleText" | "summary" | "error"> | undefined;
     // 1.1.6: pin the App Server child for the whole round. Without the pin the
     // idle window can fall between creating the Reviewer and its first turn,
     // and the respawned process answers `thread not found` for that new thread.
@@ -77,69 +77,42 @@ export class ReviewExecution {
       if (evidenceCommit.suppressed) return evidenceCommit.record;
       current = evidenceCommit.record;
 
-      // 1.1.2: the VISIBLE review turn ALWAYS runs on the App Server now, even
-      // when a CLI audit is configured. A Reviewer task created by
-      // `codex exec` is stored with `source='exec'`, is never returned by
-      // `thread/list` (measured 0/15, versus 62/72 App Server threads) and
-      // therefore cannot be rendered in Codex Desktop at all — the readable
-      // review was landing in a task the user could not open. The CLI keeps
-      // only the internal conversions (normalize/align), which run in
-      // independent `--ephemeral` sessions and never create a durable thread.
-
-      // The durable visible REVIEWER task (1.1.0). A review always runs on a
-      // DEDICATED Reviewer thread — never the Planner task, never the bridge
-      // origin task — because Codex Desktop keeps a writer lock on every
-      // thread it has loaded: resuming a shared task made reviews fail with
-      // `thread-store conflict: thread <id> already has an active writer`, a
-      // lock the plugin cannot release. A legacy record whose reviewerThreadId
-      // still aliases the shared task is migrated lazily (a dedicated Reviewer
-      // is created below). The readable review contract + FULL per-round
-      // context (workflow identity, original task, approved plan,
-      // implementation summary, changed files, test results, workspace
-      // evidence) are ALSO injected as the thread's developer instructions
-      // (refreshed before every round) — but only as an AUXILIARY channel: a
-      // real App Server native review turn does not reliably see hidden
-      // thread-settings instructions, so verdict correctness never depends on
-      // them. The complete context and the coverage gate ride the
-      // `review/start` custom target on every path (see below).
+      // The visible review always runs on a fresh App Server ephemeral thread,
+      // even when a CLI audit is configured. The CLI keeps only the internal
+      // conversions (normalize/align), which also run in private ephemeral
+      // sessions. No new Planner/Reviewer id is persisted or made visible to
+      // Codex Desktop; legacy ids are diagnostic only.
       const reviewerModel = current.reviewerModel
         || this.ctx.config.reviewerModel
         || await this.ctx.turnGateway.resolveDefaultModel?.(exec.signal)
         || undefined;
       const contract = reviewContractInstructions(current, input, evidence);
-      reviewerThreadId = current.reviewerThreadId;
-      // 1.1.0/1.1.2: a Reviewer is reused only when it is a DEDICATED thread the
-      // App Server created. A legacy shared alias (1.1.0) or a legacy CLI task
-      // (1.1.2: `source='exec'`, invisible in Desktop, no name) is migrated
-      // lazily: the old thread is left untouched (best-effort renamed) and a
-      // visible Reviewer is created below.
-      const legacyReviewer = reviewerThreadId
-        && (isSharedReviewerAlias(current) || current.reviewerThreadOrigin !== "app-server")
-        ? reviewerThreadId
-        : undefined;
-      if (legacyReviewer) {
-        await this.ctx.renameLegacyReviewer(current, workflowId);
-        reviewerThreadId = undefined;
-      }
-      if (!reviewerThreadId) {
-        // 1.1.3: creation runs under the shared transient retry, and a retry
-        // after a failed configuration reuses the SAME task id.
+      // Every new round gets a fresh App Server ephemeral Reviewer. Durable
+      // Reviewer ids from older records are diagnostic only and are never
+      // resumed, renamed or handed to Desktop.
+      reviewerThreadId = undefined;
+      {
+        // Creation runs under the shared transient retry. A retry after a
+        // failed configuration reuses the same in-process ephemeral id; a
+        // later review always creates a fresh one.
         reviewerThreadId = await this.ctx.createReviewerThread({
           cwd: current.cwd,
           name: `DSH Reviewer: ${workflowId}`,
           workflowId,
+          ephemeral: true,
           ...(reviewerModel ? { model: reviewerModel } : {}),
           developerInstructions: contract,
         }, exec.signal);
         let threadCommit;
         try {
           threadCommit = await this.ctx.store.update(workflowId, (r) => {
-            r.reviewerThreadId = reviewerThreadId!;
             r.reviewStep = "review_native_turn";
             r.lastProgressAt = new Date().toISOString();
             r.lastProgressMessage = "Running Reviewer turn";
-            // 1.1.2 visibility marker: only App Server threads are renderable.
-            r.reviewerThreadOrigin = "app-server";
+            // The new Reviewer is an App Server ephemeral thread. Keep only
+            // the origin marker for diagnostics; its id is process-local and
+            // must never become a Desktop-visible durable binding.
+            r.reviewerThreadOrigin = "app-server-ephemeral";
           }, { ignoreCancelled: false });
         } catch (error) {
           // The created task could not be bound: release its hold before the
@@ -156,16 +129,6 @@ export class ReviewExecution {
         }
         current = threadCommit.record;
         reviewerClaimed = true;
-      } else {
-        // 1.1.3: resume + instruction refresh under the shared transient retry
-        // (a visible Reviewer can be open in Codex Desktop, which holds its
-        // writer lock until the user closes it).
-        await this.ctx.prepareBoundReviewer(reviewerThreadId, current.cwd, contract, exec.signal, workflowId);
-        reviewerClaimed = true;
-      }
-
-      if (current.reviewerThreadId === reviewerThreadId && current.reviewStep !== "review_native_turn") {
-        await this.ctx.reviewObservation.mark(workflowId, "review_native_turn", "Running Reviewer turn");
       }
 
       // Git AND non-Git reviews use the SAME `review/start` custom target. Its
@@ -182,13 +145,13 @@ export class ReviewExecution {
       // to equal the persisted `thread.turns[].id` (real App Server
       // evidence). The baseline read is metadata-only and never touches the
       // thread's writer.
-      const reviewBaseline = await this.ctx.turnGateway.captureTurnBaseline?.(reviewerThreadId!, exec.signal);
+      const reviewBaseline = undefined;
       // 1.1.2: the visible review turn runs through the SAME transient-retry
       // wrapper as every other visible turn (1.1.1 parity on the App Server
       // path). A retried attempt re-registers its own turn, so the active-turn
       // mapping always points at the newest turn.
       const review = await this.ctx.startReviewWithTransientRetry({
-        threadId: reviewerThreadId,
+        threadId: reviewerThreadId!,
         cwd: current.cwd,
         detached: false,
         target: { type: "custom", instructions: reviewInstructions(current, input, evidence, git) },
@@ -204,7 +167,7 @@ export class ReviewExecution {
             await this.ctx.turnGateway.interrupt?.(started.threadId, started.turnId).catch(() => undefined);
             throw new Error(`review/start returned task ${started.threadId}, expected the workflow task ${reviewerThreadId}; refusing to persist a second visible task`);
           }
-          await this.ctx.registerActiveTurn(workflowId, started.threadId, started.turnId, "reviewer");
+          await this.ctx.registerActiveTurn(workflowId, started.threadId, started.turnId, "reviewer", true);
         },
       }, exec.signal);
       // Second net for the same invariant: a mismatched return value is
@@ -221,7 +184,7 @@ export class ReviewExecution {
         return afterReview!;
       }
       current = afterReview;
-      await this.ctx.reviewObservation.mark(workflowId, "review_readback", "Reading persisted Reviewer result", null);
+      await this.ctx.reviewObservation.mark(workflowId, "review_readback", "Reading Reviewer result", null);
       // BOTH the visible review turn AND the ephemeral normalization turn must
       // have genuinely completed (`status === "completed"`, not just the
       // `completed` kind): interrupted/failed/timed-out turns carry no usable
@@ -235,29 +198,16 @@ export class ReviewExecution {
         throw new Error(`${review.result.reason ?? `review turn ${review.result.status}`}${detail}`);
       }
 
-      // 1.0.7 display contract, ENFORCED ON THE PERSISTED HISTORY. The
-      // authoritative display text is what `thread/read(includeTurns: true)`
-      // returns for the turn appended since the pre-review baseline on the
-      // durable workflow task — the streamed/`turn/completed` aggregation
-      // (`review.result.text`) can differ from what Codex Desktop actually
-      // persists, so it alone must never gate the contract. Validate the
-      // READ-BACK text (non-empty,
-      // readable Markdown — never a JSON envelope — the four required sections
-      // verdict/findings/test gaps/summary, and the original task's language
-      // for Chinese tasks) BEFORE the ephemeral normalization. When the
-      // persisted native review violates it, run ONE ordinary visible rewrite
-      // turn on the SAME durable workflow task (no outputSchema, read-only/
-      // network disabled/approval never enforced per turn, low effort, silent),
-      // which only re-presents the SAME verdict/findings/test-gaps in the
-      // task's language with the fixed readable sections — it never re-reviews
-      // and never creates a second visible task. The rewrite turn is persisted
-      // like any visible turn; its READ-BACK final message becomes the
-      // authoritative text for the ephemeral conversion. A missing/ambiguous
-      // read-back and a still-violating rewrite are retryable failures — NEVER
-      // a silent fallback to the in-memory text.
-      const persistedNative = await this.ctx.readBackAppended(reviewerThreadId, reviewBaseline, exec.signal);
-      if (!persistedNative) throw new Error("persisted review read-back missing or ambiguous");
-      let authoritativeText = persistedNative.text;
+      // Validate the readable Markdown before structured normalization. It must
+      // contain the four required sections and follow the task language. A
+      // display violation gets one corrective turn on the SAME ephemeral
+      // Reviewer; the corrected text becomes the input to conversion.
+      if (review.result.kind !== "completed" || review.result.status !== "completed") {
+        if (review.result.kind !== "completed") throw new Error("review unexpectedly requested user input");
+        throw new Error(`${review.result.reason ?? `review turn ${review.result.status}`}${review.result.error ? `: ${review.result.error}` : ""}`);
+      }
+      let authoritativeText = review.result.text ?? "";
+      visibleReviewText = authoritativeText;
       const displayError = reviewDisplayError(authoritativeText, current);
       if (displayError) {
         // An EMPTY review has nothing to re-present: a rewrite turn would have
@@ -269,7 +219,7 @@ export class ReviewExecution {
         // Baseline BEFORE the rewrite turn, exactly like the native turn: the
         // rewrite's persisted output is detected as an APPENDED turn, never by
         // assuming the `turn/start` RPC id equals the persisted rollout id.
-        const rewriteBaseline = await this.ctx.turnGateway.captureTurnBaseline?.(reviewerThreadId!, exec.signal);
+        const rewriteBaseline = undefined;
         await this.ctx.reviewObservation.mark(workflowId, "review_display_rewrite", "Rewriting Reviewer display output", null);
         const rewrite = await this.ctx.startTurnWithTransientRetry(reviewerThreadId, {
           prompt: reviewRewritePrompt(authoritativeText, current),
@@ -279,7 +229,7 @@ export class ReviewExecution {
           // The rewrite turn is a VISIBLE turn on the same durable thread:
           // persist thread/turn so codex_workflow_cancel and teardown can
           // interrupt exactly this turn while it runs.
-          onStarted: (started: { threadId: string; turnId: string }) => this.ctx.registerActiveTurn(workflowId, started.threadId, started.turnId, "reviewer"),
+          onStarted: (started: { threadId: string; turnId: string }) => this.ctx.registerActiveTurn(workflowId, started.threadId, started.turnId, "reviewer", true),
         }, exec.signal);
         const afterRewrite = await this.ctx.store.load(workflowId);
         if (!afterRewrite || afterRewrite.phase === "cancelled") {
@@ -297,13 +247,13 @@ export class ReviewExecution {
         // The rewrite's AUTHORITY is its persisted history, read back exactly
         // like the native turn's — never the in-memory aggregation. A
         // missing/ambiguous read-back of the rewrite is also retryable.
-        const persistedRewrite = await this.ctx.readBackAppended(reviewerThreadId, rewriteBaseline, exec.signal);
-        if (!persistedRewrite) throw new Error("persisted rewrite read-back missing or ambiguous");
-        const rewrittenError = reviewDisplayError(persistedRewrite.text, current);
+        const rewrittenText = rewrite.text ?? "";
+        const rewrittenError = reviewDisplayError(rewrittenText, current);
         if (rewrittenError) {
           throw new Error(`corrected review still violates the display contract: ${rewrittenError}`);
         }
-        authoritativeText = persistedRewrite.text;
+        authoritativeText = rewrittenText;
+        visibleReviewText = authoritativeText;
       }
 
       // Since 1.0.7 the visible review turn (startReview) produces a readable
@@ -441,6 +391,7 @@ export class ReviewExecution {
         }
       }, { ignoreCancelled: false });
       if (commit.suppressed) return commit.record;
+      reviewEndDetail = { verdict: applied!.verdict, result: applied!, visibleText: visibleReviewText, summary: applied!.summary };
       if (outcomeMessage) exec.deferContext(pluginMessage(outcomeMessage));
       return commit.record;
     } catch (error) {
@@ -463,13 +414,14 @@ export class ReviewExecution {
         r.lastProgressMessage = "Review failed; retry is available";
       }, { ignoreCancelled: false });
       if (failed.suppressed) return failed.record;
+      reviewEndDetail = { error: this.ctx.errorMessage(error) };
       throw error;
     } finally {
       const releaseNote = reviewerClaimed && reviewerThreadId
         ? await this.ctx.releaseReviewerSubscription(reviewerThreadId)
         : undefined;
       this.ctx.reportCleanupNote(workflowId, releaseNote);
-      await this.ctx.reviewObservation.finish(workflowId);
+      await this.ctx.reviewObservation.finish(workflowId, undefined, reviewEndDetail);
       await this.ctx.flushCleanupNotes(workflowId);
       // The pin is released LAST: the cleanup above still runs on this child.
       this.ctx.turnGateway.endRound();
