@@ -112,7 +112,7 @@ export class BridgeRuntime {
   private stopped = false;
   private stopPromise?: Promise<void>;
   private readonly terminalRelayGuard: TerminalRelayGuard;
-  private readonly liveSessionRepository: LiveSessionRepositoryAdapter;
+  private liveSessionRepository?: LiveSessionRepositoryAdapter;
   private readonly workflowRepository: WorkflowRepositoryAdapter;
   private readonly store: BridgeStore;
   private readonly agents: AgentRegistryLike;
@@ -153,8 +153,11 @@ export class BridgeRuntime {
       timeoutMs: this.options.terminalRelayTimeoutMs,
       isStopped: () => this.stopped,
     });
-    this.liveSessionRepository = new LiveSessionRepositoryAdapter(store.coordinationHandle);
     this.workflowRepository = new WorkflowRepositoryAdapter(options.workflowStore);
+  }
+
+  private liveSessions(): LiveSessionRepositoryAdapter {
+    return this.liveSessionRepository ??= new LiveSessionRepositoryAdapter(this.store.coordinationHandle);
   }
 
   startInternal(): void {
@@ -210,7 +213,7 @@ export class BridgeRuntime {
     // release them. A refresh queued after stop() sees `this.stopped` and
     // writes nothing, so live_sessions can never be resurrected.
     await this.sessionsChain.then(() => undefined, () => undefined);
-    await this.liveSessionRepository.releaseOwnerSessions(this.claimOwner);
+    await this.liveSessions().releaseOwnerSessions(this.claimOwner);
   }
 
   /**
@@ -241,7 +244,7 @@ export class BridgeRuntime {
       .sort((left, right) => left.sessionId.localeCompare(right.sessionId));
     const snapshot = JSON.stringify(rows);
     if (!force && snapshot === this.sessionSnapshot) return;
-    this.liveSessionRepository.refreshOwnerSessions(this.claimOwner, rows, this.store.leaseMs, now);
+    this.liveSessions().refreshOwnerSessions(this.claimOwner, rows, this.store.leaseMs, now);
     this.sessionSnapshot = snapshot;
     // Preserve audit rows, but close old workflows whose owning DSH session has
     // disappeared. A two-lease grace period lets a normal runtime restart
@@ -266,7 +269,7 @@ export class BridgeRuntime {
         return this.agents.get(command.target.dshSessionId) !== undefined;
       }
       // cwd-based dispatch: route by the shared live-session registry.
-      const live = this.liveSessionRepository.liveSessionsForCwd(cwdKey(command.target.cwd));
+      const live = this.liveSessions().liveSessionsForCwd(cwdKey(command.target.cwd));
       if (live.length === 0) return false; // nobody owns it yet: WAIT, never steal
       if (live.length === 1) {
         return live[0]!.runtimeOwner === this.claimOwner; // only the unique owner
@@ -281,7 +284,7 @@ export class BridgeRuntime {
     // Resolve the REAL session from the shared workflow record; never trust
     // the command's own dshSessionId (a forged/stale target must not let a
     // wrong runtime apply first).
-    const session = this.liveSessionRepository.workflowSessionOf(verdict.workflowId);
+    const session = this.liveSessions().workflowSessionOf(verdict.workflowId);
     if (!session) {
       // Workflow genuinely does not exist: allow ONE runtime to claim it and
       // produce the terminal no_such_workflow receipt.
@@ -520,7 +523,7 @@ export class BridgeRuntime {
     // cwd-based dispatch: decide against the GLOBAL live-session registry, not
     // just this runtime's view, so same-cwd multi-session ambiguity is a
     // deterministic terminal error and a single session routes to its owner.
-    const live = this.liveSessionRepository.liveSessionsForCwd(cwdKey(command.target.cwd));
+    const live = this.liveSessions().liveSessionsForCwd(cwdKey(command.target.cwd));
     if (live.length === 0) {
       return { kind: "retryable", reason: `no live DSH session matches cwd ${command.target.cwd}` };
     }
