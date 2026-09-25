@@ -20,7 +20,8 @@ import {
   type SubmitVerdictCommand,
 } from "./bridge-protocol.js";
 import { collectEvidence, isGitRepository } from "./evidence.js";
-import { backoffDelayMs, normalizeBackoff, transientReason, type BackoffPolicy } from "./transient-retry.js";
+import { noticeSource } from "./message-source.js";
+import { backoffDelayMs, normalizeBackoff, retryTransient, transientReason, type BackoffPolicy } from "./transient-retry.js";
 import {
   SILENT_REVIEW_PROMPT_BLOCK,
   reviewDisplayError,
@@ -129,6 +130,23 @@ export interface CodexGateway {
     model?: string;
     developerInstructions?: string;
   }, signal?: AbortSignal): Promise<string>;
+  /** 1.1.3: `thread/start` alone (see `startReviewerThreadShell`). Optional:
+   * when a gateway provides BOTH this and `configureReviewerThread`, the
+   * manager retries a failed configuration on the SAME task instead of creating
+   * one orphan task per attempt. */
+  startReviewerThreadShell?(options: {
+    cwd: string;
+    name: string;
+    model?: string;
+    developerInstructions?: string;
+  }, signal?: AbortSignal): Promise<string>;
+  /** 1.1.3: settings + display name of an already created Reviewer task. */
+  configureReviewerThread?(threadId: string, options: {
+    cwd: string;
+    name: string;
+    model?: string;
+    developerInstructions?: string;
+  }, signal?: AbortSignal): Promise<void>;
   /** Refresh the per-round readable contract/context as developer instructions
    * on the durable Reviewer thread before a re-review runs. AUXILIARY channel
    * only: the `review/start` custom target carries the complete per-round
@@ -458,6 +476,99 @@ export class WorkflowManager {
       const delayMs = backoffDelayMs(attempt, policy, this.retryRandom);
       if (this.retryNow() + delayMs > deadline) return outcome;
       await this.retrySleep(delayMs, signal);
+    }
+  }
+
+  /**
+   * 1.1.3: the SAME bounded backoff for a CONTROL RPC (create / configure /
+   * resume / settings refresh). Control RPCs THROW instead of returning a failed
+   * turn, so they use `retryTransient` with the shared classification, policy
+   * and cancellation seam; a terminal diagnostic is rethrown unchanged, and a
+   * spent budget surfaces as `TransientRetryExhaustedError` (the caller maps it
+   * to a RETRYABLE outcome — never a terminal failure).
+   *
+   * Why this exists: 1.1.2 made the Reviewer task visible in Codex Desktop, so a
+   * user simply READING the review makes Desktop hold that task's writer lock.
+   * `thread/resume` then fails with `already has an active writer`, which is
+   * transient by nature (the lock disappears when the user closes the task) —
+   * the 1.1.1 CLI path retried exactly this for up to 20 minutes, and the App
+   * Server path must not be weaker.
+   */
+  private async retryTransientControl<T>(
+    operation: (attempt: number) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    return retryTransient(
+      operation,
+      (error) => transientReason(errorMessage(error)),
+      this.retryPolicy(),
+      { sleep: this.retrySleep, now: this.retryNow, random: this.retryRandom },
+      signal,
+    );
+  }
+
+  /**
+   * 1.1.3: prepare an ALREADY BOUND Reviewer task for a round — resume it and
+   * refresh its per-round instructions — retrying the WHOLE stage on a
+   * transient conflict.
+   *
+   * The plugin never releases a lock held by another process; it only releases
+   * its OWN subscription before backing off, so a half-prepared attempt cannot
+   * keep the task loaded while it waits:
+   *   - `thread/resume` is what ACQUIRES the subscription, so a failed resume
+   *     holds nothing and needs no release;
+   *   - a successful resume followed by a failed settings refresh DID acquire
+   *     it, so that subscription is released before the retry re-resumes.
+   * A spent budget leaves the round retryable with no cycle and no contract
+   * failure (the caller's catch restores the pre-review phase).
+   */
+  private async prepareBoundReviewer(
+    threadId: string,
+    cwd: string,
+    contract: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    await this.retryTransientControl(async () => {
+      await this.codex.resumeThread(threadId, cwd, signal);
+      try {
+        // Auxiliary refresh of the hidden channel; never load-bearing.
+        await this.codex.updateReviewerInstructions?.(threadId, cwd, contract, signal);
+      } catch (error) {
+        await this.releaseUnboundReviewer(threadId, signal);
+        throw error;
+      }
+    }, signal);
+  }
+
+  /**
+   * 1.1.3: create the visible Reviewer task under the same bounded transient
+   * retry. `thread/start` runs ONCE — every retry re-configures the SAME task
+   * id — so a flaky settings/name call can never leak one orphan task per
+   * attempt; a terminally failed creation releases the unbound task (it stays
+   * in the Codex store, but nothing holds it).
+   */
+  private async createReviewerThread(
+    options: { cwd: string; name: string; model?: string; developerInstructions?: string },
+    signal?: AbortSignal,
+  ): Promise<string> {
+    if (!this.codex.startReviewerThread) throw new Error("codex gateway has no startReviewerThread");
+    const shell = this.codex.startReviewerThreadShell?.bind(this.codex);
+    const configure = this.codex.configureReviewerThread?.bind(this.codex);
+    if (!shell || !configure) {
+      // Limited gateway: the creation is retried as ONE unit (its own failure
+      // path already releases whatever it created).
+      return this.retryTransientControl(() => this.codex.startReviewerThread!(options, signal), signal);
+    }
+    let threadId: string | undefined;
+    try {
+      return await this.retryTransientControl(async () => {
+        threadId ??= await shell(options, signal);
+        await configure(threadId, options, signal);
+        return threadId;
+      }, signal);
+    } catch (error) {
+      if (threadId) await this.releaseUnboundReviewer(threadId, signal);
+      throw error;
     }
   }
 
@@ -2112,8 +2223,9 @@ export class WorkflowManager {
         reviewerThreadId = undefined;
       }
       if (!reviewerThreadId) {
-        if (!this.codex.startReviewerThread) throw new Error("codex gateway has no startReviewerThread");
-        reviewerThreadId = await this.codex.startReviewerThread({
+        // 1.1.3: creation runs under the shared transient retry, and a retry
+        // after a failed configuration reuses the SAME task id.
+        reviewerThreadId = await this.createReviewerThread({
           cwd: current.cwd,
           name: `DSH Reviewer: ${workflowId}`,
           ...(reviewerModel ? { model: reviewerModel } : {}),
@@ -2144,9 +2256,10 @@ export class WorkflowManager {
         }
         current = threadCommit.record;
       } else {
-        await this.codex.resumeThread(reviewerThreadId, current.cwd, exec.signal);
-        // Auxiliary refresh of the hidden channel; never load-bearing.
-        await this.codex.updateReviewerInstructions?.(reviewerThreadId, current.cwd, contract, exec.signal);
+        // 1.1.3: resume + instruction refresh under the shared transient retry
+        // (a visible Reviewer can be open in Codex Desktop, which holds its
+        // writer lock until the user closes it).
+        await this.prepareBoundReviewer(reviewerThreadId, current.cwd, contract, exec.signal);
       }
 
       if (current.reviewerThreadId === reviewerThreadId && current.reviewStep !== "review_native_turn") {
@@ -3481,7 +3594,7 @@ export function formatFindings(review: ReviewResult): string {
 function pluginMessage(text: string) {
   return createUserMessage({
     content: [{ type: "text", text }],
-    source: { kind: "plugin", plugin: "dsh-codex-workflow", form: "notice", summary: "Codex workflow continuation" },
+    source: noticeSource("Codex workflow continuation"),
   });
 }
 

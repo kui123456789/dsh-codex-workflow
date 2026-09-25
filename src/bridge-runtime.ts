@@ -5,6 +5,7 @@ import type { Agent } from "@deepseek-ai/dsh-agent";
 import { MessageId, createUserMessage, freezeMessage, type UserMessage } from "@deepseek-ai/dsh-llm";
 import { cwdKey } from "./coordination.js";
 import type { DispatchPlanCommand, SubmissionNoticeCommand, SubmitVerdictCommand, BridgeCommand } from "./bridge-protocol.js";
+import { relaySource } from "./message-source.js";
 import type { BridgeStore, ClaimedBridgeCommand } from "./bridge-store.js";
 import { WorkflowStore } from "./store.js";
 import type { WorkflowRecord } from "./types.js";
@@ -450,7 +451,7 @@ export class BridgeRuntime {
     return freezeMessage({
       ...createUserMessage({
         content: [{ type: "text", text: executionPrompt(record) }],
-        source: { kind: "plugin", plugin: "dsh-codex-workflow", form: "relay" },
+        source: relaySource(),
       }),
       id: messageId,
     });
@@ -972,7 +973,7 @@ export class BridgeRuntime {
     return freezeMessage({
       ...createUserMessage({
         content: [{ type: "text", text }],
-        source: { kind: "plugin", plugin: "dsh-codex-workflow", form: "relay" },
+        source: relaySource(),
       }),
       id: messageId,
     });
@@ -985,7 +986,7 @@ export class BridgeRuntime {
           type: "text",
           text: `${command.message}\nWorkflow: ${command.workflowId}\nSubmission: ${command.submissionId}\n请检查 codex_workflow_status；修复环境或任务问题后重新提交。`,
         }],
-        source: { kind: "plugin", plugin: "dsh-codex-workflow", form: "relay" },
+        source: relaySource(),
       }),
       id: messageId,
     });

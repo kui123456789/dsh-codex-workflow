@@ -8,13 +8,28 @@ import {
   type CodexCallbackResult,
 } from "./codex-callback.js";
 import { REVIEW_OUTPUT_SCHEMA } from "./schemas.js";
-import { transientReason } from "./transient-retry.js";
+import {
+  normalizeBackoff,
+  retryTransient,
+  transientReason,
+  TransientRetryExhaustedError,
+  type BackoffHooks,
+  type BackoffPolicy,
+} from "./transient-retry.js";
 import { reviewConversionPrompt } from "./workflow.js";
 import { reviewDisplayError, reviewRewritePrompt } from "./review-contract.js";
 
 interface ActiveReview {
   threadId: string;
   turnId: string;
+}
+
+/** 1.1.3: the shared transient-retry policy for this dispatcher's CONTROL RPCs
+ * (create / configure / resume of the visible Reviewer task). Optional: an
+ * embedder that omits it gets the 1.1.1 defaults. */
+export interface AppServerCallbackRetry {
+  policy?: Partial<BackoffPolicy>;
+  hooks?: BackoffHooks;
 }
 
 /**
@@ -53,7 +68,62 @@ export class AppServerCodexCallbackDispatcher {
   private stopped = false;
   private stopPromise?: Promise<void>;
 
-  constructor(private readonly codex: CodexAppServerClient) {}
+  constructor(
+    private readonly codex: CodexAppServerClient,
+    private readonly retry: AppServerCallbackRetry = {},
+  ) {}
+
+  /** 1.1.3: the shared bounded backoff for a control RPC of this dispatcher. */
+  private retryTransientControl<T>(
+    operation: (attempt: number) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    return retryTransient(
+      operation,
+      (error) => transientReason(errorMessage(error)),
+      normalizeBackoff(this.retry.policy),
+      this.retry.hooks ?? {},
+      signal,
+    );
+  }
+
+  /** 1.1.3: create the visible Reviewer task under the shared retry.
+   * `thread/start` runs ONCE and every retry re-configures the SAME task, so a
+   * flaky settings/name call cannot leak one orphan task per attempt; a spent
+   * budget releases the task it created. */
+  private async createReviewer(request: CodexCallbackRequest, signal?: AbortSignal): Promise<string> {
+    if (!this.codex.startReviewerThread) throw new Error("codex gateway has no startReviewerThread");
+    const options = {
+      cwd: request.cwd,
+      name: request.reviewerName ?? `DSH Reviewer: ${request.workflowId}`,
+    };
+    const shell = this.codex.startReviewerThreadShell?.bind(this.codex);
+    const configure = this.codex.configureReviewerThread?.bind(this.codex);
+    if (!shell || !configure) {
+      // Limited gateway: the creation is retried as ONE unit (its own failure
+      // path already releases whatever it created).
+      return this.retryTransientControl(() => this.codex.startReviewerThread!(options, signal), signal);
+    }
+    let threadId: string | undefined;
+    try {
+      return await this.retryTransientControl(async () => {
+        threadId ??= await shell(options, signal);
+        await configure(threadId, options, signal);
+        return threadId;
+      }, signal);
+    } catch (error) {
+      if (threadId) await this.codex.unsubscribeThread(threadId).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /** 1.1.3: resume the Reviewer task under the shared retry — the writer lock a
+   * user's open Codex Desktop task holds is temporary, never a terminal
+   * failure. `thread/resume` is what ACQUIRES the subscription, so a failed
+   * resume holds nothing that would need releasing. */
+  private async resumeReviewer(threadId: string, cwd: string, signal?: AbortSignal): Promise<void> {
+    await this.retryTransientControl(() => this.codex.resumeThread(threadId, cwd, signal), signal);
+  }
 
   send(request: CodexCallbackRequest, signal?: AbortSignal): Promise<CodexCallbackResult> {
     if (this.stopped) return Promise.reject(new Error("codex callback dispatcher is stopped"));
@@ -138,22 +208,28 @@ export class AppServerCodexCallbackDispatcher {
       // it through the bridge (submission/verdict relay), not by taking its
       // writer.
       const created = !reviewerThreadId;
-      if (!reviewerThreadId) {
-        if (!this.codex.startReviewerThread) throw new Error("codex gateway has no startReviewerThread");
-        reviewerThreadId = await this.codex.startReviewerThread({
-          cwd: request.cwd,
-          name: request.reviewerName ?? `DSH Reviewer: ${request.workflowId}`,
-        }, signal);
-      }
+      // 1.1.3: creation AND resume run under the same bounded transient retry as
+      // the DSH-led path. Since 1.1.2 the Reviewer task is visible in Codex
+      // Desktop, so a user simply reading it makes Desktop hold its writer lock
+      // and `thread/resume` fail with `already has an active writer` — a
+      // temporary condition the 1.1.1 CLI path retried for up to 20 minutes. A
+      // spent budget is mapped to `retryable_busy` (the submission then follows
+      // the bounded callback retry + the periodic `recoverCallbacks` sweep)
+      // instead of becoming a terminal callback failure.
       try {
-        await this.codex.resumeThread(reviewerThreadId, request.cwd, signal);
+        if (!reviewerThreadId) reviewerThreadId = await this.createReviewer(request, signal);
+        await this.resumeReviewer(reviewerThreadId, request.cwd, signal);
       } catch (error) {
-        // 1.1.2: a task THIS invocation just created, whose resume failed, is
-        // bound to nothing and owned by nobody — release its hold instead of
-        // leaving an orphaned subscription behind. A PRE-EXISTING Reviewer is
-        // deliberately NOT released: resume is what claims the subscription, so
-        // a failed resume must never decrement another review's hold.
-        if (created) await this.codex.unsubscribeThread(reviewerThreadId).catch(() => undefined);
+        // A task THIS invocation just created is bound to nothing and owned by
+        // nobody — release its hold instead of leaving an orphaned subscription
+        // behind. A PRE-EXISTING Reviewer is deliberately NOT released: resume
+        // is what claims the subscription, so a failed resume must never
+        // decrement another review's hold.
+        if (created && reviewerThreadId) await this.codex.unsubscribeThread(reviewerThreadId).catch(() => undefined);
+        if (error instanceof TransientRetryExhaustedError) {
+          this.interruptOrigins.delete(key);
+          return { kind: "retryable_busy", reason: error.reason };
+        }
         throw error;
       }
       this.trackThreadRef(reviewerThreadId, 1);

@@ -73,8 +73,18 @@ function nextReviewVerdict() {
 // flow never touches the source's writer.
 const sourceThreadForWriter = process.env.FAKE_CODEX_SOURCE_THREAD || "";
 const sourceHasActiveWriter = process.env.FAKE_CODEX_SOURCE_ACTIVE_WRITER === "1";
+// 1.1.3: a writer conflict that CLEARS after N blocked resumes, modelling the
+// real case where the user closes the Reviewer task they had open in Codex
+// Desktop. Requires FAKE_CODEX_SOURCE_THREAD to name the target task.
+let busyResumeAttempts = Number(process.env.FAKE_CODEX_BUSY_RESUME_ATTEMPTS || 0);
 function sourceBusy(threadId) {
-  return sourceHasActiveWriter && sourceThreadForWriter && threadId === sourceThreadForWriter;
+  if (!sourceThreadForWriter || threadId !== sourceThreadForWriter) return false;
+  if (sourceHasActiveWriter) return true;
+  if (busyResumeAttempts > 0) {
+    busyResumeAttempts -= 1;
+    return true;
+  }
+  return false;
 }
 
 // 1.1.2: model the real constraint that pushed Reviewer creation to the CLI in

@@ -15,16 +15,18 @@ The plugin never opens, refreshes, navigates, or focuses Codex Desktop after a r
 
 ## Requirements
 
-- DeepSeek Harness `0.1.5-rc.1` (minimum supported version; this release updates the host API baseline)
+- DeepSeek Harness `0.1.7-rc.2` (the verified host baseline; the declared peer range is `^0.1.7-rc.2`)
 - Node.js `^22.19.0` or `>=24`
 - Codex CLI with a valid ChatGPT login and App Server support (verified by `pnpm doctor`)
 
 ### Upgrading after a DSH update
 
-Version 1.1.0 targets DSH `0.1.5-rc.1` and newer compatible 0.1.x releases.
-Older DSH versions need the older plugin release. Source installs must refresh
-their local dependencies with `pnpm install --frozen-lockfile` and rebuild;
-upgrading the host alone does not update a linked plugin's `node_modules`.
+Version 1.1.3 is verified against DSH `0.1.7-rc.2` with cordis `4.0.4`: `pnpm host:check` loads the built plugin against the **operator's installed** core packages (isolated temp storage, no live profile/session/model) and additionally asserts the declared peer range with the host's own `evaluatePluginCompatibility`, so the claim is measured rather than assumed. Other 0.1.x versions are NOT verified by this repository.
+
+Two things matter when the host moves:
+
+- **The host judges the peer range itself.** At profile startup `dsh` checks every `@deepseek-ai/dsh*` peer against the running version and asks for an exact-version exemption when one is unsatisfied (`dsh plugin allow-version`). Its documented semantics let **prereleases participate in ranges**, so a range is not judged by plain npm semver — that is why the gate reuses the host's evaluator instead of re-implementing it. `pnpm doctor` reports the same verdict (SKIPPED, never passed, when no DSH profile exists), so `pnpm release:check` inherits it.
+- **Source installs must refresh their own dependencies.** `pnpm install` (plus `pnpm build`) after a host upgrade; upgrading `dsh` alone does not update a linked plugin's `node_modules`, and the plugin's `src` is type-checked against the versions pinned in its own `devDependencies`.
 
 Run `pnpm host:check` to load and unload the built plugin using the actual DSH
 core packages installed under `$DSH_HOME/profiles`. It checks that all eight
@@ -90,6 +92,14 @@ dedicated Reviewer task --codex exec --ephemeral --output-schema--> normalizatio
 ### Reviewer writer-lock semantics
 
 Before an App Server review turn, the plugin `thread/resume`s the dedicated Reviewer task (`reviewerThreadId` — always a dedicated, visible task since 1.1.2) and releases it again (`thread/unsubscribe`) when the operation settles; a legacy `exec` task is never resumed at all, it is only renamed with `thread/name/set`, which takes no writer lock. Idempotent cleanup only: the plugin does not re-subscribe for display, read/fork the task for rendering, or invoke the Desktop opener. The review remains on that Reviewer task; users open it manually when convenient. Legacy opener fields remain compatible but audit records keep `desktopOpenState: "disabled"`.
+
+**A visible Reviewer can be held by Codex Desktop — and that is retried (1.1.3).** Because the Reviewer task is now renderable, OPENING it in Desktop makes Desktop hold that task's writer lock, and the next round's `thread/resume` fails with `thread <id> already has an active writer` until the user closes it. The control RPCs (create, configure, resume, per-round settings refresh) therefore run under the same bounded transient policy as every visible turn: they back off and continue, a spent budget keeps the round RETRYABLE (no cycle, no `reviewContractFailures`; on the callback path `retryable_busy` plus the periodic recovery sweep), and cancel/teardown interrupts a pending backoff at once. The plugin never releases a lock it does not own: a FAILED `thread/resume` acquired nothing, and a successful resume whose settings refresh failed releases only the plugin's OWN subscription before backing off, so a retry can never be blocked by the plugin's own hold. Reviewer creation is retried on the SAME task id (`thread/start` runs once; a retry re-configures it), so a flaky settings/name call cannot leak one orphan task per attempt.
+
+### Host compatibility (1.1.3)
+
+DSH `0.1.7` replaced the shared catch-all `plugin` message source with a **merge-extensible sum type**: `MessageSourceMap` is augmented by each producer in its own module, and `MessageSource.kind` answers *who produced this* while `form` answers *what kind of thing it is* (the two axes are deliberately independent). There is no `plugin` kind to borrow any more.
+
+The plugin therefore declares its own kind in `src/message-source.ts` — exactly the way first-party producers such as `dsh-agent-instructions` do — and builds every injected message from it (`relaySource()` for a plan handoff / verdict / outcome, `noticeSource(summary)` for a one-off notice). A cast would have compiled, but it would have hidden the contract from the compiler and left the harness unable to attribute this plugin's context to a declared producer.
 
 ### Transient upstream failures are retried (1.1.1)
 

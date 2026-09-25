@@ -119,7 +119,7 @@ function makeAgent(id: string, cwd: string, followupThrows = 0, hangAfterFollowu
         throw new Error("session followup temporarily unavailable");
       }
       const first = message.content[0];
-      fake.followups.push({ text: first?.type === "text" ? first.text : "" });
+      fake.followups.push({ text: first?.type === "text" ? first.text : "", source: message.source });
       session.append("agent/inbox/spliced", { target: "next-turn", start: 0, inserted: [message] });
       if (hangAfterFollowup) fake.startActivity();
     },
@@ -271,6 +271,31 @@ test("dispatch routes to the exact explicit session and delivers one followup", 
     assert.equal(record?.bridgeRequestId, command.requestId);
     assert.equal(record?.phase, "executing");
     assert.equal(record?.plannerThreadId, undefined);
+  } finally {
+    await h.runtime.stop();
+    await rmClosed(h.directory);
+  }
+});
+
+/**
+ * 1.1.3 (DSH 0.1.7 adaptation): the shared catch-all `plugin` message source is
+ * gone — every producer augments `MessageSourceMap` in its own module. The
+ * messages this plugin injects must therefore carry its OWN declared kind and the
+ * `form` the host presents them as, instead of an undeclared source.
+ */
+test("1.1.3: injected relay messages declare this plugin's own message source", async () => {
+  const h = await harness();
+  try {
+    const target = makeAgent("session-source-kind", "C:\\work");
+    h.registry.register(target);
+    h.runtime.start();
+    const command = dispatch({ target: { dshSessionId: "session-source-kind", cwd: "C:\\work" } });
+    await h.store.enqueue(command);
+    const receipt = await waitForReceipt(h.store, command.requestId);
+    assert.equal(receipt.status, "delivered");
+    assert.equal(target.followups.length, 1);
+    assert.deepEqual(target.followups[0]!.source, { kind: "dsh-codex-workflow", form: "relay" },
+      "the plan handoff is a declared relay from this plugin, never an undeclared `plugin` source");
   } finally {
     await h.runtime.stop();
     await rmClosed(h.directory);

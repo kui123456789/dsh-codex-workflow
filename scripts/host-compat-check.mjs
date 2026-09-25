@@ -1,6 +1,13 @@
 #!/usr/bin/env node
 // Load the built plugin against the operator's installed DSH core packages.
 // No live profile, session, model, port, or user storage is started or modified.
+//
+// It also answers the question the HOST asks at profile startup: does this
+// plugin's declared @deepseek-ai/dsh* peer range cover the installed runtime? The
+// answer comes from the host's OWN evaluator (`evaluatePluginCompatibility`, the
+// same code path that asks the user for an exact-version exemption), so this gate
+// can never drift from real host behaviour. Note its documented semantics:
+// prereleases PARTICIPATE in ranges — plain npm semver would misjudge them.
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
@@ -34,8 +41,24 @@ try {
   for (const name of names) assert.ok(ctx.tools.get(name), `${name} missing after activation`);
   await fiber.dispose();
   for (const name of names) assert.equal(ctx.tools.get(name), undefined, `${name} survived unload`);
+
+  // Peer range vs. the installed runtime, judged by the host itself.
+  const boot = await import(pathToFileURL(profileRequire.resolve("@deepseek-ai/dsh-app-boot")).href);
+  const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  const runtimeVersion = boot.getDshRuntimeVersion();
+  assert.equal(runtimeVersion, hostVersion,
+    `the profile's dsh package.json (${hostVersion}) disagrees with the host runtime version (${runtimeVersion})`);
+  const incompatibility = boot.evaluatePluginCompatibility(manifest, undefined, runtimeVersion);
+  assert.equal(incompatibility, undefined,
+    `declared DSH peer range does not cover the running dsh ${runtimeVersion}: `
+    + `${incompatibility ? boot.pluginCompatibilityWarning(incompatibility) : ""}`);
+  const peers = Object.entries(manifest.peerDependencies ?? {})
+    .filter(([name]) => name.startsWith("@deepseek-ai/"))
+    .map(([name, range]) => `${name}@${range}`);
+
   console.log(JSON.stringify({ ok: true, hostVersion, pluginVersion: plugin.PLUGIN_VERSION,
-    toolsRegistered: names.length, unloaded: true, storage: "isolated-temp" }, null, 2));
+    toolsRegistered: names.length, unloaded: true, storage: "isolated-temp",
+    peerCompatible: true, declaredPeers: peers }, null, 2));
 } finally {
   await ctx.fiber.dispose();
   await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });

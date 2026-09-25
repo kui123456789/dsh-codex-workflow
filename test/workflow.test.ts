@@ -121,6 +121,13 @@ class FakeGateway implements CodexGateway {
 
   async resumeThread(threadId: string): Promise<void> {
     this.resumeCalls.push(threadId);
+    if (this.resumeConflicts > 0) {
+      // 1.1.3: a foreign writer (Codex Desktop holding an OPEN, now visible
+      // Reviewer task) is transient — the lock disappears when the user closes
+      // the task.
+      this.resumeConflicts -= 1;
+      throw new Error(`thread-store conflict: thread ${threadId} already has an active writer`);
+    }
   }
 
   async releaseThreadForExternal(threadId: string): Promise<void> {
@@ -130,6 +137,13 @@ class FakeGateway implements CodexGateway {
   /** Thread ids resumed by the manager (start/continue/review flows). */
   resumeCalls: string[] = [];
 
+  /** 1.1.3: N first `resumeThread` calls fail with a transient writer conflict. */
+  resumeConflicts = 0;
+  /** 1.1.3: N first `configureReviewerThread` calls fail transiently. */
+  configureFailures = 0;
+  /** 1.1.3: reviewer configurations (settings + name) of an existing task. */
+  configureCalls: Array<{ threadId: string; name: string }> = [];
+
   async startReviewerThread(options: { cwd: string; name: string; model?: string; developerInstructions?: string }): Promise<string> {
     this.reviewerThreadCalls.push({
       name: options.name,
@@ -137,6 +151,20 @@ class FakeGateway implements CodexGateway {
       ...(options.developerInstructions ? { developerInstructions: options.developerInstructions } : {}),
     });
     return "reviewer-thread";
+  }
+
+  /** 1.1.3: `thread/start` alone — the durable id every retry reuses. */
+  async startReviewerThreadShell(options: { cwd: string; name: string; model?: string; developerInstructions?: string }): Promise<string> {
+    return this.startReviewerThread(options);
+  }
+
+  /** 1.1.3: settings + name of an existing task (idempotent, retryable). */
+  async configureReviewerThread(threadId: string, options: { cwd: string; name: string }): Promise<void> {
+    if (this.configureFailures > 0) {
+      this.configureFailures -= 1;
+      throw new Error("Selected model is at capacity. Please try a different model.");
+    }
+    this.configureCalls.push({ threadId, name: options.name });
   }
 
   async updateReviewerInstructions(threadId: string, cwd: string, instructions: string): Promise<void> {
@@ -2442,6 +2470,9 @@ test("review-only reviewer-thread creation failure is retryable and records the 
     const gateway = new FakeGateway();
     const failing = new Proxy(gateway, {
       get(target, property, receiver) {
+        // 1.1.3: creation fails at the FIRST step (`thread/start`), which the
+        // manager calls through the split shell when the gateway provides it.
+        if (property === "startReviewerThreadShell") return async () => { throw new Error("boom"); };
         if (property === "startReviewerThread") return async () => { throw new Error("boom"); };
         const value = Reflect.get(target, property, receiver);
         return typeof value === "function" ? value.bind(target) : value;
@@ -2658,6 +2689,8 @@ test("review-only Reviewer thread creation failure keeps a retryable record", as
     const gateway = new FakeGateway();
     const failing = new Proxy(gateway, {
       get(target, property, receiver) {
+        // 1.1.3: the gateway can create NO Reviewer task at all (see above).
+        if (property === "startReviewerThreadShell") return async () => { throw new Error("no thread"); };
         if (property === "startReviewerThread") return async () => { throw new Error("no thread"); };
         const value = Reflect.get(target, property, receiver);
         return typeof value === "function" ? value.bind(target) : value;
@@ -3021,7 +3054,164 @@ test("1.1.2: a failing ephemeral CLI conversion keeps the visible Reviewer bound
   } finally { await rmClosed(directory); }
 });
 
-test("cancel during first visible Reviewer creation cannot bind or apply a late result", async () => {  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-cli-create-cancel-"));
+/**
+ * 1.1.3: a Reviewer task is now VISIBLE in Codex Desktop, so a user simply
+ * reading it makes Desktop hold that task's writer lock and `thread/resume`
+ * fail with `already has an active writer`. That is a temporary condition, so
+ * the control RPC must back off and continue — the 1.1.1 CLI path retried
+ * exactly this, and the App Server path may not be weaker.
+ */
+test("1.1.3: a transient writer conflict on the bound Reviewer is retried and the round completes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-writer-retry-"));
+  try {
+    const gateway = new FakeGateway();
+    gateway.reviewResults = [{ verdict: "pass", findings: [], testGaps: [], summary: "ok" }];
+    const instance = manager(directory, gateway, {}, undefined, undefined, undefined, {
+      sleep: async () => undefined,
+      random: () => 0.5,
+    });
+    const exec = fakeExec("session-writer-retry", directory, []);
+    const planned = await instance.start({ task: "Build it" }, exec);
+    const store = new WorkflowStore(directory);
+    // The Reviewer is already bound (1.1.2 layout) and the user has it OPEN in
+    // Codex Desktop, which holds its writer lock for the first attempt.
+    await store.update(planned.id, (r) => {
+      r.reviewerThreadId = "reviewer-thread";
+      r.reviewerThreadOrigin = "app-server";
+    }, { ignoreCancelled: false });
+    gateway.resumeConflicts = 1;
+    const reviewed = await instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.ts"] }, exec);
+    assert.equal(reviewed.phase, "passed", "the round completes after the conflict clears");
+    assert.equal(reviewed.reviewCycles, 1, "the backoff is not an extra review cycle");
+    assert.equal(gateway.resumeCalls.filter((id) => id === "reviewer-thread").length, 2,
+      "the resume was attempted twice on the SAME Reviewer task");
+    assert.equal(gateway.reviewerThreadCalls.length, 0, "the bound Reviewer is reused, never replaced");
+    assert.ok(!gateway.resumeCalls.includes("planner-thread"), "the Planner task is never resumed");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("1.1.3: a writer conflict that never clears keeps the round retryable with no cycle and no contract failure", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-writer-exhausted-"));
+  try {
+    const gateway = new FakeGateway();
+    const instance = manager(directory, gateway, {}, undefined, undefined, undefined, {
+      sleep: async () => undefined,
+      random: () => 0.5,
+      // Every clock read advances two minutes, so the 20-minute budget is spent
+      // after a couple of attempts instead of spinning for real time.
+      now: (() => { let clock = 0; return () => (clock += 120_000); })(),
+    });
+    const exec = fakeExec("session-writer-exhausted", directory, []);
+    const planned = await instance.start({ task: "Build it" }, exec);
+    const store = new WorkflowStore(directory);
+    await store.update(planned.id, (r) => {
+      r.reviewerThreadId = "reviewer-thread";
+      r.reviewerThreadOrigin = "app-server";
+    }, { ignoreCancelled: false });
+    gateway.resumeConflicts = 10_000;
+    await assert.rejects(
+      instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.ts"] }, exec),
+      /retry budget/,
+    );
+    const record = (await store.load(planned.id))!;
+    assert.equal(record.phase, "executing", "a spent retry budget stays retryable");
+    assert.equal(record.reviewCycles, 0, "no cycle is consumed");
+    assert.equal(record.reviewContractFailures, 0, "a writer conflict is infrastructure, never a contract failure");
+    assert.equal(record.reviewerThreadId, "reviewer-thread", "the Reviewer identity is untouched");
+    assert.deepEqual(gateway.releasedThreads, [], "a FAILED resume acquired nothing, so nothing is released");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("1.1.3: cancel during the writer-conflict backoff ends the round immediately", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-writer-cancel-"));
+  try {
+    const gateway = new FakeGateway();
+    const controller = new AbortController();
+    const instance = manager(directory, gateway, {}, undefined, undefined, undefined, {
+      // The FIRST backoff is where the cancel lands: the sleep aborts the run
+      // and the loop must reject at once instead of waiting out the delay.
+      sleep: async () => { controller.abort(new Error("cancelled by user")); },
+      random: () => 0.5,
+    });
+    const exec = fakeExec("session-writer-cancel", directory, []);
+    const planned = await instance.start({ task: "Build it" }, exec);
+    const store = new WorkflowStore(directory);
+    await store.update(planned.id, (r) => {
+      r.reviewerThreadId = "reviewer-thread";
+      r.reviewerThreadOrigin = "app-server";
+    }, { ignoreCancelled: false });
+    gateway.resumeConflicts = 10_000;
+    await assert.rejects(
+      instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.ts"] }, {
+        ...exec,
+        signal: controller.signal,
+      }),
+      /cancelled by user/,
+    );
+    const record = (await store.load(planned.id))!;
+    assert.equal(record.phase, "executing", "a cancelled backoff returns to the retryable phase");
+    assert.equal(record.reviewCycles, 0);
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("1.1.3: a transient failure while configuring a created Reviewer retries the SAME task", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-config-retry-"));
+  try {
+    const gateway = new FakeGateway();
+    gateway.reviewResults = [{ verdict: "pass", findings: [], testGaps: [], summary: "ok" }];
+    gateway.configureFailures = 1;
+    const instance = manager(directory, gateway, {}, undefined, undefined, undefined, {
+      sleep: async () => undefined,
+      random: () => 0.5,
+    });
+    const exec = fakeExec("session-config-retry", directory, []);
+    await changedFile(directory);
+    const reviewed = await instance.reviewOnly({ implementationSummary: "Changed", changedFiles: ["a.txt"] }, exec);
+    assert.equal(reviewed.phase, "passed");
+    assert.equal(gateway.reviewerThreadCalls.length, 1, "`thread/start` ran exactly ONCE");
+    assert.deepEqual(gateway.configureCalls.map((call) => call.threadId), ["reviewer-thread"],
+      "the retry configured the SAME task instead of leaking an orphan");
+    assert.deepEqual(gateway.releasedThreads, [], "a retried configuration releases nothing");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("1.1.3: a configuration that never succeeds releases the created Reviewer and stays retryable", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-config-exhausted-"));
+  try {
+    const gateway = new FakeGateway();
+    gateway.configureFailures = 10_000;
+    const instance = manager(directory, gateway, {}, undefined, undefined, undefined, {
+      sleep: async () => undefined,
+      random: () => 0.5,
+      now: (() => { let clock = 0; return () => (clock += 120_000); })(),
+    });
+    const exec = fakeExec("session-config-exhausted", directory, []);
+    await changedFile(directory);
+    await assert.rejects(
+      instance.reviewOnly({ implementationSummary: "Changed", changedFiles: ["a.txt"] }, exec),
+      /retry budget/,
+    );
+    const [record] = await new WorkflowStore(directory).list();
+    assert.equal(record?.phase, "executing", "the workflow stays retryable");
+    assert.equal(record?.reviewerThreadId, undefined, "nothing is bound to a half-configured task");
+    assert.equal(record?.reviewCycles, 0);
+    assert.deepEqual(gateway.releasedThreads, ["reviewer-thread"],
+      "the unbound created task is released instead of leaking its subscription");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("cancel during first visible Reviewer creation cannot bind or apply a late result", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-cli-create-cancel-"));
   try {
     const gateway = new FakeGateway();
     const store = new WorkflowStore(directory);

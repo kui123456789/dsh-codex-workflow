@@ -161,6 +161,89 @@ test("a NEWLY created Reviewer whose resume fails is released; a pre-existing on
   }
 });
 
+/**
+ * 1.1.3: since the Reviewer task is visible in Codex Desktop, a user reading it
+ * makes Desktop hold its writer lock. The callback must back off through that
+ * conflict (1.1.1 parity) and only give up — as RETRYABLE, never terminal —
+ * when the budget is spent.
+ */
+test("1.1.3: a writer conflict on the Reviewer is retried, and a spent budget stays retryable", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-app-server-callback-writer-"));
+  const marker = join(directory, "calls.jsonl");
+  const readCalls = async () => (await readFile(marker, "utf8")).trim().split("\n").filter(Boolean)
+    .map((line) => JSON.parse(line) as { method: string; params: Record<string, any> });
+  const request = {
+    workflowId: "workflow-writer",
+    submissionId: "submission-writer",
+    codexThreadId: "origin-task-writer",
+    reviewerThreadId: "existing-reviewer-1",
+    cwd: directory,
+    prompt: "Review this implementation.",
+  };
+  // (a) the conflict CLEARS after the first blocked resume (the user closed the
+  // task): the review continues normally.
+  const clearing = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: {
+      ...process.env,
+      FAKE_CODEX_THREAD_PARAMS_MARKER: marker,
+      FAKE_CODEX_SOURCE_THREAD: "existing-reviewer-1",
+      FAKE_CODEX_BUSY_RESUME_ATTEMPTS: "1",
+      FAKE_CODEX_PLAIN_REVIEW_MARKDOWN: "1",
+      FAKE_CODEX_REVIEW_VERDICT: JSON.stringify({ verdict: "pass", findings: [], testGaps: [], summary: "ok" }),
+    },
+  });
+  try {
+    const callback = new AppServerCodexCallbackDispatcher(clearing, {
+      hooks: { sleep: async () => undefined, random: () => 0.5 },
+    });
+    const outcome = await callback.send(request);
+    assert.equal(outcome.kind, "verdict", "the review completes once the writer lock is gone");
+    const calls = await readCalls();
+    assert.equal(calls.filter((call) => call.method === "thread/resume").length, 2,
+      "the resume was retried on the SAME Reviewer task");
+    assert.equal(calls.filter((call) => call.method === "thread/start").length, 0, "no task is created for a bound Reviewer");
+    assert.equal(calls.filter((call) => call.params.threadId === request.codexThreadId).length, 0,
+      "the origin task is still never touched");
+  } finally {
+    await clearing.stop();
+  }
+
+  // (b) the conflict NEVER clears: the submission stays retryable with the
+  // transient reason, and the pre-existing Reviewer is never released.
+  await rm(marker, { force: true });
+  const stuck = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: {
+      ...process.env,
+      FAKE_CODEX_THREAD_PARAMS_MARKER: marker,
+      FAKE_CODEX_SOURCE_THREAD: "existing-reviewer-1",
+      FAKE_CODEX_SOURCE_ACTIVE_WRITER: "1",
+    },
+  });
+  try {
+    const callback = new AppServerCodexCallbackDispatcher(stuck, {
+      policy: { budgetMs: 120_000 },
+      hooks: { sleep: async () => undefined, random: () => 0.5, now: (() => { let clock = 0; return () => (clock += 60_000); })() },
+    });
+    const outcome = await callback.send({ ...request, submissionId: "submission-writer-2" });
+    assert.deepEqual(outcome, { kind: "retryable_busy", reason: "active writer" });
+    const calls = await readCalls();
+    assert.equal(calls.filter((call) => call.method === "thread/unsubscribe").length, 0,
+      "a PRE-EXISTING Reviewer is never released by a failed resume");
+    assert.ok(calls.filter((call) => call.method === "thread/resume").length >= 2, "the conflict was retried");
+  } finally {
+    await stuck.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("creates and reuses a dedicated Reviewer task for every background review, never touching the origin task", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-app-server-callback-"));
   const marker = join(directory, "calls.jsonl");

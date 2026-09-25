@@ -449,7 +449,11 @@ export class CodexAppServerClient {
    * step (settings update or naming) fails, the half-configured review-only
    * thread is unsubscribed here before the error propagates — it must never
    * be left holding a writer lock, even when `idleProcessMs` is 0. */
-  async startReviewerThread(options: ReviewerStartOptions, signal?: AbortSignal): Promise<string> {
+  /** 1.1.3: `thread/start` ALONE. The returned id is durable, so a caller that
+   * retries a failed CONFIGURATION reuses the SAME task — retrying the whole
+   * creation would leave one orphan, named-less task in the Codex store per
+   * attempt. */
+  async startReviewerThreadShell(options: ReviewerStartOptions, signal?: AbortSignal): Promise<string> {
     const params: JsonObject = {
       cwd: options.cwd,
       runtimeWorkspaceRoots: [options.cwd],
@@ -462,16 +466,27 @@ export class CodexAppServerClient {
     if (options.model) params.model = options.model;
     const response = await this.request<JsonObject>("thread/start", params, signal);
     const thread = object(response.thread);
-    const threadId = string(thread.id, "thread/start result.thread.id");
+    return string(thread.id, "thread/start result.thread.id");
+  }
+
+  /** 1.1.3: settings + display name of an already created Reviewer task. Both
+   * requests are idempotent on a given task id, so a caller may retry them
+   * without creating a second task. */
+  async configureReviewerThread(threadId: string, options: ReviewerStartOptions, signal?: AbortSignal): Promise<void> {
+    await this.request("thread/settings/update", {
+      threadId,
+      cwd: options.cwd,
+      approvalPolicy: "never",
+      sandboxPolicy: { type: "readOnly", networkAccess: false },
+      ...(options.developerInstructions ? { developerInstructions: options.developerInstructions } : {}),
+    }, signal);
+    await this.request("thread/name/set", { threadId, name: options.name }, signal);
+  }
+
+  async startReviewerThread(options: ReviewerStartOptions, signal?: AbortSignal): Promise<string> {
+    const threadId = await this.startReviewerThreadShell(options, signal);
     try {
-      await this.request("thread/settings/update", {
-        threadId,
-        cwd: options.cwd,
-        approvalPolicy: "never",
-        sandboxPolicy: { type: "readOnly", networkAccess: false },
-        ...(options.developerInstructions ? { developerInstructions: options.developerInstructions } : {}),
-      }, signal);
-      await this.request("thread/name/set", { threadId, name: options.name }, signal);
+      await this.configureReviewerThread(threadId, options, signal);
     } catch (error) {
       // Best-effort release of the orphaned subscription; never mask the
       // original setup failure. No signal is passed so an aborted caller still

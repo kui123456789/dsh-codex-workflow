@@ -14,7 +14,7 @@
 // probe + read-only real-DB probe); the only real-home write is the one-time
 // legacy probe cleanup for OUR OWN exact "ok" file.
 import crossSpawn from "cross-spawn";
-import { access, rm } from "node:fs/promises";
+import { access, readFile, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -153,7 +153,33 @@ if (legacy.deleted) {
   check("doctor leaves no residue in the real DSH_HOME", true);
 }
 
-// 5) The app-server talks to the installed CLI (online-only). The import is
+// 5) DSH host compatibility (offline-safe: reads the installed profile only).
+// The host checks this plugin's declared @deepseek-ai/dsh* peer range at profile
+// startup and asks the user for an exact-version exemption when it does not
+// cover the runtime, so the release gate must know BEFORE publishing. The verdict
+// comes from the host's OWN evaluator, whose documented semantics let
+// prereleases participate in ranges (plain npm semver would misjudge them).
+// Skipped — never falsely passed — when no DSH profile is installed (CI).
+try {
+  const { createRequire } = await import("node:module");
+  const { pathToFileURL } = await import("node:url");
+  const profileRequire = createRequire(join(dshHome, "profiles", "package.json"));
+  const boot = await import(pathToFileURL(profileRequire.resolve("@deepseek-ai/dsh-app-boot")).href);
+  const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  const runtimeVersion = boot.getDshRuntimeVersion();
+  const incompatibility = boot.evaluatePluginCompatibility(manifest, undefined, runtimeVersion);
+  check(
+    "plugin dsh peer range covers the installed runtime",
+    !incompatibility,
+    incompatibility
+      ? `dsh ${runtimeVersion}: ${Object.entries(incompatibility.peers).map(([name, range]) => `${name}@${range}`).join(", ")} not satisfied — widen the declared range or the host will demand a manual exemption`
+      : `dsh ${runtimeVersion}`,
+  );
+} catch (error) {
+  skip("plugin dsh peer range covers the installed runtime", `skipped: no installed DSH profile to evaluate against (${error instanceof Error ? error.message : String(error)})`);
+}
+
+// 6) The app-server talks to the installed CLI (online-only). The import is
 // lazy so --offline does not even need a built lib/.
 if (!offline) {
   let client;

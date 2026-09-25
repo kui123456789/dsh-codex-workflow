@@ -67,7 +67,17 @@ export async function apply(ctx: Context, raw: Config): Promise<void> {
     // cannot render. The CLI dispatcher stays injected as the AUDIT gateway for
     // the internal normalize/align/reconcile conversions only — those run
     // `--ephemeral` and create no durable task.
-    const callback = new AppServerCodexCallbackDispatcher(codex);
+    const callback = new AppServerCodexCallbackDispatcher(codex, {
+      // 1.1.3: the same bounded transient policy the manager uses, so a control
+      // RPC blocked by a writer lock (a Reviewer task open in Codex Desktop)
+      // backs off instead of failing the submission immediately.
+      policy: {
+        baseMs: config.transientRetryBaseMs,
+        maxMs: config.transientRetryMaxMs,
+        budgetMs: config.transientRetryBudgetMs,
+        jitterRatio: config.transientRetryJitterRatio,
+      },
+    });
     const manager = new WorkflowManager(store, codex, config, callback, bridgeStore, audit);
     const autoTriggerDisposer = registerAutoTriggerPrompt(ctx.systemPrompt, config.autoTriggerMode);
     const runtime = new BridgeRuntime(bridgeStore, ctx.agents, {

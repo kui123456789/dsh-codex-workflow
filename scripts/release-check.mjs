@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Release check for dsh-codex-workflow 1.1.2.
+// Release check for dsh-codex-workflow 1.1.3.
 //
 // A repeatable, OFFLINE gate (no Codex login, no real DSH_HOME):
 //   1. verify      : typecheck + full test suite + build
@@ -61,6 +61,16 @@ report("bundle defaults autonomous trigger to complex", /^\s*autoTriggerMode:\s*
   "cordis.patch.yml does not set autoTriggerMode: complex");
 report("system-prompt peer dependency is declared", typeof packageJson.peerDependencies?.["@deepseek-ai/dsh-system-prompt"] === "string",
   "package.json has no @deepseek-ai/dsh-system-prompt peer dependency");
+// 1.1.3: every DSH peer range must describe the version the plugin is actually
+// developed and type-checked against (its pinned devDependency), otherwise the
+// declared contract silently drifts from the verified baseline. The HOST judges
+// the range itself at profile startup; this keeps our two declarations in step
+// (the runtime verdict is checked by `pnpm host:check` and `pnpm doctor`).
+const dshPeerDrift = Object.entries(packageJson.peerDependencies ?? {})
+  .filter(([name]) => name.startsWith("@deepseek-ai/dsh"))
+  .filter(([name, range]) => range !== `^${packageJson.devDependencies?.[name]}`);
+report("every dsh peer range matches its pinned dev dependency", dshPeerDrift.length === 0,
+  dshPeerDrift.map(([name, range]) => `${name} peer ${range} != ^${packageJson.devDependencies?.[name]}`).join(", "));
 
 // 1.1.2 VISIBILITY CONTRACT. `source` is fixed by the creation path, and Codex
 // Desktop's sidebar (`thread/list`) only returns `source='vscode'` tasks, which

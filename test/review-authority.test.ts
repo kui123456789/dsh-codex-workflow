@@ -904,6 +904,78 @@ test("preservation check rejects duplicate-count changes and unauthorized additi
   assert.match(reconciliationPreservationViolation(mixedVerdict, findingConflict, unauthorizedFinding) ?? "", /unauthorized finding/);
 });
 
+/** 1.1.3 (problem B is judged CORRECT and stays fail-closed): the preservation
+ * check must be exact about WHICH entry a conflict authorizes dropping —
+ * adjacent indexes, the finding/test-gap boundary, and duplicates of a required
+ * entry are the cases where a sloppy check would silently lose a real review
+ * entry (or block a faithful rewrite). */
+test("preservation check: conflict indexes are exact — adjacent entries, the finding/testGap boundary and duplicates", () => {
+  const finding = (title: string): ReviewResult["findings"][number] => ({
+    severity: "high",
+    blocking: true,
+    title,
+    body: `${title} 的具体证据`,
+    file: "src/a.ts",
+    line: 1,
+  });
+  const original: ReviewResult = {
+    verdict: "changes_requested",
+    findings: [finding("A"), finding("B"), finding("C")],
+    testGaps: [],
+    summary: "",
+  };
+  const middle: ReviewConflictEntry[] = [{ kind: "finding", index: 1, reason: "r", violated: "v", highSeverityException: false }];
+  // Dropping ONLY the conflicted middle entry is faithful.
+  assert.equal(
+    reconciliationPreservationViolation(original, middle, { ...original, findings: [finding("A"), finding("C")] }),
+    undefined,
+  );
+  // The ADJACENT entries are still required: index proximity must not widen the licence.
+  assert.match(
+    reconciliationPreservationViolation(original, middle, { ...original, findings: [finding("C")] }) ?? "",
+    /dropped a non-conflicting finding "A"/,
+  );
+  assert.match(
+    reconciliationPreservationViolation(original, middle, { ...original, findings: [finding("A")] }) ?? "",
+    /dropped a non-conflicting finding "C"/,
+  );
+
+  // A `finding` conflict never authorizes dropping a test gap (and vice versa).
+  const boundary: ReviewResult = {
+    verdict: "changes_requested",
+    findings: [finding("only")],
+    testGaps: ["必须保留的缺口"],
+    summary: "",
+  };
+  const empty: ReviewResult = { verdict: "changes_requested", findings: [], testGaps: [], summary: "" };
+  assert.match(
+    reconciliationPreservationViolation(boundary, [{ kind: "finding", index: 0, reason: "r", violated: "v", highSeverityException: false }], empty) ?? "",
+    /dropped a non-conflicting test gap "必须保留的缺口"/,
+  );
+  assert.match(
+    reconciliationPreservationViolation(boundary, [{ kind: "testGap", index: 0, reason: "r", violated: "v", highSeverityException: false }], empty) ?? "",
+    /dropped a non-conflicting finding "only"/,
+  );
+
+  // Duplicates are a MULTISET: with two identical findings and only the second
+  // listed as a conflict, exactly one copy must survive.
+  const duplicated: ReviewResult = {
+    verdict: "changes_requested",
+    findings: [finding("D"), finding("D")],
+    testGaps: [],
+    summary: "",
+  };
+  const secondOnly: ReviewConflictEntry[] = [{ kind: "finding", index: 1, reason: "r", violated: "v", highSeverityException: false }];
+  assert.equal(
+    reconciliationPreservationViolation(duplicated, secondOnly, { ...duplicated, findings: [finding("D")] }),
+    undefined,
+  );
+  assert.match(
+    reconciliationPreservationViolation(duplicated, secondOnly, { ...duplicated, findings: [] }) ?? "",
+    /dropped a non-conflicting finding "D"/,
+  );
+});
+
 test("DSH-led: a reconciliation that DROPS a real non-conflicting finding is a hardened failure (retryable, no cycle, no verdict)", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-authority-preserve-"));
   const gateway = new AuthorityGateway();
