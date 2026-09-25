@@ -38,9 +38,28 @@ Run `pnpm release:check` twice in a row and confirm:
      then restore `complex`;
    - while one workflow is active, send another qualifying request and confirm
      no second WorkflowRecord or Planner task is created.
-3. In a throwaway workspace with a scratch `CODEX_THREAD_ID`:
-   - run `pnpm lifecycle:accept`; it uses low reasoning and a 600-second turn
-     timeout by default. When the account's default model is temporarily slow,
+3. **Current acceptance path (1.1.x).** The manual harnesses this step used to
+   name (`pnpm lifecycle:accept`, `pnpm review-only:accept`) were REMOVED: they
+   drove the pre-1.1.0 CLI-visible wiring and could no longer be trusted as
+   evidence. Run instead:
+   - `pnpm verify` and `pnpm release:check` (typecheck + the full suite + build +
+     offline doctor + pack audit + the static gates);
+   - `pnpm host:check` against the operator's installed DSH (it also asserts the
+     declared peer range with the host's own evaluator);
+   - one REAL review round (`codex_workflow_review_only`, or a DSH-led
+     `start` → `review`) and confirm: a dedicated Reviewer task is created with
+     `source='vscode'` and the name `DSH Reviewer: <workflowId>`, the verdict is
+     persisted, and the round RELEASES its subscription when it ends;
+   - one real bridge relay (Codex-led `dispatch` → `codex_workflow_submit`) and
+     confirm the verdict returns to the originating task exactly once.
+
+   The bullets below are the HISTORICAL pre-1.1.0 acceptance script — keep them
+   only as a record of what used to be asserted; several of them (single-task
+   history, `1.0.14`, `codex exec --json resume` reviewers) no longer describe
+   the plugin at all, because 1.1.0 made the Reviewer a dedicated task and 1.1.2
+   moved it to the App Server so it renders in Desktop.
+4. Historical script (pre-1.1.0, no longer runnable — kept for reference):
+   - the old harness used low reasoning and a 600-second turn timeout by default; When the account's default model is temporarily slow,
      pin an available model with `DSH_CODEX_LIFECYCLE_MODEL` rather than
      weakening any history/task-id assertion;
    - `dsh-codex-workflow sessions --cwd $PWD --json` lists the live session;

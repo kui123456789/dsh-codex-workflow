@@ -54,7 +54,7 @@ pnpm verify
 pnpm doctor
 ```
 
-`pnpm run lifecycle:accept` is a manual harness that requires a live Codex login. It still drives the PRE-1.1.0 CLI-visible wiring (`codex exec --json resume <existing-task>` for visible Reviewer turns, shared task ids) and has **not** been updated for the dedicated-Reviewer (1.1.0) or App-Server-visible (1.1.2) layout; it is not part of `pnpm verify` / `pnpm release:check` and must not be used as evidence for a current release. The offline gates are `pnpm verify` and `pnpm release:check`.
+The pre-1.1.0 manual harnesses (`pnpm lifecycle:accept`, `pnpm review-only:accept`) were REMOVED: they drove the legacy CLI-visible wiring, predated the dedicated-Reviewer and App-Server-visible layouts, and could no longer be trusted as acceptance evidence. The gates that replaced them are the automated ones above plus `pnpm host:check` and an independent review round.
 
 ## Codex-led flow (preferred)
 
@@ -147,7 +147,7 @@ The bridge never invents the source task id. `dispatch`/`respond` default `--cod
 
 Both `codex_workflow_review` and `codex_workflow_review_only` run the SAME pipeline: the visible review turn executes on the App Server — creating (and naming) the dedicated Reviewer task on the first round — while the structured conversion runs in an independent `codex exec --ephemeral` session. The Reviewer identity is persisted before the conversion, so a round that fails during review or conversion keeps the same task for the retry, and an existing task that cannot be loaded still fails instead of being silently replaced. The first round never has to resume an empty App Server task: the turn that creates the Reviewer also runs on it.
 
-`pnpm review-only:accept` is a manual, live-login harness for the legacy CLI-visible layout; like `lifecycle:accept` it predates the App-Server-visible Reviewer and is not part of the release gate — use `pnpm verify` and `pnpm release:check`.
+The legacy `pnpm review-only:accept` harness was removed with `pnpm lifecycle:accept` (see above); use the automated gates instead.
 
 In a DSH conversation:
 

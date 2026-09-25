@@ -15,7 +15,22 @@
 | 4 | Bridge Runtime 拆分 | queue-pump / session-router / delivery-coordinator / terminal-relay-guard；Bridge 依赖窄 port | ⏳ 未开始 |
 | 5 | CoordinationStore 拆分 | coordination-database / lease-repository / queue-repository / workflow-repository / live-session-repository / legacy-import；共享同一 SQLite 连接与事务 | ⏳ 未开始 |
 | 6 | 状态模型 v2 | `WorkflowRecord` 升 schemaVersion 2（identity/planning/execution/review/submission/bridge/desktop）+ 纯函数 v1→v2 迁移；迁移前备份 coord.sqlite；未知版本/损坏记录进入可诊断错误；对外 status/show/CLI/DSH tool 由 serializer 保持兼容 | ⏳ 未开始（风险最高） |
-| 7 | 测试与清理 | 先提取 fixture 再拆 suite；删除前做全仓引用检查；`lifecycle-acceptance.mjs` / `review-only-acceptance.mjs` 与两个无引用 fixture 待清理 | ⏳ 未开始 |
+| 7 | 测试与清理 | 先提取 fixture 再拆 suite；删除前做全仓引用检查；`lifecycle-acceptance.mjs` / `review-only-acceptance.mjs` 与两个无引用 fixture 待清理 | 🟡 清理已完成（见下）；suite 拆分未开始 |
+
+## 阶段 7（清理）— 已完成的部分
+
+**删除前做了全仓引用检查**（`src/`、`test/`、`scripts/`、`package.json`、README/CHANGELOG/docs），只删除**确定过时/无引用**的内容：
+
+| 删除项 | 引用证据 |
+|---|---|
+| `scripts/lifecycle-acceptance.mjs`（55 KB） | 仅 `package.json` 的 `lifecycle:accept` 脚本引用；该 harness 驱动 1.1.0 之前的 CLI 可见布局 |
+| `scripts/review-only-acceptance.mjs` | 仅 `package.json` 的 `review-only:accept` 脚本引用 |
+| `test/fixtures/e2e-low-effort.patch.yml` | 全仓**零引用** |
+| `test/fixtures/no-desktop.patch.yml` | 全仓**零引用** |
+
+同步更新了活跃入口：`package.json` 移除两个脚本；README 两处改为「这些手工 harness 已移除，改用自动化门禁 + 一轮真实审查」；`docs/release-checklist.md` 的验收步骤改为当前路径（`pnpm verify` / `pnpm release:check` / `pnpm host:check` + 一轮真实 `review_only` 或 DSH-led 审查 + 一次真实 bridge 中继），并把旧脚本内容明确标为历史记录。历史性文档（CHANGELOG 旧条目、带日期的取证文档）不改写。
+
+**未做**：测试套件拆分（先提取 fixture 再拆 suite）——留待后续阶段，避免与阶段 2–6 的模块边界同时变动。
 
 ## 阶段 1（ports / facades）— 已完成
 
