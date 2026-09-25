@@ -14,6 +14,7 @@ import { SystemDesktopThreadOpener, type DesktopThreadOpener } from "./desktop-t
 import { DeliveryCoordinator } from "./application/bridge/delivery-coordinator.js";
 import { QueuePump } from "./application/bridge/queue-pump.js";
 import { SessionRouter } from "./application/bridge/session-router.js";
+import { TerminalRelayGuard } from "./application/bridge/terminal-relay-guard.js";
 
 export interface AgentRegistryLike {
   get(id: string): Agent | undefined;
@@ -109,8 +110,7 @@ export class BridgeRuntime {
   private polling = false;
   private stopped = false;
   private stopPromise?: Promise<void>;
-  private readonly terminalRelayGuardControllers = new Set<AbortController>();
-  private readonly terminalRelayGuards = new Set<Promise<void>>();
+  private readonly terminalRelayGuard: TerminalRelayGuard;
   private readonly store: BridgeStore;
   private readonly agents: AgentRegistryLike;
   private readonly options: BridgeRuntimeOptions & {
@@ -146,6 +146,10 @@ export class BridgeRuntime {
     });
     this.sessionRouter = new SessionRouter({ refreshSessions: this.refreshSessionsInternal.bind(this) });
     this.deliveryCoordinator = new DeliveryCoordinator(options.manager);
+    this.terminalRelayGuard = new TerminalRelayGuard({
+      timeoutMs: this.options.terminalRelayTimeoutMs,
+      isStopped: () => this.stopped,
+    });
   }
 
   startInternal(): void {
@@ -185,7 +189,7 @@ export class BridgeRuntime {
 
   private async doStop(): Promise<void> {
     this.stopped = true;
-    for (const controller of this.terminalRelayGuardControllers) controller.abort();
+    await this.terminalRelayGuard.stop();
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
     if (this.sessionHeartbeat) clearInterval(this.sessionHeartbeat);
@@ -194,10 +198,8 @@ export class BridgeRuntime {
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
     }
     // A relay finishing concurrently with stop() sees `stopped` and cannot arm
-    // a new guard. Abort once more after the pump drains, then await every
-    // existing guard so no late timer can cancel a future user turn.
-    for (const controller of this.terminalRelayGuardControllers) controller.abort();
-    await Promise.allSettled([...this.terminalRelayGuards]);
+    // a new guard; the guard module drains any existing timers here.
+    await this.terminalRelayGuard.stop();
     // Await the WHOLE serialized refresh chain: any refresh that started before
     // stop() may still write this owner's rows, so it must settle BEFORE we
     // release them. A refresh queued after stop() sees `this.stopped` and
@@ -921,62 +923,7 @@ export class BridgeRuntime {
   }
 
   private startTerminalRelayGuard(agent: Agent, workflowId: string): void {
-    if (this.stopped || this.options.terminalRelayTimeoutMs <= 0) return;
-    const controller = new AbortController();
-    this.terminalRelayGuardControllers.add(controller);
-    let task: Promise<void>;
-    task = this.guardTerminalRelay(agent, workflowId, controller.signal)
-      .catch(() => undefined)
-      .finally(() => {
-        this.terminalRelayGuardControllers.delete(controller);
-        this.terminalRelayGuards.delete(task);
-      });
-    this.terminalRelayGuards.add(task);
-  }
-
-  private async guardTerminalRelay(agent: Agent, workflowId: string, signal: AbortSignal): Promise<void> {
-    let reachedIdle = false;
-    const idle = agent.whenIdle().then(
-      () => { reachedIdle = true; },
-      () => { reachedIdle = true; },
-    );
-    let timer: NodeJS.Timeout | undefined;
-    let onAbort: (() => void) | undefined;
-    const deadline = new Promise<"timeout" | "aborted">((resolvePromise) => {
-      timer = setTimeout(() => resolvePromise("timeout"), this.options.terminalRelayTimeoutMs);
-      timer.unref();
-      onAbort = () => resolvePromise("aborted");
-      signal.addEventListener("abort", onAbort, { once: true });
-    });
-    const outcome = await Promise.race([
-      idle.then(() => "idle" as const),
-      deadline,
-    ]);
-    if (timer) clearTimeout(timer);
-    if (onAbort) signal.removeEventListener("abort", onAbort);
-    if (outcome !== "timeout") return;
-
-    // Let an idle resolution already queued for this exact observed activity
-    // win before consulting the mutable status. Once `whenIdle()` resolves,
-    // this guard is permanently disarmed and cannot affect a later user turn.
-    await Promise.resolve();
-    if (reachedIdle || signal.aborted || this.stopped || agent.status !== "running") return;
-    agent.cancel(
-      {
-        kind: "hook",
-        reason: `dsh-codex-workflow terminal relay exceeded ${this.options.terminalRelayTimeoutMs}ms for workflow ${workflowId}`,
-      },
-      { keepInbox: true },
-    );
-    if (signal.aborted) return;
-    await Promise.race([
-      idle,
-      new Promise<void>((resolvePromise) => {
-        const abort = () => resolvePromise();
-        signal.addEventListener("abort", abort, { once: true });
-        void idle.finally(() => signal.removeEventListener("abort", abort));
-      }),
-    ]);
+    this.terminalRelayGuard.start(agent, workflowId);
   }
 
   private verdictRelayMessage(record: WorkflowRecord, messageId: MessageId): UserMessage {
