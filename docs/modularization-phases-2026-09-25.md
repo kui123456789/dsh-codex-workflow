@@ -61,6 +61,8 @@ thread-gateway、turn-gateway 和 reviewer-gateway 提供了稳定的进程传�
 Reviewer 生命周期现在通过 `src/application/app-server/reviewer-gateway.ts` 进入，
 覆盖创建、配置、恢复、重命名、释放和外部 handoff；Planner 线程恢复仍直接使用
 Codex client，避免把 Planner 和 Reviewer 的生命周期混在同一个 gateway 里。
+`thread-gateway.ts` 与 `turn-gateway.ts` 也已声明并覆盖各自的窄 port；下一步是把
+WorkflowManager/CallbackDispatcher 的具体调用逐个迁移到这些 gateway，去掉剩余 facade 依赖。
 
 ## 阶段 6（状态 envelope / migration core）— 当前提交
 
