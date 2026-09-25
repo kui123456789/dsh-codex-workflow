@@ -136,7 +136,7 @@ prune 属于 ops 编排，保留在 facade 不影响 repository 数据边界。
 - `e2a4c55`：`LifecycleExecution`，status/cancel/teardown 移入 application module。
 - `pnpm verify`：439 tests passed，typecheck/build 通过。
 - `pnpm release:check`：`RELEASE_CHECK_OK`，打包审计和 offline doctor 通过。
-- `pnpm host:check`：`ok=true`，DSH `0.1.7-rc.2`、插件 `1.1.5`、8 tools、卸载成功、peer compatible。
+- `pnpm host:check`：`ok=true`，DSH `0.1.7-rc.2`、插件 `1.1.6`、8 tools、卸载成功、peer compatible。
 
 仍明确保留在后续范围的只有 CoordinationStore 的 prune ops 编排，以及 WorkflowManager
 中少量外部 verdict 的 CAS delivery helpers；它们没有被用空壳 adapter 冒充完成，

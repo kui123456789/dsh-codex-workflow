@@ -1,6 +1,6 @@
-# Release checklist — dsh-codex-workflow 1.1.5
+# Release checklist — dsh-codex-workflow 1.1.6
 
-This is the operator checklist for shipping the CURRENT release (1.1.5; keep this line in sync with `package.json` on every release). It assumes the automated gates
+This is the operator checklist for shipping the CURRENT release (1.1.6; keep this line in sync with `package.json` on every release). It assumes the automated gates
 succeeded; this page is about the things automation cannot cover, plus the
 rollback story. It never authorizes touching user credentials or configuration
 outside `$DSH_HOME/storages/dsh-codex-workflow/`.
@@ -171,7 +171,7 @@ Run `pnpm release:check` twice in a row and confirm:
 - If the current release must be pulled: stop the plugin/dispatch traffic first, restore the
   package, and verify with `pnpm doctor` before resuming. Record database and
   log state are not modified by a version change (only by `prune --commit`).
-  Old workflow records need no migration (1.1.4/1.1.5 added only behavior; the
+  Old workflow records need no migration (1.1.4/1.1.5/1.1.6 added only behavior; the
   last schema-visible change was 1.0.10's OPTIONAL fields
   `reviewContractFailures`/`latestReviewConflict`, which old records default to
   0); records with a distinct `reviewerThreadId` continue using that task.
@@ -180,7 +180,7 @@ Run `pnpm release:check` twice in a row and confirm:
 
 - Do not push to user `$DSH_HOME` outside `storages/dsh-codex-workflow`.
 - Do not modify or rotate any credentials (this plugin never stores them).
-- Create the `v1.1.5` Git tag and corresponding GitHub Release only after all
+- Create the `v1.1.6` Git tag and corresponding GitHub Release only after all
   automated and real-environment checks pass.
 - Do not commit or touch `docs/research/` or `docs/superpowers/` (untracked).
 

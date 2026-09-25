@@ -2,6 +2,12 @@
 
 All notable changes to `dsh-codex-workflow`.
 
+## [1.1.6] - 2026-09-25
+
+- **Modular workflow architecture.** Planner, Review, Submission and Lifecycle execution now live in application modules with a single shared runtime-state owner; App Server, Bridge and Coordination SQL operations use narrow gateways and repositories.
+- **State and compatibility preserved.** Workflow schema v1→v2 serialization/migration, bridge wire contracts, DSH tools, CLI commands, cancellation, recovery and Reviewer cleanup behavior remain compatible.
+- **Verification:** 439 tests pass; `pnpm release:check` and `pnpm host:check` pass against DSH `0.1.7-rc.2`.
+
 ## [1.1.5] - 2026-09-25
 
 - **A freshly created Reviewer is no longer resumed — that resume is what broke EVERY bridge review on DSH 0.1.7.** The background submission callback created its dedicated Reviewer with `thread/start` and then immediately called `thread/resume` on it. `thread/resume` paginates the thread's history, and a task that has never run a turn has a **registered rollout path whose file does not exist yet**, so the App Server rejects it: `reviewer failed: invalid paginated history lineage for <threadId>: missing source rollout`. Reproduced twice on workflow `00a043f3` (two different Reviewer threads, `reviewStep: review_native_turn`, ~3.8 s, terminal — no cycle consumed). Evidence: `~/.codex/state_5.sqlite.threads` had the row with a `rollout_path`, while that file was absent on disk.
