@@ -130,8 +130,31 @@ class FakeGateway implements CodexGateway {
     }
   }
 
+  /** EXTERNAL handoff releases (`releaseThreadForExternal`): the idle-shutdown
+   * path that only the two CLI-resume sites may use — a per-round release must
+   * never appear here (1.1.4). */
   async releaseThreadForExternal(threadId: string): Promise<void> {
     this.releasedThreads.push(threadId);
+  }
+
+  /** 1.1.4: subscription-only releases (`thread/unsubscribe`). */
+  unsubscribedThreads: string[] = [];
+
+  /** Signals handed to `unsubscribeThread`. The release must never receive the
+   * business signal, or a cancelled round would abort its own cleanup. */
+  unsubscribeSignals: Array<AbortSignal | undefined> = [];
+
+  /** 1.1.4: N first `unsubscribeThread` calls fail (release is best-effort). */
+  unsubscribeFailures = 0;
+
+  async unsubscribeThread(threadId: string, signal?: AbortSignal): Promise<string> {
+    this.unsubscribeSignals.push(signal);
+    if (this.unsubscribeFailures > 0) {
+      this.unsubscribeFailures -= 1;
+      throw new Error("thread/unsubscribe temporarily unavailable");
+    }
+    this.unsubscribedThreads.push(threadId);
+    return "unsubscribed";
   }
 
   /** Thread ids resumed by the manager (start/continue/review flows). */
@@ -809,6 +832,10 @@ test("runs plan, repair, and review in the original DSH session", async () => {
     assert.deepEqual(gateway.reviewThreads, ["reviewer-thread", "reviewer-thread"]);
     assert.deepEqual(gateway.reviewStarts[0], { threadId: "reviewer-thread", detached: false });
     assert.deepEqual(gateway.reviewStarts[1], { threadId: "reviewer-thread", detached: false });
+    assert.deepEqual(gateway.unsubscribedThreads, ["reviewer-thread", "reviewer-thread"],
+      "each completed DSH-led review must release its Reviewer subscription before the next round");
+    assert.deepEqual(gateway.releasedThreads, [],
+      "a per-round release must NEVER take the external handoff (it idle-shuts the shared App Server)");
     assert.ok(!gateway.resumeCalls.includes("planner-thread"), "a review never resumes the Planner task");
     assert.ok(gateway.resumeCalls.includes("reviewer-thread"));
     assert.ok(deferred.length >= 3);
@@ -3121,6 +3148,7 @@ test("1.1.3: a writer conflict that never clears keeps the round retryable with 
     assert.equal(record.reviewContractFailures, 0, "a writer conflict is infrastructure, never a contract failure");
     assert.equal(record.reviewerThreadId, "reviewer-thread", "the Reviewer identity is untouched");
     assert.deepEqual(gateway.releasedThreads, [], "a FAILED resume acquired nothing, so nothing is released");
+    assert.deepEqual(gateway.unsubscribedThreads, [], "a FAILED resume acquired no subscription to release");
   } finally {
     await rmClosed(directory);
   }
@@ -3177,7 +3205,7 @@ test("1.1.3: a transient failure while configuring a created Reviewer retries th
     assert.equal(gateway.reviewerThreadCalls.length, 1, "`thread/start` ran exactly ONCE");
     assert.deepEqual(gateway.configureCalls.map((call) => call.threadId), ["reviewer-thread"],
       "the retry configured the SAME task instead of leaking an orphan");
-    assert.deepEqual(gateway.releasedThreads, [], "a retried configuration releases nothing");
+    assert.deepEqual(gateway.unsubscribedThreads, ["reviewer-thread"], "the completed review releases the created Reviewer");
   } finally {
     await rmClosed(directory);
   }
@@ -3203,11 +3231,236 @@ test("1.1.3: a configuration that never succeeds releases the created Reviewer a
     assert.equal(record?.phase, "executing", "the workflow stays retryable");
     assert.equal(record?.reviewerThreadId, undefined, "nothing is bound to a half-configured task");
     assert.equal(record?.reviewCycles, 0);
-    assert.deepEqual(gateway.releasedThreads, ["reviewer-thread"],
+    assert.deepEqual(gateway.unsubscribedThreads, ["reviewer-thread"],
       "the unbound created task is released instead of leaking its subscription");
   } finally {
     await rmClosed(directory);
   }
+});
+
+/**
+ * 1.1.4: the round's release must be a SUBSCRIPTION release. The external
+ * handoff (`releaseThreadForExternal`) ends in an `idleShutdown()` that detaches
+ * the child, clears its turn bookkeeping and closes its stdin, so using it per
+ * round could tear the SHARED App Server out from under a concurrent operation
+ * (a bridge callback turn, a planner turn). It stays only on the two paths that
+ * are really followed by an external CLI resume.
+ */
+test("1.1.4: a round releases its own subscription and never takes the external handoff path", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-release-path-"));
+  try {
+    const gateway = new FakeGateway();
+    gateway.reviewResults = [{ verdict: "pass", findings: [], testGaps: [], summary: "ok" }];
+    const controller = new AbortController();
+    const instance = manager(directory, gateway);
+    const exec = fakeExec("session-release-path", directory, []);
+    await changedFile(directory);
+    const reviewed = await instance.reviewOnly(
+      { implementationSummary: "Changed", changedFiles: ["changed.txt"] },
+      { ...exec, signal: controller.signal },
+    );
+    assert.equal(reviewed.phase, "passed");
+    assert.deepEqual(gateway.unsubscribedThreads, ["reviewer-thread"], "the round releases the subscription it took");
+    assert.deepEqual(gateway.releasedThreads, [], "the release never goes through the external handoff");
+    assert.deepEqual(gateway.unsubscribeSignals, [undefined],
+      "the release must not carry the business signal — an abort would cancel the cleanup itself");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("1.1.4: a round that FAILED after claiming the Reviewer still releases it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-release-failed-round-"));
+  try {
+    const gateway = new FlakyReviewGateway({ message: "codex thread 01a0 does not exist", times: 1 });
+    const instance = manager(directory, gateway, {}, undefined, undefined, undefined, {
+      sleep: async () => undefined,
+      random: () => 0.5,
+    });
+    const exec = fakeExec("session-release-failed-round", directory, []);
+    const planned = await instance.start({ task: "Build it" }, exec);
+    await assert.rejects(
+      instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.ts"] }, exec),
+      /turn failed/,
+    );
+    assert.deepEqual(gateway.unsubscribedThreads, ["reviewer-thread"],
+      "a failed round must not leave its Reviewer subscription behind");
+    assert.deepEqual(gateway.releasedThreads, []);
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("1.1.4: a failed release is survivable — the next round backs off through the hold it left", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-release-failure-"));
+  try {
+    const gateway = new FakeGateway();
+    gateway.unsubscribeFailures = 1;
+    gateway.reviewResults = [
+      { verdict: "changes_requested", findings: [{ severity: "high", blocking: true, title: "t", body: "b" }], testGaps: [], summary: "first" },
+      { verdict: "pass", findings: [], testGaps: [], summary: "second" },
+    ];
+    const instance = manager(directory, gateway, {}, undefined, undefined, undefined, {
+      sleep: async () => undefined,
+      random: () => 0.5,
+    });
+    const exec = fakeExec("session-release-failure", directory, []);
+    const planned = await instance.start({ task: "Build it" }, exec);
+    const first = await instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.txt"] }, exec);
+    assert.equal(first.phase, "fixing", "the round outcome is preserved when the cleanup fails");
+    assert.equal(first.latestReview?.summary, "first");
+    assert.deepEqual(gateway.unsubscribedThreads, [], "the failed release recorded no subscription release");
+    const persisted = (await new WorkflowStore(directory).load(planned.id))!;
+    assert.match(persisted.lastProgressMessage ?? "", /reviewer release failed/,
+      `a swallowed cleanup failure must still be visible on the round's terminal message (got ${JSON.stringify({ returned: first.lastProgressMessage, persisted: persisted.lastProgressMessage, state: persisted.processState })})`);
+    // The hold the failed release left behind blocks the NEXT resume exactly like
+    // a foreign writer would: the 1.1.3 control-RPC retry backs off through it.
+    gateway.resumeConflicts = 1;
+    await writeFile(join(directory, "second.txt"), "v2", "utf8");
+    const second = await instance.review(planned.id, { implementationSummary: "two", changedFiles: ["second.txt"] }, exec);
+    assert.equal(second.phase, "passed");
+    assert.deepEqual(gateway.unsubscribedThreads, ["reviewer-thread"],
+      "the next round releases the subscription the failed release left behind");
+    assert.doesNotMatch(second.lastProgressMessage ?? "", /reviewer release failed/,
+      "a successful release leaves no failure note behind");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("1.1.4: a gateway without thread/unsubscribe releases nothing instead of idle-shutting the shared App Server", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-release-narrow-"));
+  try {
+    const gateway = new FakeGateway();
+    gateway.reviewResults = [{ verdict: "pass", findings: [], testGaps: [], summary: "ok" }];
+    // The ONLY release API this gateway has is the external handoff, which ends in
+    // an idleShutdown() of the shared App Server. A round release must not use it.
+    // Shadow the PROTOTYPE method with an own `undefined` property: a plain
+    // `delete` would be a no-op and the inherited method would still be called.
+    Object.defineProperty(gateway, "unsubscribeThread", { value: undefined, configurable: true });
+    assert.equal(gateway.unsubscribeThread, undefined, "the gateway really has no subscription release API");
+    const instance = manager(directory, gateway);
+    const exec = fakeExec("session-release-narrow", directory, []);
+    await changedFile(directory);
+    const reviewed = await instance.reviewOnly({ implementationSummary: "Changed", changedFiles: ["changed.txt"] }, exec);
+    assert.equal(reviewed.phase, "passed", "the round outcome never depends on the release path");
+    assert.deepEqual(gateway.releasedThreads, [],
+      "the external handoff (idle shutdown) must never run for a round release");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("1.1.4: a round cancelled AFTER claiming the Reviewer still releases it, without a signal", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-release-cancel-"));
+  try {
+    const gateway = new FakeGateway();
+    const store = new WorkflowStore(directory);
+    const instance = manager(directory, gateway);
+    const exec = fakeExec("session-release-cancel", directory, []);
+    const planned = await instance.start({ task: "Build it" }, exec);
+    await store.update(planned.id, (r) => {
+      r.reviewerThreadId = "reviewer-thread";
+      r.reviewerThreadOrigin = "app-server";
+    }, { ignoreCancelled: false });
+    // Cancel while the visible review turn is running: the round HAS claimed the
+    // Reviewer, so the finally must still hand the subscription back.
+    const realStartReview = gateway.startReview.bind(gateway);
+    gateway.startReview = async (options) => {
+      await instance.cancel(planned.id, exec);
+      return realStartReview(options);
+    };
+    await instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.ts"] }, exec).catch(() => undefined);
+    const record = (await store.load(planned.id))!;
+    assert.equal(record.phase, "cancelled");
+    assert.deepEqual(gateway.unsubscribedThreads, ["reviewer-thread"],
+      "a cancelled round still releases the subscription it claimed");
+    assert.deepEqual(gateway.unsubscribeSignals, [undefined],
+      "…and the cleanup never carries the business signal that was cancelled");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("1.1.4: a hung release cannot wedge the round — the cleanup has its own deadline", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-release-hang-"));
+  try {
+    const gateway = new FakeGateway();
+    gateway.reviewResults = [{ verdict: "pass", findings: [], testGaps: [], summary: "ok" }];
+    // A `thread/unsubscribe` that never settles. The release carries no business
+    // signal by design, so this deadline is the only thing that keeps the round
+    // (and therefore cancel/teardown) from waiting on it forever.
+    gateway.unsubscribeThread = () => new Promise<string>(() => undefined);
+    const instance = manager(directory, gateway, { reviewerReleaseTimeoutMs: 250 });
+    const exec = fakeExec("session-release-hang", directory, []);
+    await changedFile(directory);
+    const started = Date.now();
+    const reviewed = await instance.reviewOnly({ implementationSummary: "Changed", changedFiles: ["changed.txt"] }, exec);
+    const elapsed = Date.now() - started;
+    assert.equal(reviewed.phase, "passed", "a hung cleanup never changes the round outcome");
+    assert.ok(elapsed < 5_000, `the round must not wait on the cleanup (took ${elapsed}ms)`);
+    const persisted = (await new WorkflowStore(directory).load(reviewed.id))!;
+    assert.match(persisted.lastProgressMessage ?? "", /reviewer release timed out/,
+      "the timeout is reported on the round's terminal message");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("1.1.4: a hung external handoff cannot wedge a submission callback", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-handoff-hang-"));
+  try {
+    const gateway = new FakeGateway();
+    // The handoff exists so the CLI callback can resume the thread; it must still
+    // be BOUNDED, or a pending RPC would wedge the callback round.
+    gateway.releaseThreadForExternal = () => new Promise<void>(() => undefined);
+    const callback = new FakeCallback();
+    callback.results.push({ kind: "verdict", verdict: { verdict: "pass", findings: [], testGaps: [], summary: "ok" } });
+    const queue = fakeBridgeQueue();
+    const instance = manager(directory, gateway, { reviewerReleaseTimeoutMs: 250 }, callback, queue);
+    const exec = fakeExec("session-handoff-hang", directory, []);
+    const bridge = await bridgeWorkflow(instance, "session-handoff-hang", directory, newRequestId());
+    await new WorkflowStore(directory).update(bridge.id, (r) => {
+      r.reviewerThreadId = "reviewer-thread";
+      r.reviewerThreadOrigin = "app-server";
+    }, { ignoreCancelled: false });
+    await changedFile(directory);
+    await instance.submit(bridge.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
+    // The note is flushed after the round's terminal write, so wait for it rather
+    // than for an intermediate state.
+    await waitFor(async () => /external handoff timed out/.test(
+      (await new WorkflowStore(directory).load(bridge.id))?.lastProgressMessage ?? "",
+    ));
+    const record = (await new WorkflowStore(directory).load(bridge.id))!;
+    assert.equal(record.submissionState, "received", "the callback round settles despite the hung handoff");
+    assert.match(record.lastProgressMessage ?? "", /external handoff timed out/,
+      "the handoff timeout is reported instead of being swallowed");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("1.1.4: an unbound Reviewer whose release fails reports it on the round", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-unbound-note-"));
+  try {
+    const gateway = new FakeGateway();
+    gateway.unsubscribeFailures = 1;
+    const store = new FlakyStore(directory);
+    const instance = new WorkflowManager(store, gateway, { ...config, storageDir: directory });
+    const exec = fakeExec("session-unbound-note", directory, []);
+    const planned = await instance.start({ task: "Build it" }, exec);
+    // Fail the Reviewer-thread persist (the third review-scoped update), so the
+    // task exists but could never be bound — and its release also fails.
+    store.failAtUpdate = store.updateCount + 3;
+    await assert.rejects(
+      instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.txt"] }, exec),
+      /store write failed/,
+    );
+    const record = (await store.load(planned.id))!;
+    assert.equal(record.reviewerThreadId, undefined, "nothing is bound after the failed write");
+    assert.match(record.lastProgressMessage ?? "", /reviewer release failed/,
+      "an unbound release failure is reported, never silently dropped");
+  } finally { await rmClosed(directory); }
 });
 
 test("cancel during first visible Reviewer creation cannot bind or apply a late result", async () => {
@@ -3231,7 +3484,7 @@ test("cancel during first visible Reviewer creation cannot bind or apply a late 
     assert.equal(result.latestReview, undefined);
     assert.equal(result.reviewCycles, 0);
     assert.equal(gateway.reviewStarts.length, 0, "no review turn starts on the cancelled workflow");
-    assert.deepEqual(gateway.releasedThreads, ["late-visible-task"],
+    assert.deepEqual(gateway.unsubscribedThreads, ["late-visible-task"],
       "the task created for a cancelled binding is released, never left subscribed");
     await instance.stop();
   } finally { await rmClosed(directory); }
@@ -3253,7 +3506,7 @@ test("1.1.2: a Reviewer task created for a FAILED binding write is released too"
       instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.txt"] }, exec),
       /store write failed/,
     );
-    assert.deepEqual(gateway.releasedThreads, ["reviewer-thread"],
+    assert.deepEqual(gateway.unsubscribedThreads, ["reviewer-thread"],
       "an unbound created Reviewer is released instead of leaking its subscription");
     const record = (await store.load(planned.id))!;
     assert.equal(record.reviewerThreadId, undefined, "nothing is bound after the failed write");
@@ -3282,7 +3535,9 @@ test("a CLI-audited review runs its visible turn on the App Server and keeps onl
 
     const reviewed = await instance.review(planned.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
     assert.equal(reviewed.phase, "passed");
-    assert.deepEqual(gateway.releasedThreads, [], "a replaced legacy task is not released — it is not resumed at all");
+    assert.deepEqual(gateway.unsubscribedThreads, ["reviewer-thread"], "the replacement Reviewer is released after the visible review");
+    assert.deepEqual(gateway.releasedThreads, [],
+      "a review that needed no reconciliation never takes the external handoff path");
     assert.equal(audit.reviewRequests.length, 0, "the CLI never runs a visible review turn");
     assert.equal(audit.creations, 0, "the CLI never creates a durable task");
     assert.equal(audit.normalizeCalls, 1, "the structured conversion still comes from the CLI");
@@ -3617,6 +3872,7 @@ test("bridge callback never hands over a legacy CLI Reviewer; the source task st
     assert.equal(callback.requests[0]!.reviewerThreadId, undefined,
       "an unrenderable legacy Reviewer is handed over as UNBOUND so a visible one is created");
     assert.deepEqual(gateway.releasedThreads, [], "the legacy task is not resumed, so it is not released either");
+    assert.deepEqual(gateway.unsubscribedThreads, [], "the legacy task is never resumed, so it has no subscription to release");
     assert.deepEqual(gateway.renamedThreads.map((entry) => entry.threadId), ["legacy-callback-reviewer"],
       "the legacy task is renamed best-effort for a human reader");
   } finally {
@@ -3644,6 +3900,7 @@ test("1.1.2: a bridge record whose Reviewer id IS the origin task is never renam
     assert.deepEqual(gateway.renamedThreads, [],
       "the ORIGIN task's title is never overwritten by the legacy-Reviewer rename");
     assert.deepEqual(gateway.releasedThreads, [], "the origin task is not resumed, so it is not released either");
+    assert.deepEqual(gateway.unsubscribedThreads, [], "the origin task is never resumed, so it has no subscription to release");
   } finally {
     await rmClosed(directory);
   }

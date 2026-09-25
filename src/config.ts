@@ -41,6 +41,12 @@ export const Config = z.object({
   transientRetryJitterRatio: z.number().default(0.25),
   reviewHeartbeatMs: z.number().default(15_000),
   reviewStaleMs: z.number().default(60_000),
+  /** 1.1.4: bound on the round's Reviewer-subscription release. The cleanup
+   * deliberately carries no business signal (a cancelled round must still
+   * release), so it needs its own deadline instead — otherwise a hung
+   * `thread/unsubscribe` would wedge the round's `finally`, and with it
+   * cancel/teardown. */
+  reviewerReleaseTimeoutMs: z.number().default(10_000),
   leaseTtlMs: z.number().default(60_000),
   turnTimeoutMs: z.number().default(10 * 60 * 1000),
   idleProcessMs: z.number().default(5_000),

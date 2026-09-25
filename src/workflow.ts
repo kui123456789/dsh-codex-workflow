@@ -21,7 +21,7 @@ import {
 } from "./bridge-protocol.js";
 import { collectEvidence, isGitRepository } from "./evidence.js";
 import { noticeSource } from "./message-source.js";
-import { backoffDelayMs, normalizeBackoff, retryTransient, transientReason, type BackoffPolicy } from "./transient-retry.js";
+import { backoffDelayMs, compactDiagnostic, normalizeBackoff, retryTransient, transientReason, type BackoffPolicy } from "./transient-retry.js";
 import {
   SILENT_REVIEW_PROMPT_BLOCK,
   reviewDisplayError,
@@ -295,10 +295,18 @@ export class WorkflowManager {
   }
 
   /** Start a durable Review attempt and its independent heartbeat. */
+  /** 1.1.4: best-effort cleanup notes collected during a round, keyed by workflow
+   * id. They are flushed AFTER the round's terminal observation write, because
+   * that write replaces `lastProgressMessage`. */
+  private cleanupNotes = new Map<string, string[]>();
+
   private async beginReviewObservation(
     workflowId: string,
     options: { enterReviewing?: boolean; step?: ReviewStep; message?: string } = {},
   ) {
+    // A new round starts with an empty note buffer: a note left by an earlier
+    // round that never flushed must never be attributed to this one.
+    this.cleanupNotes.delete(workflowId);
     const now = new Date().toISOString();
     const outcome = await this.store.update(workflowId, (record) => {
       if (options.enterReviewing !== false) record.phase = "reviewing";
@@ -527,6 +535,7 @@ export class WorkflowManager {
     cwd: string,
     contract: string,
     signal?: AbortSignal,
+    workflowId?: string,
   ): Promise<void> {
     await this.retryTransientControl(async () => {
       await this.codex.resumeThread(threadId, cwd, signal);
@@ -534,7 +543,7 @@ export class WorkflowManager {
         // Auxiliary refresh of the hidden channel; never load-bearing.
         await this.codex.updateReviewerInstructions?.(threadId, cwd, contract, signal);
       } catch (error) {
-        await this.releaseUnboundReviewer(threadId, signal);
+        this.reportCleanupNote(workflowId, await this.releaseUnboundReviewer(threadId, signal));
         throw error;
       }
     }, signal);
@@ -548,7 +557,7 @@ export class WorkflowManager {
    * in the Codex store, but nothing holds it).
    */
   private async createReviewerThread(
-    options: { cwd: string; name: string; model?: string; developerInstructions?: string },
+    options: { cwd: string; name: string; model?: string; developerInstructions?: string; workflowId?: string },
     signal?: AbortSignal,
   ): Promise<string> {
     if (!this.codex.startReviewerThread) throw new Error("codex gateway has no startReviewerThread");
@@ -567,7 +576,7 @@ export class WorkflowManager {
         return threadId;
       }, signal);
     } catch (error) {
-      if (threadId) await this.releaseUnboundReviewer(threadId, signal);
+      if (threadId) this.reportCleanupNote(options.workflowId, await this.releaseUnboundReviewer(threadId, signal));
       throw error;
     }
   }
@@ -1357,8 +1366,14 @@ export class WorkflowManager {
           // only — never the Planner/origin task), so it is simply called.
           if (!boundReviewer) await this.renameLegacyReviewer(current, workflowId);
           if (boundReviewer) {
-            if (this.codex.releaseThreadForExternal) await this.codex.releaseThreadForExternal(boundReviewer, signal);
-            else await this.codex.unsubscribeThread?.(boundReviewer, signal);
+            // 1.1.4: signal-free but BOUNDED — a handoff that never settles must
+            // not wedge the round (or cancel/teardown) either.
+            const handoffNote = await this.boundedCleanup("external handoff", () => (
+              this.codex.releaseThreadForExternal
+                ? this.codex.releaseThreadForExternal(boundReviewer)
+                : this.codex.unsubscribeThread?.(boundReviewer)
+            ));
+            this.reportCleanupNote(workflowId, handoffNote);
           }
           outcome = await this.callback!.send({
             workflowId,
@@ -1627,6 +1642,7 @@ export class WorkflowManager {
     } finally {
       lease?.stopHeartbeat();
       await this.finishReviewObservation(workflowId);
+      await this.flushCleanupNotes(workflowId);
     }
   }
 
@@ -2163,6 +2179,8 @@ export class WorkflowManager {
     });
     if (entering.suppressed) return entering.record;
     let current = entering.record;
+    let reviewerClaimed = false;
+    let reviewerThreadId: string | undefined;
     try {
       const evidence = await collectEvidence({
         cwd: current.cwd,
@@ -2208,7 +2226,7 @@ export class WorkflowManager {
         || await this.codex.resolveDefaultModel?.(exec.signal)
         || undefined;
       const contract = reviewContractInstructions(current, input, evidence);
-      let reviewerThreadId = current.reviewerThreadId;
+      reviewerThreadId = current.reviewerThreadId;
       // 1.1.0/1.1.2: a Reviewer is reused only when it is a DEDICATED thread the
       // App Server created. A legacy shared alias (1.1.0) or a legacy CLI task
       // (1.1.2: `source='exec'`, invisible in Desktop, no name) is migrated
@@ -2228,6 +2246,7 @@ export class WorkflowManager {
         reviewerThreadId = await this.createReviewerThread({
           cwd: current.cwd,
           name: `DSH Reviewer: ${workflowId}`,
+          workflowId,
           ...(reviewerModel ? { model: reviewerModel } : {}),
           developerInstructions: contract,
         }, exec.signal);
@@ -2244,22 +2263,24 @@ export class WorkflowManager {
         } catch (error) {
           // The created task could not be bound: release its hold before the
           // failure propagates, so a failed round cannot leave it loaded.
-          await this.releaseUnboundReviewer(reviewerThreadId);
+          this.reportCleanupNote(workflowId, await this.releaseUnboundReviewer(reviewerThreadId));
           throw error;
         }
         if (threadCommit.suppressed) {
           // A concurrent cancel won the CAS: the task is never bound, so it is
           // released here instead of being left subscribed under a cancelled
           // workflow (the task remains in the Codex store, unbound).
-          await this.releaseUnboundReviewer(reviewerThreadId);
+          this.reportCleanupNote(workflowId, await this.releaseUnboundReviewer(reviewerThreadId));
           return threadCommit.record;
         }
         current = threadCommit.record;
+        reviewerClaimed = true;
       } else {
         // 1.1.3: resume + instruction refresh under the shared transient retry
         // (a visible Reviewer can be open in Codex Desktop, which holds its
         // writer lock until the user closes it).
-        await this.prepareBoundReviewer(reviewerThreadId, current.cwd, contract, exec.signal);
+        await this.prepareBoundReviewer(reviewerThreadId, current.cwd, contract, exec.signal, workflowId);
+        reviewerClaimed = true;
       }
 
       if (current.reviewerThreadId === reviewerThreadId && current.reviewStep !== "review_native_turn") {
@@ -2563,7 +2584,12 @@ export class WorkflowManager {
       if (failed.suppressed) return failed.record;
       throw error;
     } finally {
+      const releaseNote = reviewerClaimed && reviewerThreadId
+        ? await this.releaseReviewerSubscription(reviewerThreadId)
+        : undefined;
+      this.reportCleanupNote(workflowId, releaseNote);
       await this.finishReviewObservation(workflowId);
+      await this.flushCleanupNotes(workflowId);
     }
   }
 
@@ -2602,13 +2628,104 @@ export class WorkflowManager {
    * cannot be deleted); only the plugin's own subscription/writer hold is
    * released, so a cancelled round cannot leave a task loaded under it. Always
    * best-effort: the caller's original outcome must never be masked. */
-  private async releaseUnboundReviewer(threadId: string, signal?: AbortSignal): Promise<void> {
+  private async releaseUnboundReviewer(threadId: string, signal?: AbortSignal): Promise<string | undefined> {
+    // Cleanup is independent of the turn that failed or was cancelled: an
+    // aborted business signal must never cancel the unsubscribe that releases
+    // the writer hold.
+    void signal;
+    return this.releaseReviewerHold(threadId);
+  }
+
+  /** 1.1.4: surface a best-effort cleanup note on the round's progress channel.
+   * A cleanup failure must never change an outcome, but it must also not vanish:
+   * an operator has to be able to see that a hold may still be open. Notes are
+   * BUFFERED here and flushed after the round's terminal observation write —
+   * that write replaces `lastProgressMessage`, so a note written earlier would be
+   * silently discarded. */
+  private reportCleanupNote(workflowId: string | undefined, note: string | undefined): void {
+    if (!workflowId || !note) return;
+    const notes = this.cleanupNotes.get(workflowId) ?? [];
+    notes.push(note);
+    this.cleanupNotes.set(workflowId, notes);
+  }
+
+  /** Append every buffered cleanup note to the round's terminal progress message. */
+  private async flushCleanupNotes(workflowId: string): Promise<void> {
+    const notes = this.cleanupNotes.get(workflowId);
+    if (!notes || notes.length === 0) return;
+    this.cleanupNotes.delete(workflowId);
+    await this.store.update(workflowId, (record) => {
+      record.lastProgressMessage = [record.lastProgressMessage, ...notes].filter(Boolean).join(" — ");
+      record.lastProgressAt = new Date().toISOString();
+    }, { ignoreCancelled: true }).catch(() => undefined);
+  }
+
+  /** 1.1.4: release the subscription acquired by THIS DSH-led review round, so
+   * the next round can never collide with the previous round's own hold.
+   * @returns a compact note when the release could not be sent, so the caller can
+   * surface it on the round's terminal message instead of swallowing it. */
+  private async releaseReviewerSubscription(threadId: string): Promise<string | undefined> {
+    return this.releaseReviewerHold(threadId);
+  }
+
+  /**
+   * Release ONLY this plugin's own subscription on a Reviewer thread.
+   *
+   * `releaseThreadForExternal` is deliberately NEVER used here. That handoff ends
+   * with an `idleShutdown()` which detaches the child, clears its turn
+   * bookkeeping and closes its stdin, and it exists for exactly one purpose:
+   * letting an external CLI process (`codex exec`) resume the thread. Calling it
+   * at the end of a review round could therefore tear the SHARED App Server out
+   * from under a concurrent operation (a bridge callback turn, a planner turn),
+   * so a gateway without `unsubscribeThread` releases nothing instead.
+   *
+   * Best-effort and idempotent (`unsubscribed`, `notSubscribed` and `notLoaded`
+   * are all success outcomes): a failed release never changes the workflow's
+   * outcome and the next round releases again. The Reviewer task itself is never
+   * deleted or archived — the review stays on it.
+   *
+   * @returns a compact diagnostic when the release could not be sent, else
+   * `undefined`. The caller reports it on the round's terminal progress message,
+   * so a hold that may still be open is never silent.
+   */
+  /**
+   * Run a signal-free cleanup under its OWN deadline.
+   *
+   * Cleanup must not ride on the business signal — a cancelled round still has to
+   * release its claim, and a cancelled submission still has to hand the thread
+   * back before an external CLI resumes it — so the bound has to come from
+   * somewhere else. Without one, a `thread/unsubscribe` (or an external handoff
+   * that includes an idle shutdown) that never settles would wedge the caller:
+   * the round's `finally`, and with it cancel/teardown.
+   *
+   * @param what - short label used in the returned note.
+   * @param run - the cleanup; returning `undefined` means the gateway has no such
+   * API, which is not a failure.
+   * @returns a compact note when the cleanup failed or did not finish in time,
+   * else `undefined`.
+   */
+  private async boundedCleanup(what: string, run: () => Promise<unknown> | undefined): Promise<string | undefined> {
+    const timeoutMs = Math.max(250, this.config.reviewerReleaseTimeoutMs ?? 10_000);
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      if (this.codex.releaseThreadForExternal) await this.codex.releaseThreadForExternal(threadId, signal);
-      else await this.codex.unsubscribeThread?.(threadId, signal);
-    } catch {
-      // A failed release never changes the workflow's outcome.
+      const operation = run();
+      if (!operation) return undefined;
+      // `unref` keeps a pending deadline from holding the process open.
+      const deadline = new Promise<"timeout">((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), timeoutMs);
+        timer.unref?.();
+      });
+      const outcome = await Promise.race([operation.then(() => "done" as const), deadline]);
+      return outcome === "timeout" ? `${what} timed out after ${timeoutMs}ms (best-effort)` : undefined;
+    } catch (error) {
+      return `${what} failed (best-effort): ${compactDiagnostic(error instanceof Error ? error.message : String(error), 200)}`;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
+  }
+
+  private async releaseReviewerHold(threadId: string): Promise<string | undefined> {
+    return this.boundedCleanup("reviewer release", () => this.codex.unsubscribeThread?.(threadId));
   }
 
   /** Fail-closed read-back of the turn appended to the durable Reviewer thread
@@ -2726,8 +2843,14 @@ export class WorkflowManager {
     if (this.audit) {
       const threadId = record.reviewerThreadId ?? record.codexThreadId;
       if (!threadId) throw new Error("review reconciliation requires the workflow review thread");
-      if (this.codex.releaseThreadForExternal) await this.codex.releaseThreadForExternal(threadId, signal);
-      else await this.codex.unsubscribeThread?.(threadId, signal);
+      // 1.1.4: signal-free but BOUNDED — the CLI reconciliation below resumes the
+      // thread, so the handoff still has to happen, just never unboundedly.
+      const handoffNote = await this.boundedCleanup("external handoff", () => (
+        this.codex.releaseThreadForExternal
+          ? this.codex.releaseThreadForExternal(threadId)
+          : this.codex.unsubscribeThread?.(threadId)
+      ));
+      this.reportCleanupNote(record.id, handoffNote);
       const corrected = await this.audit.reconcile({
         workflowId: record.id,
         submissionId: record.submissionId ?? `reconcile-${Date.now()}`,

@@ -332,6 +332,11 @@ export interface WorkflowConfig {
    * host/test configs written before observability was added. */
   reviewHeartbeatMs?: number;
   reviewStaleMs?: number;
+  /** 1.1.4: deadline for the round's Reviewer-subscription release. The cleanup
+   * carries no business signal (a cancelled round must still release), so this
+   * bound is what keeps a hung `thread/unsubscribe` from wedging the round's
+   * finally — and with it cancel/teardown. Default 10000. */
+  reviewerReleaseTimeoutMs?: number;
   /** Lease lifetime for submission callback claims (ms); heartbeats renew at
    * ttl/3 while a callback runs. Default 60000. */
   leaseTtlMs?: number;
