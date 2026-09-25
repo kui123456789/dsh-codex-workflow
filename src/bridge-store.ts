@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir } from "node:fs/promises";
 import {
   BRIDGE_MAX_PAYLOAD_BYTES,
   isPlainObject,
@@ -13,6 +12,7 @@ import {
   type PruneRequestCandidate,
   type PruneWorkflowCandidate,
 } from "./coordination.js";
+import { LegacyQueueImporter } from "./infrastructure/legacy-queue-import.js";
 
 export const BRIDGE_QUEUE_DIRS = ["inbox", "processing", "retry", "receipts", "dead-letter"] as const;
 export type BridgeQueueDir = (typeof BRIDGE_QUEUE_DIRS)[number];
@@ -61,7 +61,7 @@ export function commandHash(command: BridgeCommand): string {
  */
 export class BridgeStore {
   private coordination?: CoordinationStore;
-  private legacyImported = false;
+  private readonly legacyImporter = new LegacyQueueImporter();
   private closed = false;
 
   /** `directory` is the plugin storage directory; the coordination database
@@ -99,7 +99,7 @@ export class BridgeStore {
   async init(): Promise<void> {
     await mkdir(this.directory, { recursive: true });
     this.ensure();
-    await this.importLegacyQueue();
+    await this.legacyImporter.import(this.directory, this.coordination!, commandHash);
   }
 
   private assertRequestId(requestId: string): string {
@@ -290,88 +290,4 @@ export class BridgeStore {
     };
   }
 
-  /** Import legacy file-queue data (`<directory>/bridge/*`) once, so
-   * pre-SQLite deployments keep their queued commands, retry semantics and
-   * receipts. Receipts files are receipts (no envelope.command); envelope
-   * files preserve attempts/last_error/next_attempt_at/dead_letter_at. */
-  private async importLegacyQueue(): Promise<void> {
-    if (this.legacyImported) return;
-    this.legacyImported = true;
-    const base = join(this.directory, "bridge");
-    const coordination = this.coordination!;
-    const now = Date.now();
-    const importReceipts = async (): Promise<void> => {
-      let names: string[] = [];
-      try {
-        names = await readdir(join(base, "receipts"));
-      } catch {
-        return;
-      }
-      for (const name of names.filter((entry) => entry.endsWith(".json") && !entry.endsWith(".error.txt"))) {
-        try {
-          const raw = await readFile(join(base, "receipts", name), "utf8");
-          const receipt = JSON.parse(raw) as Partial<BridgeReceipt>;
-          if (!receipt.requestId || !UUID_RE.test(receipt.requestId)) continue;
-          const requestId = receipt.requestId;
-          if (coordination.queueRow(requestId)?.receiptJson) continue;
-          coordination.importLegacyReceipt(requestId, receipt.commandHash ?? "", `${JSON.stringify(receipt, null, 2)}\n`, now);
-        } catch {
-          // Unreadable legacy receipts are skipped; the queue stays clean.
-        }
-      }
-    };
-    const importEnvelopes = async (dir: string, status: "inbox" | "retry" | "processing" | "dead-letter"): Promise<void> => {
-      let names: string[] = [];
-      try {
-        names = await readdir(join(base, dir));
-      } catch {
-        return;
-      }
-      for (const name of names.filter((entry) => entry.endsWith(".json") && !entry.endsWith(".error.txt"))) {
-        try {
-          const raw = await readFile(join(base, dir, name), "utf8");
-          const envelope = JSON.parse(raw) as Record<string, unknown>;
-          if (!isPlainObject(envelope) || typeof envelope.attempts !== "number") continue;
-          const command = parseBridgeCommand(envelope.command);
-          const requestId = command.requestId;
-          if (!UUID_RE.test(requestId)) continue;
-          if (coordination.queueRow(requestId)) continue;
-          const attempts = Number(envelope.attempts) || 0;
-          const lastError = typeof envelope.lastError === "string" ? envelope.lastError : undefined;
-          let nextAttemptAt: number | undefined;
-          if (typeof envelope.nextAttemptAt === "string") {
-            const parsed = Date.parse(envelope.nextAttemptAt);
-            if (!Number.isNaN(parsed)) nextAttemptAt = parsed;
-          }
-          let deadLetterAt: number | undefined;
-          if (typeof envelope.deadLetterAt === "string") {
-            const parsed = Date.parse(envelope.deadLetterAt);
-            if (!Number.isNaN(parsed)) deadLetterAt = parsed;
-          }
-          // A stale legacy processing claim is imported as a due retry.
-          const importStatus = status === "processing" ? "retry" : status;
-          coordination.importLegacyRow(
-            requestId,
-            commandHash(command),
-            JSON.stringify(command),
-            importStatus,
-            attempts,
-            lastError,
-            status === "retry" || status === "processing"
-              ? (nextAttemptAt ?? (status === "processing" ? now : now))
-              : nextAttemptAt,
-            deadLetterAt,
-            now,
-          );
-        } catch {
-          // Unreadable/malformed legacy files are skipped; the queue stays clean.
-        }
-      }
-    };
-    await importReceipts();
-    await importEnvelopes("inbox", "inbox");
-    await importEnvelopes("processing", "processing");
-    await importEnvelopes("retry", "retry");
-    await importEnvelopes("dead-letter", "dead-letter");
-  }
 }
