@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { isAbsolute, join, resolve } from "node:path";
 import { parseWorkflowJson } from "./state/workflow-schema.js";
+import { CoordinationDatabase } from "./infrastructure/coordination-database.js";
 
 /**
  * SQLite-backed coordination state shared by every DSH process and the CLI.
@@ -157,30 +158,12 @@ export function closeCoordinationStoresForDirectory(directory: string): void {
 
 export class CoordinationStore {
   readonly db: DatabaseSync;
+  private readonly database: CoordinationDatabase;
   private closed = false;
 
   constructor(readonly path: string, options: CoordinationOptions = {}) {
-    assertLocalDisk(path);
-    this.db = new DatabaseSync(path);
-    try {
-      // Busy handling must be installed before any PRAGMA that can acquire a
-      // write lock. Two DSH processes may open/create the same database at the
-      // same time during startup.
-      this.db.exec(`PRAGMA busy_timeout=${options.busyTimeoutMs ?? 10_000}`);
-      // Rollback journal (DELETE), NOT WAL: see the module docs — SQLite <=
-      // 3.51.2 (Node 24.14.0) has a WAL-reset bug under concurrent writers.
-      const journal = this.db.prepare("PRAGMA journal_mode").get() as { journal_mode: string };
-      if (journal.journal_mode.toLowerCase() !== "delete") this.db.exec("PRAGMA journal_mode=DELETE");
-      this.db.exec("PRAGMA synchronous=FULL");
-      this.db.exec(SCHEMA);
-    } catch (error) {
-      try {
-        this.db.close();
-      } catch {
-        // Preserve the initialization error.
-      }
-      throw error;
-    }
+    this.database = new CoordinationDatabase(path, options, SCHEMA);
+    this.db = this.database.db;
     const key = normalizeDbPath(path);
     let group = LIVE_BY_PATH.get(key);
     if (!group) {
@@ -203,15 +186,13 @@ export class CoordinationStore {
   /** Runtime SQLite version (e.g. "3.51.2"). */
   sqliteVersion(): string {
     this.assertOpen();
-    const row = this.db.prepare("SELECT sqlite_version() AS v").get() as { v: string };
-    return row.v;
+    return this.database.sqliteVersion();
   }
 
   /** Current journal mode (must be "delete" — we never use WAL). */
   journalMode(): string {
     this.assertOpen();
-    const row = this.db.prepare("PRAGMA journal_mode").get() as { journal_mode: string };
-    return row.journal_mode;
+    return this.database.journalMode();
   }
 
   close(): void {
@@ -224,7 +205,7 @@ export class CoordinationStore {
       if (group.size === 0) LIVE_BY_PATH.delete(key);
     }
     try {
-      this.db.close();
+      this.database.close();
     } catch {
       // already closed
     }
@@ -233,12 +214,7 @@ export class CoordinationStore {
   /** `PRAGMA integrity_check`; throws unless every row reports "ok". */
   integrityCheck(): string[] {
     this.assertOpen();
-    const rows = this.db.prepare("PRAGMA integrity_check").all() as Array<{ integrity_check: string }>;
-    const messages = rows.map((row) => row.integrity_check);
-    if (messages.some((message) => message !== "ok")) {
-      throw new Error(`sqlite integrity check failed: ${messages.join("; ")}`);
-    }
-    return messages;
+    return this.database.integrityCheck();
   }
 
   // ------------------------------------------------------------------ leases
