@@ -11,6 +11,9 @@ import { WorkflowStore } from "./store.js";
 import type { WorkflowRecord } from "./types.js";
 import { executionPrompt, formatFindings, type WorkflowManager } from "./workflow.js";
 import { SystemDesktopThreadOpener, type DesktopThreadOpener } from "./desktop-thread-opener.js";
+import { DeliveryCoordinator } from "./application/bridge/delivery-coordinator.js";
+import { QueuePump } from "./application/bridge/queue-pump.js";
+import { SessionRouter } from "./application/bridge/session-router.js";
 
 export interface AgentRegistryLike {
   get(id: string): Agent | undefined;
@@ -96,6 +99,9 @@ function errorMessage(error: unknown): string {
  * between send and receipt. Verdict handling is added on top of the same pump.
  */
 export class BridgeRuntime {
+  private readonly queuePump: QueuePump;
+  private readonly sessionRouter: SessionRouter;
+  private readonly deliveryCoordinator: DeliveryCoordinator;
   private timer?: NodeJS.Timeout;
   private sessionHeartbeat?: NodeJS.Timeout;
   private sessionsChain: Promise<void> = Promise.resolve();
@@ -132,38 +138,50 @@ export class BridgeRuntime {
       desktopOpener: options.desktopOpener ?? new SystemDesktopThreadOpener(),
     };
     this.claimOwner = randomUUID();
+    this.queuePump = new QueuePump({
+      start: this.startInternal.bind(this),
+      stop: this.stopInternal.bind(this),
+      pump: this.pumpInternal.bind(this),
+      refreshSessions: this.refreshSessionsInternal.bind(this),
+    });
+    this.sessionRouter = new SessionRouter({ refreshSessions: this.refreshSessionsInternal.bind(this) });
+    this.deliveryCoordinator = new DeliveryCoordinator(options.manager);
   }
 
-  start(): void {
+  startInternal(): void {
     this.stopped = false;
     void this.store.recoverOrphans().catch(() => undefined);
     // Resume callbacks that were durably persisted but never finished.
-    void this.options.manager.recoverCallbacks().catch(() => undefined);
+    void this.deliveryCoordinator.recoverCallbacks().catch(() => undefined);
     void this.retryPendingDesktopOpens().catch(() => undefined);
-    void this.refreshSessions(true);
+    void this.refreshSessionsInternal(true);
     // Session heartbeat is INDEPENDENT of the pump: a long Codex callback must
     // never let this runtime's live sessions expire, and agent churn (created /
     // disposed) is reflected promptly. Period is a third of the lease TTL; the
     // refresh chain is serialized and gated on `stopped`.
     const sessionPeriod = Math.max(100, Math.floor(this.store.leaseMs / 3));
     this.sessionHeartbeat = setInterval(() => {
-      void this.refreshSessions(true).catch(() => undefined);
+      void this.refreshSessionsInternal(true).catch(() => undefined);
     }, sessionPeriod);
     this.sessionHeartbeat.unref();
-    this.timer = setInterval(() => void this.pump(), this.options.pollMs);
+    this.timer = setInterval(() => void this.pumpInternal(), this.options.pollMs);
     this.timer.unref();
-    void this.pump();
+    void this.pumpInternal();
   }
+
+  start(): void { this.queuePump.start(); }
 
   /** Stop the pump and wait for in-flight handling. Concurrent stop() calls
    * share ONE settle promise, so a second caller can never resolve before the
    * first has truly stopped. */
-  async stop(): Promise<void> {
+  async stopInternal(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
     const task = this.doStop();
     this.stopPromise = task;
     return task;
   }
+
+  stop(): Promise<void> { return this.queuePump.stop(); }
 
   private async doStop(): Promise<void> {
     this.stopped = true;
@@ -195,13 +213,15 @@ export class BridgeRuntime {
    * start, pump) never interleave or reorder; once stopped, a refresh writes
    * nothing. Returns the chain's current tail.
    */
-  refreshSessions(force = false): Promise<void> {
+  refreshSessionsInternal(force = false): Promise<void> {
     const task = this.sessionsChain
       .then(() => undefined, () => undefined)
       .then(() => this.doRefreshSessions(force));
     this.sessionsChain = task.then(() => undefined, () => undefined);
     return task;
   }
+
+  refreshSessions(force = false): Promise<void> { return this.sessionRouter.refreshSessions(force); }
 
   private async doRefreshSessions(force: boolean): Promise<void> {
     if (this.stopped) return; // teardown gate: never resurrect live_sessions
@@ -269,14 +289,14 @@ export class BridgeRuntime {
   }
 
   /** Exposed for tests and one-off pumps; the timer path calls it repeatedly. */
-  async pump(): Promise<void> {
+  async pumpInternal(): Promise<void> {
     if (this.polling || this.stopped) return;
     this.polling = true;
     try {
       // A Codex-led submission may outlive the originating Codex turn. Busy
       // callbacks stay durably retrying, and every normal pump gives due work
       // another fenced recovery round without requiring a DSH restart.
-      await this.options.manager.recoverCallbacks().catch(() => 0);
+      await this.deliveryCoordinator.recoverCallbacks().catch(() => 0);
       await this.retryPendingDesktopOpens();
       for (;;) {
         const claim = await this.store.claimNext(this.claimOwner, (command) => this.isClaimEligible(command));
@@ -296,12 +316,14 @@ export class BridgeRuntime {
       // `polling` true through this finalizer so another timer tick cannot
       // overlap a new pump and teardown cannot return before the pump settles.
       try {
-        await this.refreshSessions(false).catch(() => undefined);
+        await this.refreshSessionsInternal(false).catch(() => undefined);
       } finally {
         this.polling = false;
       }
     }
   }
+
+  pump(): Promise<void> { return this.queuePump.pump(); }
 
   /**
    * Heartbeat the claim lease while it is handled: renewal period is a third
