@@ -2081,7 +2081,7 @@ export class WorkflowManager {
     // 1.1.6: pin the App Server child for the whole round. Without the pin the
     // idle window can fall between creating the Reviewer and its first turn,
     // and the respawned process answers `thread not found` for that new thread.
-    this.codex.beginRound?.();
+    this.turnGateway.beginRound();
     try {
       const evidence = await collectEvidence({
         cwd: current.cwd,
@@ -2492,7 +2492,7 @@ export class WorkflowManager {
       await this.reviewObservation.finish(workflowId);
       await this.flushCleanupNotes(workflowId);
       // The pin is released LAST: the cleanup above still runs on this child.
-      this.codex.endRound?.();
+      this.turnGateway.endRound();
     }
   }
 

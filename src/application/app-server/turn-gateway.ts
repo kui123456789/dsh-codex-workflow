@@ -1,6 +1,6 @@
 import type { CodexGateway } from "../../workflow.js";
 
-export type TurnGatewayPort = Pick<CodexGateway, "startTurn" | "continueTurn" | "startReview" | "interrupt" | "normalizeInFork" | "captureTurnBaseline" | "readAppendedTurnText" | "resolveDefaultModel">;
+export type TurnGatewayPort = Pick<CodexGateway, "startTurn" | "continueTurn" | "startReview" | "interrupt" | "normalizeInFork" | "captureTurnBaseline" | "readAppendedTurnText" | "resolveDefaultModel" | "beginRound" | "endRound">;
 
 /** Turn-only App Server seam; thread identity and child transport stay out. */
 export class TurnGateway {
@@ -14,4 +14,6 @@ export class TurnGateway {
   readAppendedTurnText(...args: Parameters<NonNullable<TurnGatewayPort["readAppendedTurnText"]>>): ReturnType<NonNullable<TurnGatewayPort["readAppendedTurnText"]>> { return this.port.readAppendedTurnText ? this.port.readAppendedTurnText(...args) : Promise.reject(new Error("codex gateway has no readAppendedTurnText")); }
   normalizeInFork(...args: Parameters<TurnGatewayPort["normalizeInFork"]>): ReturnType<TurnGatewayPort["normalizeInFork"]> { return this.port.normalizeInFork(...args); }
   resolveDefaultModel(...args: Parameters<NonNullable<TurnGatewayPort["resolveDefaultModel"]>>): ReturnType<NonNullable<TurnGatewayPort["resolveDefaultModel"]>> { return this.port.resolveDefaultModel ? this.port.resolveDefaultModel(...args) : Promise.resolve(undefined); }
+  beginRound(): void { this.port.beginRound?.(); }
+  endRound(): void { this.port.endRound?.(); }
 }

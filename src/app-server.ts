@@ -1,10 +1,6 @@
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
 import { CodexInvalidThreadError } from "./codex-callback.js";
-import {
-  CONVERSION_DEVELOPER_INSTRUCTIONS,
-  SILENT_REVIEW_DEVELOPER_INSTRUCTIONS,
-} from "./review-contract.js";
 import type {
   PersistedTurnBaseline,
   PlannerQuestion,
@@ -14,6 +10,7 @@ import type {
 } from "./types.js";
 import { PLUGIN_VERSION } from "./version.js";
 import { spawnProcess, stopProcess } from "./infrastructure/process-transport.js";
+import { ModelSelectionGateway } from "./application/app-server/model-selection-gateway.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -132,15 +129,6 @@ export interface ReviewStartOptions {
   onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
 }
 
-/** A single entry of `model/list` trimmed to the fields the plugin uses to pick
- * the default Reviewer model. */
-interface ModelSelection {
-  id: string;
-  isDefault: boolean;
-  hidden: boolean;
-  defaultReasoningEffort?: string;
-}
-
 /** Bounded wall-clock window each persisted read-back polls before declaring
  * the appended text "missing" (roll-out lag) — well under the production turn
  * budget, and folded into the provable tool budgets (reviewToolTimeout adds
@@ -217,10 +205,15 @@ export class CodexAppServerClient {
   /** 1.1.6: rounds currently pinning this child (see `beginRound`). */
   private pinned = 0;
   private turnWaiters = 0;
-  private cachedDefault?: { id: string; defaultReasoningEffort?: string };
+  private readonly modelGateway: ModelSelectionGateway;
   private stderr = "";
 
-  constructor(private readonly options: CodexAppServerOptions) {}
+  constructor(private readonly options: CodexAppServerOptions) {
+    this.modelGateway = new ModelSelectionGateway({
+      request: (method, params, signal) => this.request<JsonObject>(method, params, signal),
+      object,
+    });
+  }
 
   async start(signal?: AbortSignal): Promise<void> {
     // Permanent-teardown fence: after stop() has begun this client must NEVER
@@ -718,131 +711,21 @@ export class CodexAppServerClient {
     this.scheduleIdle();
   }
 
-  private async planMode(model?: string, effort?: ReasoningEffort, signal?: AbortSignal): Promise<JsonObject | undefined> {
-    const response = await this.request<JsonObject>("collaborationMode/list", {}, signal);
-    const data = Array.isArray(response.data) ? response.data : [];
-    const plan = data.map(object).find((entry) => entry.mode === "plan");
-    // The Plan mode's own model wins when no explicit model is given; only
-    // when the mode declares none do we pin the server's default model, so
-    // plan turns ALWAYS run with a concrete, reportable model (onModel) that
-    // the ephemeral conversion fork can reuse.
-    let selectedModel = model || (typeof plan?.model === "string" ? plan.model : "");
-    if (!selectedModel) selectedModel = (await this.defaultModel(signal))?.id ?? "";
-    if (!selectedModel) return undefined;
-    return {
-      mode: "plan",
-      settings: {
-        model: selectedModel,
-        reasoning_effort: effort ?? (typeof plan?.reasoning_effort === "string" ? plan.reasoning_effort : null),
-        developer_instructions: null,
-      },
-    };
+  private planMode(model?: string, effort?: ReasoningEffort, signal?: AbortSignal): Promise<JsonObject | undefined> {
+    return this.modelGateway.planMode(model, effort, signal);
   }
 
-  /** Pin a Reviewer turn to the non-collaborative "default" collaboration mode
-   * and inject the silent single-message review developer instructions at the
-   * protocol level. The mode's `settings` require a concrete model id: the
-   * configured reviewer model when present, otherwise the app-server's default
-   * model. When no explicit effort is configured, the selected model's own
-   * `defaultReasoningEffort` (as reported by `model/list`) is used. */
-  private async silentReviewMode(model?: string, effort?: ReasoningEffort, signal?: AbortSignal): Promise<JsonObject | undefined> {
-    return this.defaultModeWithInstructions(model, effort, signal, SILENT_REVIEW_DEVELOPER_INSTRUCTIONS);
+  private silentReviewMode(model?: string, effort?: ReasoningEffort, signal?: AbortSignal): Promise<JsonObject | undefined> {
+    return this.modelGateway.silentReviewMode(model, effort, signal);
   }
 
-  /** Conversion-turn mode for ephemeral forks: non-collaborative "default"
-   * mode with the JSON-only conversion developer instructions, so the fork
-   * emits exactly one schema-conforming JSON object. Uses the source task's
-   * model when provided, otherwise the server's default model. */
-  private async conversionMode(model?: string, effort?: ReasoningEffort, signal?: AbortSignal): Promise<JsonObject | undefined> {
-    return this.defaultModeWithInstructions(model, effort, signal, CONVERSION_DEVELOPER_INSTRUCTIONS);
+  private conversionMode(model?: string, effort?: ReasoningEffort, signal?: AbortSignal): Promise<JsonObject | undefined> {
+    return this.modelGateway.conversionMode(model, effort, signal);
   }
 
-  private async defaultModeWithInstructions(
-    model?: string,
-    effort?: ReasoningEffort,
-    signal?: AbortSignal,
-    instructions?: string,
-  ): Promise<JsonObject | undefined> {
-    let selected: { id: string; defaultReasoningEffort?: string } | undefined;
-    if (model) {
-      selected = await this.modelSelection(model, signal);
-    } else {
-      selected = await this.defaultModel(signal);
-    }
-    if (!selected) return undefined;
-    return {
-      mode: "default",
-      settings: {
-        model: selected.id,
-        reasoning_effort: effort ?? selected.defaultReasoningEffort ?? null,
-        developer_instructions: instructions ?? null,
-      },
-    };
-  }
-
-  private cachedModels?: ModelSelection[];
-
-  /** Parse `model/list` into a stable selection list (cached for the life of
-   * the client; the set of models does not change mid-run). */
-  private async modelSelections(signal?: AbortSignal): Promise<ModelSelection[]> {
-    if (this.cachedModels) return this.cachedModels;
-    const response = await this.request<JsonObject>("model/list", {}, signal);
-    const data = Array.isArray(response.data) ? response.data : [];
-    const parsed: ModelSelection[] = [];
-    for (const entry of data) {
-      const value = object(entry);
-      const id = typeof value.id === "string" && value.id.length > 0 ? value.id : undefined;
-      if (!id) continue;
-      const defaultReasoningEffort = typeof value.defaultReasoningEffort === "string" && value.defaultReasoningEffort.length > 0
-        ? value.defaultReasoningEffort
-        : undefined;
-      parsed.push({
-        id,
-        isDefault: value.isDefault === true,
-        hidden: value.hidden === true,
-        ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
-      });
-    }
-    this.cachedModels = parsed;
-    return parsed;
-  }
-
-  /** Select a model entry by exact id (for a configured reviewer model that is
-   * present in `model/list`); models absent from the list still resolve with
-   * their id and no server-provided default effort. */
-  private async modelSelection(id: string, signal?: AbortSignal): Promise<{ id: string; defaultReasoningEffort?: string } | undefined> {
-    const models = await this.modelSelections(signal);
-    const match = models.find((entry) => entry.id === id);
-    return match
-      ? { id: match.id, ...(match.defaultReasoningEffort ? { defaultReasoningEffort: match.defaultReasoningEffort } : {}) }
-      : { id };
-  }
-
-  /** The app-server's default model: the entry marked `isDefault === true`.
-   * Only when the server presents no explicit default do we fall back, and then
-   * deterministically — first non-hidden model, then the first model — so the
-   * Reviewer never silently picks an arbitrary list-first entry. The selection
-   * (and its `defaultReasoningEffort`) is cached. */
-  private async defaultModel(signal?: AbortSignal): Promise<{ id: string; defaultReasoningEffort?: string } | undefined> {
-    if (this.cachedDefault) return this.cachedDefault;
-    const models = await this.modelSelections(signal);
-    const pick = models.find((entry) => entry.isDefault)
-      ?? models.find((entry) => !entry.hidden)
-      ?? models[0];
-    if (!pick) return undefined;
-    this.cachedDefault = { id: pick.id, ...(pick.defaultReasoningEffort ? { defaultReasoningEffort: pick.defaultReasoningEffort } : {}) };
-    return this.cachedDefault;
-  }
-
-  /** Public view of the server's default model selection (isDefault entry,
-   * deterministic first-non-hidden fallback, else the first entry). Cached.
-   * Used by callers that must pass the SAME explicit model into visible turns
-   * and their ephemeral conversion forks when no model is configured. */
   async resolveDefaultModel(signal?: AbortSignal): Promise<string | undefined> {
-    const selected = await this.defaultModel(signal);
-    return selected?.id;
+    return this.modelGateway.resolveDefaultModel(signal);
   }
-
   /** Probe the App Server's thread directory (`thread/list`) when the protocol
    * provides it. Returns the known thread ids, or `undefined` when the method
    * is unsupported (older servers) so callers can skip directory assertions
