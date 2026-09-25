@@ -49,6 +49,7 @@ import { WorkflowRuntimeState } from "./application/workflow-runtime-state.js";
 import { ReviewObservation } from "./application/review-observation.js";
 import { ReviewExecution } from "./application/review-execution.js";
 import { SubmissionExecution } from "./application/submission-execution.js";
+import { LifecycleExecution } from "./application/lifecycle-execution.js";
 import type {
   AlignmentOutcome,
   PersistedTurnBaseline,
@@ -261,6 +262,7 @@ export class WorkflowManager {
   private readonly reviewObservation: ReviewObservation;
   private readonly reviewExecution: ReviewExecution;
   private readonly submissionExecution: SubmissionExecution;
+  private readonly lifecycleExecution: LifecycleExecution;
   /** The only owner of in-process flow lifecycle state. */
   private readonly runtime = new WorkflowRuntimeState();
   /** Submission lease lifetime; heartbeats renew at ttl/3 while a callback
@@ -383,6 +385,15 @@ export class WorkflowManager {
       alignReview: this.alignReview.bind(this),
       reconcileReview: this.reconcileReview.bind(this),
       errorMessage,
+    });
+    this.lifecycleExecution = new LifecycleExecution({
+      store: this.store,
+      runtime: this.runtime,
+      reviewObservation: this.reviewObservation,
+      turnGateway: this.turnGateway,
+      callback: this.callback,
+      requireAgent,
+      submissionTaskKey: this.submissionTaskKey.bind(this),
     });
   }
 
@@ -639,38 +650,9 @@ export class WorkflowManager {
    * share ONE settle promise, so a second caller can never resolve before the
    * first has truly finished tearing down.
    */
-  private async stopInternal(): Promise<void> {
-    if (this.runtime.stopPromise) return this.runtime.stopPromise;
-    const task = this.doStop();
-    this.runtime.stopPromise = task;
-    return task;
+  private stopInternal(): Promise<void> {
+    return this.lifecycleExecution.stop();
   }
-
-  private async doStop(): Promise<void> {
-    if (this.runtime.stopped) return;
-    this.runtime.stopped = true;
-    this.runtime.lifecycleController.abort();
-    for (const controller of this.runtime.submissionControllers.values()) controller.abort();
-    // Interrupt every ACTIVE foreground turn (visible Planner/Reviewer or
-    // ephemeral normalization fork) so the foreground tool flows settle via
-    // their own abort/interrupt paths instead of timing out into a closed
-    // store. Background Reviewer turns are interrupted by callback.stop().
-    for (const active of this.runtime.activeTurns.values()) {
-      void this.turnGateway.interrupt(active.threadId, active.turnId).catch(() => undefined);
-    }
-    const foreground = [...this.runtime.foreground];
-    const callbackStop = this.callback?.stop();
-    const chain = this.runtime.recoveryChain;
-    this.runtime.recoveryChain = undefined;
-    if (chain) await chain.catch(() => undefined);
-    // Wait for EVERY manager-owned task to settle (foreground tool flows AND
-    // background recovery-derived tasks; they observe the abort and the
-    // interrupts and stop writing/enqueueing/spawning).
-    const tasks = [...this.runtime.backgroundTasks];
-    await Promise.allSettled([...tasks, ...foreground]);
-    await callbackStop;
-  }
-
   /** Track every foreground tool flow so teardown can interrupt and await it
    * before stopping the App Server and closing the stores. Registered at the
    * method boundary so even a tool call that dies mid-flight is awaited. */
@@ -1624,120 +1606,12 @@ export class WorkflowManager {
     return commit.record;
   }
 
-  private async statusInternal(workflowId: string | undefined, exec: ToolRunContext): Promise<WorkflowRecord & { reviewerActive: boolean }> {
-    const agent = requireAgent(exec);
-    let record = workflowId ? await this.store.load(workflowId) : await this.store.activeForSession(agent.id);
-    if (!record) throw new Error(workflowId ? `unknown workflow ${workflowId}` : "no active Codex workflow for this session");
-    if (record.dshSessionId !== agent.id) throw new Error("workflow belongs to another DSH session");
-    // Old records have no observability fields. Hydrate a safe baseline from
-    // their durable updatedAt and immediately classify an abandoned review as
-    // stale; status remains read-safe and never exposes model output.
-    if (!record.processState && record.phase === "reviewing") {
-      const baseline = record.updatedAt || new Date().toISOString();
-      const hydrated = await this.store.update(record.id, (current) => {
-        if (current.processState) return;
-        current.processState = "running";
-        current.reviewStep = "reviewing";
-        current.reviewStartedAt = current.reviewStartedAt ?? baseline;
-        current.lastProgressAt = current.lastProgressAt ?? baseline;
-        current.reviewAttempt = current.reviewAttempt ?? 1;
-        current.reviewElapsedMs = current.reviewElapsedMs ?? 0;
-        current.lastProgressMessage = current.lastProgressMessage ?? "Review status recovered after restart";
-      }, { ignoreCancelled: true });
-      record = hydrated.record;
-    }
-    record = await this.reviewObservation.refreshStale(record);
-    if (!record.processState && ["passed", "blocked", "waiting_review_decision"].includes(record.phase)) {
-      record = { ...record, processState: "completed" };
-    } else if (!record.processState && record.phase === "cancelled") {
-      record = { ...record, processState: "cancelled" };
-    } else if (!record.processState && record.phase === "failed") {
-      record = { ...record, processState: "failed" };
-    }
-    // Whether a Reviewer turn is currently executing. Provsional per-message
-    // JSON is never surfaced; `latestReview` only ever holds an applied verdict.
-    // A live Reviewer turn is reported by the callback dispatcher (accurate even
-    // during retry backoff / verdict delivery / terminal states), by the
-    // in-process active-turn mapping (visible Reviewer turns AND ephemeral
-    // conversion forks), or by the DSH-led reviewing phase as the fallback when
-    // no dispatcher is injected.
-    const reviewerActive =
-      this.callback?.activeReview?.(record.id) === true
-      || this.runtime.activeTurns.get(record.id)?.kind === "reviewer"
-      || (record.processState === "running" && record.phase === "reviewing" && Boolean(record.reviewerTurnId));
-    return { ...record, reviewerActive };
+  private statusInternal(workflowId: string | undefined, exec: ToolRunContext): Promise<WorkflowRecord & { reviewerActive: boolean }> {
+    return this.lifecycleExecution.status(workflowId, exec);
   }
-
-  /**
-   * Cancel is the only writer allowed to flip any state to cancelled. The
-   * phase flip and the read of the currently known active turn happen in one
-   * atomic update; the interrupt afterwards is best-effort and a failure keeps
-   * the workflow cancelled. All other writers suppress themselves once the
-   * record is cancelled, so cancelled is terminal.
-   *
-   * The interrupt targets the in-process ACTIVE turn (visible or ephemeral)
-   * whenever one is registered: an active ephemeral conversion-fork turn is
-   * interrupted on the FORK thread/turn pair, so an ephemeral turnId can never
-   * be mispaired with a persistent threadId. Only when nothing is active does
-   * cancel fall back to the persisted planner/reviewer pair.
-   */
-  private async cancelInternal(workflowId: string, exec: ToolRunContext): Promise<WorkflowRecord> {
-    const agent = requireAgent(exec);
-    const active = this.runtime.activeTurns.get(workflowId);
-    let target: { threadId: string; turnId: string } | undefined;
-    const outcome = await this.store.update(workflowId, (r) => {
-      if (r.dshSessionId !== agent.id) throw new Error("workflow belongs to another DSH session");
-      if (!active) {
-        // Persisted fallback, ONLY for the distinct-Reviewer layout
-        // (review_only task, or a legacy record with its own reviewer id):
-        // there the persisted reviewer pair points at a review task that is
-        // never the planning task, so interrupting its last-known turn keeps
-        // the pre-1.0.8 contract. Since 1.0.8, planned/bridge workflows
-        // share ONE task (`reviewerThreadId === plannerThreadId`): a
-        // persisted turn id there may be an ALREADY-COMPLETED Planner or
-        // review turn, and a completed turn must never receive an
-        // `turn/interrupt` — the genuinely running turn is covered by the
-        // in-process active-turn map, by registerActiveTurn's
-        // suppressed-registration interrupt, and by the callback latch.
-        if (r.reviewerThreadId && r.reviewerTurnId && r.reviewerThreadId !== r.plannerThreadId) {
-          target = { threadId: r.reviewerThreadId, turnId: r.reviewerTurnId };
-        }
-        // The planner pair is never a fallback target: `plannerTurnId` is
-        // only persisted for COMPLETED planner turns (while the planner is
-        // running, the active-turn map covers it), so it must never receive
-        // an interrupt.
-      }
-      r.phase = "cancelled";
-      r.processState = "cancelled";
-      r.activeTurnId = undefined;
-      r.lastProgressAt = new Date().toISOString();
-      r.lastProgressMessage = "Review cancelled";
-      if (r.reviewStartedAt) {
-        const started = Date.parse(r.reviewStartedAt);
-        if (Number.isFinite(started)) r.reviewElapsedMs = Math.max(0, Date.now() - started);
-      }
-      if (r.submissionId && !submissionTerminal(r.submissionState)) {
-        // Terminate the in-flight submission so no callback state may regress.
-        r.submissionState = "failed";
-        r.submissionError = "workflow cancelled";
-        r.callbackState = "failed";
-      }
-    }, { ignoreCancelled: true });
-    this.reviewObservation.stopHeartbeat(workflowId);
-    if (active) target = { threadId: active.threadId, turnId: active.turnId };
-    if (target) {
-      await this.turnGateway.interrupt(target.threadId, target.turnId, exec.signal).catch(() => undefined);
-    }
-    // Cancel the active Reviewer operation, if any; cancelled is terminal for it too.
-    if (outcome.record.submissionId) {
-      this.runtime.submissionControllers
-        .get(this.submissionTaskKey(workflowId, outcome.record.submissionId))
-        ?.abort();
-    }
-    this.callback?.cancel(workflowId);
-    return outcome.record;
+  private cancelInternal(workflowId: string, exec: ToolRunContext): Promise<WorkflowRecord> {
+    return this.lifecycleExecution.cancel(workflowId, exec);
   }
-
   private async onTurnStoppingInternal(agent: Agent, turn: number): Promise<void> {
     const record = await this.store.activeForSession(agent.id);
     // waiting_review_decision must not be steered: the user (not the agent)
