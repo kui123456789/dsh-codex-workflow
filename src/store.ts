@@ -342,7 +342,12 @@ function recordJson(record: WorkflowRecord): string {
 /** Parse a workflow row, overriding `record.revision` with the database row's
  * revision — the JSON inside record_json must never be trusted for it. */
 function parseWorkflowRow(row: { id: string; revision: number; recordJson: string }): WorkflowRecord {
-  const record = parseRecord(deserializeWorkflowRecord(JSON.parse(row.recordJson)));
-  record.revision = row.revision;
-  return record;
+  try {
+    const record = parseRecord(deserializeWorkflowRecord(JSON.parse(row.recordJson)));
+    record.revision = row.revision;
+    return record;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`workflow ${row.id} record is invalid: ${message}`, { cause: error });
+  }
 }

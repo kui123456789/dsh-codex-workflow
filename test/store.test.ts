@@ -319,6 +319,19 @@ test("workflow store creates a pre-schema-v2 database backup before opening an e
   }
 });
 
+test("workflow store reports the workflow id when a persisted schema is corrupt", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-schema-corrupt-"));
+  try {
+    const store = new WorkflowStore(directory);
+    await store.init();
+    store.coordinationHandle.saveWorkflow("wf-corrupt", JSON.stringify({ schemaVersion: 99 }));
+    await assert.rejects(store.load("wf-corrupt"), /workflow wf-corrupt record is invalid: unsupported workflow schemaVersion 99/);
+    store.close();
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
 test("abandonOrphaned cancels stale session-less workflows but preserves active submissions", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-orphan-recovery-"));
   try {
