@@ -37,6 +37,10 @@ import {
 } from "./review-authority.js";
 import { PLANNER_OUTPUT_SCHEMA, REVIEW_OUTPUT_SCHEMA } from "./schemas.js";
 import { WorkflowStore } from "./store.js";
+import { LifecycleFlow } from "./application/lifecycle-flow.js";
+import { PlannerFlow } from "./application/planner-flow.js";
+import { ReviewFlow } from "./application/review-flow.js";
+import { SubmissionFlow } from "./application/submission-flow.js";
 import type {
   AlignmentOutcome,
   PersistedTurnBaseline,
@@ -236,6 +240,13 @@ export interface CodexCallback {
 }
 
 export class WorkflowManager {
+  /** Phase 2 application flows. The manager remains the compatibility facade;
+   * each flow owns one public use-case boundary and delegates to the legacy
+   * implementation while its internals are extracted incrementally. */
+  private readonly plannerFlow: PlannerFlow;
+  private readonly reviewFlow: ReviewFlow;
+  private readonly submissionFlow: SubmissionFlow;
+  private readonly lifecycleFlow: LifecycleFlow;
   private readonly pending = new Map<string, TurnNeedsInputResult>();
   private readonly nudgedTurns = new Set<string>();
   private readonly recovering = new Set<string>();
@@ -290,6 +301,98 @@ export class WorkflowManager {
     this.retryNow = retryHooks.now ?? Date.now;
     this.retrySleep = retryHooks.sleep ?? ((ms, signal) => delay(ms, signal));
     this.retryRandom = retryHooks.random ?? Math.random;
+    this.plannerFlow = new PlannerFlow({
+      start: this.startInternal.bind(this),
+      continue: this.continueInternal.bind(this),
+      startExternalPlan: this.startExternalPlanInternal.bind(this),
+      onTurnStopping: this.onTurnStoppingInternal.bind(this),
+      decide: this.decideInternal.bind(this),
+    });
+    this.reviewFlow = new ReviewFlow({
+      review: this.reviewInternal.bind(this),
+      reviewOnly: this.reviewOnlyInternal.bind(this),
+      applyExternalVerdict: this.applyExternalVerdictInternal.bind(this),
+      assertVerdictStillValid: this.assertVerdictStillValidInternal.bind(this),
+    });
+    this.submissionFlow = new SubmissionFlow({
+      submit: this.submitInternal.bind(this),
+      recoverCallbacks: this.recoverCallbacksInternal.bind(this),
+      commitVerdictDelivery: this.commitVerdictDeliveryInternal.bind(this),
+      commitSubmissionNoticeDelivery: this.commitSubmissionNoticeDeliveryInternal.bind(this),
+    });
+    this.lifecycleFlow = new LifecycleFlow({
+      status: this.statusInternal.bind(this),
+      cancel: this.cancelInternal.bind(this),
+      stop: this.stopInternal.bind(this),
+    });
+  }
+
+  // ---------------------------------------------------------------- facade
+  // Public compatibility surface. New consumers use the flow objects above;
+  // these methods keep the existing DSH tools, bridge runtime and npm API
+  // stable while the implementation moves behind the application boundaries.
+  start(args: { task: string; plannerModel?: string; plannerEffort?: WorkflowConfig["plannerEffort"] }, exec: ToolRunContext): Promise<WorkflowRecord> {
+    return this.plannerFlow.start(args, exec);
+  }
+
+  continue(workflowId: string, answers: Record<string, string[]>, exec: ToolRunContext): Promise<WorkflowRecord> {
+    return this.plannerFlow.continue(workflowId, answers, exec);
+  }
+
+  startExternalPlan(command: DispatchPlanCommand, agent: Agent): Promise<WorkflowRecord> {
+    return this.plannerFlow.startExternalPlan(command, agent);
+  }
+
+  onTurnStopping(agent: Agent, turn: number): Promise<void> {
+    return this.plannerFlow.onTurnStopping(agent, turn);
+  }
+
+  decide(workflowId: string, input: { decision: "accept" | "fix"; note?: string }, exec: ToolRunContext): Promise<WorkflowRecord> {
+    return this.plannerFlow.decide(workflowId, input, exec);
+  }
+
+  review(workflowId: string, input: ReviewInput, exec: ToolRunContext): Promise<WorkflowRecord> {
+    return this.reviewFlow.review(workflowId, input, exec);
+  }
+
+  reviewOnly(args: { task?: string; implementationSummary: string; changedFiles?: string[]; testResults?: string; reviewerModel?: string; reviewerEffort?: WorkflowConfig["reviewerEffort"] }, exec: ToolRunContext): Promise<WorkflowRecord> {
+    return this.reviewFlow.reviewOnly(args, exec);
+  }
+
+  applyExternalVerdict(command: SubmitVerdictCommand): Promise<WorkflowRecord> {
+    return this.reviewFlow.applyExternalVerdict(command);
+  }
+
+  assertVerdictStillValid(command: SubmitVerdictCommand): Promise<{ invalidated: boolean; record: WorkflowRecord }> {
+    return this.reviewFlow.assertVerdictStillValid(command);
+  }
+
+  submit(workflowId: string, input: ReviewInput, exec: ToolRunContext): Promise<WorkflowRecord> {
+    return this.submissionFlow.submit(workflowId, input, exec);
+  }
+
+  recoverCallbacks(): Promise<number> {
+    return this.submissionFlow.recoverCallbacks();
+  }
+
+  commitVerdictDelivery(command: SubmitVerdictCommand): Promise<{ committed: boolean; record: WorkflowRecord }> {
+    return this.submissionFlow.commitVerdictDelivery(command);
+  }
+
+  commitSubmissionNoticeDelivery(command: SubmissionNoticeCommand): Promise<{ committed: boolean; record: WorkflowRecord }> {
+    return this.submissionFlow.commitSubmissionNoticeDelivery(command);
+  }
+
+  status(workflowId: string | undefined, exec: ToolRunContext): Promise<WorkflowRecord & { reviewerActive: boolean }> {
+    return this.lifecycleFlow.status(workflowId, exec);
+  }
+
+  cancel(workflowId: string, exec: ToolRunContext): Promise<WorkflowRecord> {
+    return this.lifecycleFlow.cancel(workflowId, exec);
+  }
+
+  stop(): Promise<void> {
+    return this.lifecycleFlow.stop();
   }
 
   private reviewHeartbeatMs(): number {
@@ -600,7 +703,7 @@ export class WorkflowManager {
    * share ONE settle promise, so a second caller can never resolve before the
    * first has truly finished tearing down.
    */
-  async stop(): Promise<void> {
+  private async stopInternal(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
     const task = this.doStop();
     this.stopPromise = task;
@@ -687,7 +790,7 @@ export class WorkflowManager {
   }
 
   /** Foreground tool flow: tracked so teardown interrupts and awaits it. */
-  async start(
+  private async startInternal(
     args: { task: string; plannerModel?: string; plannerEffort?: WorkflowConfig["plannerEffort"] },
     exec: ToolRunContext,
   ): Promise<WorkflowRecord> {
@@ -785,7 +888,7 @@ export class WorkflowManager {
    *  - Legacy manual path (no staged verdict) applies from waiting_verdict.
    * The outcome (including refusal) is persisted in one atomic CAS update.
    */
-  async applyExternalVerdict(command: SubmitVerdictCommand): Promise<WorkflowRecord> {
+  private async applyExternalVerdictInternal(command: SubmitVerdictCommand): Promise<WorkflowRecord> {
     const record = await this.store.load(command.workflowId);
     if (!record) throw new Error(`unknown workflow ${command.workflowId}`);
     if (record.origin !== "codex_bridge") {
@@ -935,7 +1038,7 @@ export class WorkflowManager {
    * durable `delivered` is committed only after the relay succeeds.
    * A cancelled workflow always short-circuits without touching state.
    */
-  async assertVerdictStillValid(command: SubmitVerdictCommand): Promise<{ invalidated: boolean; record: WorkflowRecord }> {
+  private async assertVerdictStillValidInternal(command: SubmitVerdictCommand): Promise<{ invalidated: boolean; record: WorkflowRecord }> {
     const loaded = await this.store.load(command.workflowId);
     if (!loaded) return { invalidated: false, record: loaded as unknown as WorkflowRecord };
     if (loaded.phase === "cancelled") return { invalidated: false, record: loaded };
@@ -992,7 +1095,7 @@ export class WorkflowManager {
    * {@link assertVerdictStillValid} before this, never inside the
    * transaction.
    */
-  async commitVerdictDelivery(
+  private async commitVerdictDeliveryInternal(
     command: SubmitVerdictCommand,
   ): Promise<{ committed: boolean; record: WorkflowRecord }> {
     let changed = false;
@@ -1022,7 +1125,7 @@ export class WorkflowManager {
     record.desktopOpenState = "disabled";
   }
 
-  async commitSubmissionNoticeDelivery(
+  private async commitSubmissionNoticeDeliveryInternal(
     command: SubmissionNoticeCommand,
   ): Promise<{ committed: boolean; record: WorkflowRecord }> {
     let changed = false;
@@ -1051,7 +1154,7 @@ export class WorkflowManager {
    * idempotently or is rejected as already active; never two active
    * workflows.
    */
-  async startExternalPlan(command: DispatchPlanCommand, agent: Agent): Promise<WorkflowRecord> {
+  private async startExternalPlanInternal(command: DispatchPlanCommand, agent: Agent): Promise<WorkflowRecord> {
     // Bounded wait for the session-scoped create lease so concurrent
     // creators of the SAME request converge idempotently instead of failing:
     // the loser waits, then re-checks byBridgeRequest and returns the record
@@ -1096,7 +1199,7 @@ export class WorkflowManager {
     }
   }
 
-  async continue(
+  private async continueInternal(
     workflowId: string,
     answers: Record<string, string[]>,
     exec: ToolRunContext,
@@ -1130,7 +1233,7 @@ export class WorkflowManager {
   }
 
   /** Foreground tool flow: tracked so teardown interrupts and awaits it. */
-  async review(
+  private async reviewInternal(
     workflowId: string,
     input: ReviewInput,
     exec: ToolRunContext,
@@ -1156,7 +1259,7 @@ export class WorkflowManager {
    * unverifiable workspace is rejected outright. All state updates are
    * atomic revision-CAS writes conditional on the submission id.
    */
-  async submit(
+  private async submitInternal(
     workflowId: string,
     input: ReviewInput,
     exec: ToolRunContext,
@@ -1766,7 +1869,7 @@ export class WorkflowManager {
    * active run that stop() is about to abort/await (which would otherwise let
    * stop() return before the abandoned run finished writing).
    */
-  recoverCallbacks(): Promise<number> {
+  private recoverCallbacksInternal(): Promise<number> {
     if (!this.callback) return Promise.resolve(0);
     if (this.stopped) return Promise.resolve(0); // teardown gate: nothing to recover, never touch a closing store
     if (this.activeRecovery) return Promise.resolve(0);
@@ -1934,7 +2037,7 @@ export class WorkflowManager {
    * evidence, decision-gate, no-change and cycle-limit logic is shared.
    */
   /** Foreground tool flow: tracked so teardown interrupts and awaits it. */
-  async reviewOnly(
+  private async reviewOnlyInternal(
     args: {
       task?: string;
       implementationSummary: string;
@@ -1988,7 +2091,7 @@ export class WorkflowManager {
     }, exec)) as Promise<WorkflowRecord>;
   }
 
-  async decide(
+  private async decideInternal(
     workflowId: string,
     input: { decision: "accept" | "fix"; note?: string },
     exec: ToolRunContext,
@@ -2020,7 +2123,7 @@ export class WorkflowManager {
     return commit.record;
   }
 
-  async status(workflowId: string | undefined, exec: ToolRunContext): Promise<WorkflowRecord & { reviewerActive: boolean }> {
+  private async statusInternal(workflowId: string | undefined, exec: ToolRunContext): Promise<WorkflowRecord & { reviewerActive: boolean }> {
     const agent = requireAgent(exec);
     let record = workflowId ? await this.store.load(workflowId) : await this.store.activeForSession(agent.id);
     if (!record) throw new Error(workflowId ? `unknown workflow ${workflowId}` : "no active Codex workflow for this session");
@@ -2077,7 +2180,7 @@ export class WorkflowManager {
    * be mispaired with a persistent threadId. Only when nothing is active does
    * cancel fall back to the persisted planner/reviewer pair.
    */
-  async cancel(workflowId: string, exec: ToolRunContext): Promise<WorkflowRecord> {
+  private async cancelInternal(workflowId: string, exec: ToolRunContext): Promise<WorkflowRecord> {
     const agent = requireAgent(exec);
     const active = this.activeTurns.get(workflowId);
     let target: { threadId: string; turnId: string } | undefined;
@@ -2134,7 +2237,7 @@ export class WorkflowManager {
     return outcome.record;
   }
 
-  async onTurnStopping(agent: Agent, turn: number): Promise<void> {
+  private async onTurnStoppingInternal(agent: Agent, turn: number): Promise<void> {
     const record = await this.store.activeForSession(agent.id);
     // waiting_review_decision must not be steered: the user (not the agent)
     // decides whether non-blocking findings get fixed.
