@@ -96,6 +96,12 @@ export interface CodexGateway {
   nameThread?(threadId: string, name: string, signal?: AbortSignal): Promise<void>;
   interrupt(threadId: string, turnId: string, signal?: AbortSignal): Promise<void>;
   unsubscribeThread?(threadId: string, signal?: AbortSignal): Promise<unknown>;
+  /** 1.1.6: pin the App Server child for the duration of a round, so the idle
+   * window can never fall between creating a thread and its first turn (the
+   * respawned process would answer `thread not found` for the new thread). */
+  beginRound?(): void;
+  /** Release a round pin (`beginRound`). */
+  endRound?(): void;
   releaseThreadForExternal?(threadId: string, signal?: AbortSignal): Promise<void>;
   /** Structured conversion of a visible reply inside an EPHEMERAL fork of the
    * given persistent thread (`thread/fork` with `ephemeral: true` + one
@@ -2181,6 +2187,10 @@ export class WorkflowManager {
     let current = entering.record;
     let reviewerClaimed = false;
     let reviewerThreadId: string | undefined;
+    // 1.1.6: pin the App Server child for the whole round. Without the pin the
+    // idle window can fall between creating the Reviewer and its first turn,
+    // and the respawned process answers `thread not found` for that new thread.
+    this.codex.beginRound?.();
     try {
       const evidence = await collectEvidence({
         cwd: current.cwd,
@@ -2590,6 +2600,8 @@ export class WorkflowManager {
       this.reportCleanupNote(workflowId, releaseNote);
       await this.finishReviewObservation(workflowId);
       await this.flushCleanupNotes(workflowId);
+      // The pin is released LAST: the cleanup above still runs on this child.
+      this.codex.endRound?.();
     }
   }
 

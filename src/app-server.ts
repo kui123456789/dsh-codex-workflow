@@ -215,6 +215,8 @@ export class CodexAppServerClient {
   private idleStopping?: Promise<void>;
   private nextId = 1;
   private idleTimer?: NodeJS.Timeout;
+  /** 1.1.6: rounds currently pinning this child (see `beginRound`). */
+  private pinned = 0;
   private turnWaiters = 0;
   private cachedDefault?: { id: string; defaultReasoningEffort?: string };
   private stderr = "";
@@ -1106,15 +1108,38 @@ export class CodexAppServerClient {
     this.idleTimer = undefined;
   }
 
+  /**
+   * 1.1.6: pin the App Server child for the duration of a round.
+   *
+   * The idle timer fires whenever no RPC is pending, so a gap between CREATING a
+   * thread and its FIRST turn (a store write, evidence collection, a settings
+   * refresh — anything longer than `idleProcessMs`) used to let the child exit.
+   * The respawned process does not know that thread and answers
+   * `thread not found` for the very thread the round just created, which broke
+   * the first background review under production settings (default 5s window).
+   * A round pins the child instead and releases the pin when it ends.
+   */
+  beginRound(): void {
+    this.pinned += 1;
+    this.clearIdleTimer();
+  }
+
+  /** Release a round pin; the idle timer is re-armed once nothing is pinned. */
+  endRound(): void {
+    this.pinned = Math.max(0, this.pinned - 1);
+    if (this.pinned === 0) this.scheduleIdle();
+  }
+
   private scheduleIdle(): void {
     if (this.options.idleProcessMs <= 0) return;
     this.clearIdleTimer();
+    if (this.pinned > 0) return;
     if (!this.isIdle()) return;
     this.idleTimer = setTimeout(() => {
       this.idleTimer = undefined;
       // RECOVERABLE shutdown: idle closes the child but NEVER latches this
       // client — the next start()/health() respawns a fresh App Server.
-      if (this.isIdle()) void this.idleShutdown();
+      if (this.pinned === 0 && this.isIdle()) void this.idleShutdown();
     }, this.options.idleProcessMs);
     this.idleTimer.unref();
   }

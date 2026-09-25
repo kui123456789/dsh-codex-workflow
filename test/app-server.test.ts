@@ -1167,3 +1167,41 @@ async function waitForProcessExit(pid: number): Promise<void> {
   }
   throw new Error(`timed out waiting for process ${pid} to exit`);
 }
+
+/**
+ * 1.1.6: a round PINS the App Server child. The idle timer fires whenever no RPC
+ * is pending, so without the pin a gap between creating a thread and its first
+ * turn (longer than `idleProcessMs`) let the child exit — and the respawned
+ * process answers `thread not found` for the thread the round just created,
+ * which broke the first background review under production settings.
+ */
+test("1.1.6: a pinned round keeps the child alive across a gap longer than idleProcessMs", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-app-server-pin-"));
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 30,
+  });
+  try {
+    const threadId = await codex.startThread({ cwd: directory, name: "Pinned round" });
+    codex.beginRound();
+    // Longer than idleProcessMs: an unpinned client would have closed the child.
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const result = await codex.startTurn(threadId, { prompt: "Still there?" });
+    assert.equal(result.kind, "completed", "the pinned child still knows the thread it just created");
+    codex.endRound();
+  } finally {
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+/**
+ * The unpinned control is NOT reproducible against this fixture: the fake App
+ * Server keeps threads in memory and the client's `isIdle()` does not go true
+ * here, so the idle shutdown never fires. The real-Codex evidence for the
+ * mechanism is recorded in the 1.1.6 diagnosis (a gap longer than
+ * `idleProcessMs` between `thread/start` and `turn/start` made the respawned
+ * App Server answer `thread not found`); the pin above is what prevents it.
+ */

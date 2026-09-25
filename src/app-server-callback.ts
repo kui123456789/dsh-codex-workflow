@@ -194,10 +194,15 @@ export class AppServerCodexCallbackDispatcher {
   private async run(request: CodexCallbackRequest, signal?: AbortSignal): Promise<CodexCallbackResult> {
     const key = `${request.workflowId}:${request.submissionId}`;
     let reviewerThreadId: string | undefined;
-    // True only once THIS invocation owns an App Server subscription to the
-    // task carrying the review. The claim is acquired only after resume
-    // succeeds, so a pre-turn failure cannot release another review's hold.
+    // True only once THIS invocation owns an App Server subscription to the task
+    // carrying the review. A task created HERE is claimed by the creation itself
+    // (1.1.5: it is never resumed); a PRE-EXISTING task is claimed by its resume,
+    // so a failed resume can never release another review's hold.
     let claimed = false;
+    // 1.1.6: pin the child for the whole round. The idle window must never fall
+    // between creating the Reviewer and its first turn — the respawned process
+    // does not know that thread and answers `thread not found`.
+    this.codex.beginRound?.();
     try {
       reviewerThreadId = request.reviewerThreadId;
       // 1.1.0: a review NEVER runs on the origin (source) task. A dedicated
@@ -496,6 +501,8 @@ export class AppServerCodexCallbackDispatcher {
       // only when THIS invocation acquired the claim. Unsubscribe unloads this
       // client subscription; it does not delete the persistent Desktop task.
       if (reviewerThreadId && claimed) await this.releaseThread(reviewerThreadId);
+      // The pin is released LAST: the release above still runs on this child.
+      this.codex.endRound?.();
     }
   }
 

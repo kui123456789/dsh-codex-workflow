@@ -1407,3 +1407,46 @@ test("a review/start reporting a different task id IN onStarted is interrupted, 
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+/**
+ * Test gap from the 1.1.6 review: a Reviewer that is CREATED and then fails on
+ * its settings write (`configureReviewerThread`) is bound to nothing and owned by
+ * nobody, so its subscription must be released EXACTLY ONCE — the creation-path
+ * counterpart of the failed-resume case.
+ */
+test("1.1.6: a Reviewer whose settings write fails after creation is released exactly once", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-app-server-callback-settings-"));
+  const marker = join(directory, "calls.jsonl");
+  const codex = new CodexAppServerClient({
+    command: process.execPath,
+    args: [fixture],
+    requestTimeoutMs: 5_000,
+    idleProcessMs: 0,
+    env: {
+      ...process.env,
+      FAKE_CODEX_THREAD_PARAMS_MARKER: marker,
+      FAKE_CODEX_FAIL_SETTINGS: "1",
+    },
+  });
+  const callback = new AppServerCodexCallbackDispatcher(codex);
+  const readCalls = async () => (await readFile(marker, "utf8")).trim().split("\n").filter(Boolean)
+    .map((line) => JSON.parse(line) as { method: string; params: Record<string, any> });
+  try {
+    await assert.rejects(callback.send({
+      workflowId: "workflow-settings",
+      submissionId: "submission-settings",
+      codexThreadId: "origin-task-settings",
+      cwd: directory,
+      prompt: "Review this implementation.",
+    }));
+    const calls = await readCalls();
+    assert.equal(calls.filter((call) => call.method === "thread/start").length, 1, "the review created its own Reviewer");
+    const unsubs = calls.filter((call) => call.method === "thread/unsubscribe");
+    assert.equal(unsubs.length, 1, "the orphaned created task is released exactly once");
+    assert.ok(unsubs[0]!.params.threadId, "the released task is the one that was created");
+  } finally {
+    await callback.stop().catch(() => undefined);
+    await codex.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});

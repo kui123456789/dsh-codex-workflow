@@ -133,6 +133,34 @@ export type CoordinationDatabasePort = Pick<
   "close" | "isClosed" | "journalMode" | "integrityCheck" | "sqliteVersion"
 >;
 
+// ---------------------------------------------------------------- Narrowness proof
+
+/** `true` only when `A` is assignable to `B`. */
+type Extends<A, B> = [A] extends [B] ? true : false;
+/** Compile-time assertion: only `true` is accepted. */
+type Expect<T extends true> = T;
+
+/**
+ * The ports are DERIVED from their facades (so they can never drift), and these
+ * assertions prove they are also genuinely NARROWER than them: a port must NOT be
+ * assignable to a type that requires a member outside it, which is exactly what
+ * stops a consumer from reaching the rest of the facade through the port.
+ *
+ * A hand-written interface expresses the same intent without naming the facade;
+ * that rewrite belongs to the phases that actually INJECT these ports (2-5),
+ * where the real consumer surface is known. Until then the narrowness property
+ * stays ENFORCED by the compiler rather than merely intended.
+ */
+type _ThreadPortIsNarrow = Expect<Extends<CodexThreadPort, { startTurn: unknown }> extends false ? true : false>;
+type _TurnPortIsNarrow = Expect<Extends<CodexTurnPort, { resumeThread: unknown }> extends false ? true : false>;
+type _PlannerPortIsNarrow = Expect<Extends<PlannerPort, { review: unknown }> extends false ? true : false>;
+type _ReviewPortIsNarrow = Expect<Extends<ReviewPort, { submit: unknown }> extends false ? true : false>;
+type _SubmissionPortIsNarrow = Expect<Extends<SubmissionPort, { status: unknown }> extends false ? true : false>;
+type _LifecyclePortIsNarrow = Expect<Extends<LifecyclePort, { submit: unknown }> extends false ? true : false>;
+type _QueuePortIsNarrow = Expect<Extends<QueueRepository, { acquireLease: unknown }> extends false ? true : false>;
+type _LeasePortIsNarrow = Expect<Extends<LeaseRepository, { claimNext: unknown }> extends false ? true : false>;
+type _WorkflowRepoIsNarrow = Expect<Extends<WorkflowRepository, { enqueueCommand: unknown }> extends false ? true : false>;
+
 // ---------------------------------------------------------------- Conformance
 
 /**
