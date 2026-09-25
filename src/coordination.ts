@@ -4,6 +4,7 @@ import { parseWorkflowJson } from "./state/workflow-schema.js";
 import { CoordinationDatabase } from "./infrastructure/coordination-database.js";
 import { LeaseRepositorySql, LiveSessionRepositorySql } from "./infrastructure/coordination-repositories.js";
 import { QueueRepositorySql } from "./infrastructure/queue-repository.js";
+import { WorkflowRepositorySql } from "./infrastructure/workflow-repository.js";
 
 /**
  * SQLite-backed coordination state shared by every DSH process and the CLI.
@@ -164,6 +165,7 @@ export class CoordinationStore {
   private readonly leases: LeaseRepositorySql;
   private readonly liveSessions: LiveSessionRepositorySql;
   private readonly queue: QueueRepositorySql;
+  private readonly workflows: WorkflowRepositorySql;
   private closed = false;
 
   constructor(readonly path: string, options: CoordinationOptions = {}) {
@@ -172,6 +174,7 @@ export class CoordinationStore {
     this.leases = new LeaseRepositorySql(this.db);
     this.liveSessions = new LiveSessionRepositorySql(this.db);
     this.queue = new QueueRepositorySql(this.db);
+    this.workflows = new WorkflowRepositorySql(this.db);
     const key = normalizeDbPath(path);
     let group = LIVE_BY_PATH.get(key);
     if (!group) {
@@ -511,51 +514,19 @@ export class CoordinationStore {
 
   loadWorkflow(id: string): WorkflowRow | undefined {
     this.assertOpen();
-    const row = this.db.prepare("SELECT id, revision, record_json, updated_at FROM workflows WHERE id = ?").get(id) as
-      | Record<string, unknown>
-      | undefined;
-    return row ? { id: String(row.id), revision: Number(row.revision), recordJson: String(row.record_json), updatedAt: Number(row.updated_at) } : undefined;
+    return this.workflows.loadWorkflow(id);
   }
 
   listWorkflows(): WorkflowRow[] {
     this.assertOpen();
-    const rows = this.db.prepare("SELECT id, revision, record_json, updated_at FROM workflows ORDER BY updated_at DESC").all() as Array<Record<string, unknown>>;
-    return rows.map((row) => ({ id: String(row.id), revision: Number(row.revision), recordJson: String(row.record_json), updatedAt: Number(row.updated_at) }));
+    return this.workflows.listWorkflows();
   }
 
   saveWorkflow(id: string, recordJson: string, now = Date.now()): void {
     this.assertOpen();
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const existing = this.db.prepare("SELECT revision FROM workflows WHERE id = ?").get(id) as
-        | { revision: number | bigint }
-        | undefined;
-      const revision = Number(existing?.revision ?? 0) + 1;
-      this.db.prepare(
-        `INSERT INTO workflows (id, revision, record_json, updated_at) VALUES (?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET revision = excluded.revision, record_json = excluded.record_json, updated_at = excluded.updated_at`,
-      ).run(id, revision, recordJson, now);
-      this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
+    this.workflows.saveWorkflow(id, recordJson, now);
   }
 
-  /**
-   * Synchronous conditional revision CAS. The transaction opens, verifies the
-   * row still carries `expectedRevision`, runs the (SYNCHRONOUS) mutation and
-   * commits — all within one call stack, so no await ever holds the write
-   * lock and no other asynchronous caller can join an open transaction on the
-   * same connection. Async work (evidence, file I/O) MUST happen before this
-   * call; a lost CAS returns `retry` so the caller re-loads and re-computes.
-   *
-   * The mutation input carries the DB row's authoritative `revision` (the
-   * JSON inside record_json must never be trusted for it). `mutate` may
-   * return `recordJson: undefined` for a no-op commit (e.g. idempotent
-   * replay) that does NOT bump the revision. The committed/suppressed return
-   * always carries the exact revision of the row as it stands.
-   */
   compareAndUpdateWorkflow<T>(
     id: string,
     expectedRevision: number,
@@ -563,48 +534,8 @@ export class CoordinationStore {
     opts: { ignoreCancelled?: boolean },
   ): { kind: "committed" | "suppressed" | "retry"; result?: T; revision: number; recordJson: string } {
     this.assertOpen();
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const existing = this.db.prepare("SELECT revision, record_json FROM workflows WHERE id = ?").get(id) as
-        | { revision: number | bigint; record_json: string }
-        | undefined;
-      if (!existing) {
-        this.db.exec("ROLLBACK");
-        throw new Error(`unknown workflow ${id}`);
-      }
-      const loadedRevision = Number(existing.revision);
-      const raw = parseWorkflowJson(existing.record_json);
-      if (!opts.ignoreCancelled && (raw as { phase?: string }).phase === "cancelled") {
-        this.db.exec("ROLLBACK");
-        return { kind: "suppressed", revision: loadedRevision, recordJson: existing.record_json };
-      }
-      if (loadedRevision !== expectedRevision) {
-        // Lost the CAS race: roll back; the caller re-loads and re-computes.
-        this.db.exec("ROLLBACK");
-        return { kind: "retry", revision: loadedRevision, recordJson: existing.record_json };
-      }
-      const outcome = mutate({ raw, revision: loadedRevision });
-      if (outcome.recordJson === undefined) {
-        // No-op commit: the row is unchanged (same revision), untouched.
-        this.db.exec("COMMIT");
-        return { kind: "committed", result: outcome.result, revision: loadedRevision, recordJson: existing.record_json };
-      }
-      const nextRevision = loadedRevision + 1;
-      const updated = this.db.prepare(
-        "UPDATE workflows SET revision = ?, record_json = ?, updated_at = ? WHERE id = ? AND revision = ?",
-      ).run(nextRevision, outcome.recordJson, Date.now(), id, loadedRevision);
-      if (Number(updated.changes) === 1) {
-        this.db.exec("COMMIT");
-        return { kind: "committed", result: outcome.result, revision: nextRevision, recordJson: outcome.recordJson };
-      }
-      this.db.exec("ROLLBACK");
-      return { kind: "retry", revision: loadedRevision, recordJson: existing.record_json };
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-  }
-}
+    return this.workflows.compareAndUpdateWorkflow(id, expectedRevision, mutate, opts);
+  }}
 
 function receiptDeliveredAt(receiptJson: string): number | undefined {
   try {
