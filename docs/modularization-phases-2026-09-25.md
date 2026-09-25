@@ -126,3 +126,18 @@ Bridge queue/delivery port 迁移由全量测试覆盖，最终 `release:check` 
 
 - 1.1.0 专用 Reviewer（绝不 resume Planner/起源任务）；1.1.1 瞬时重试分类与预算；1.1.2 可见创建/命名/`reviewerThreadOrigin` 惰性迁移/未绑定释放/共享别名不改名；1.1.3 控制类 RPC 重试与自锁规避；1.1.4 每轮归还订阅、`thread/unsubscribe`-only、有界清理与备注 flush。
 - `WorkflowStore` 同步 CAS 与取消抑制；队列 claim epoch/owner fencing；workflow revision CAS；SQLite DELETE journal + synchronous FULL；Bridge 确定性中继 exactly-once；App Server stop/idle fence；`show --json` 字段稳定；npm 导出与 bridge wire 不变。
+
+## 直接执行收口记录（2026-09-25）
+
+本轮取消后台 DSH 重构任务后由 Codex 直接完成并提交：
+
+- `ef13816`：Planner execution、Review observation、Bridge queue/delivery ports、Lease/LiveSession SQL。
+- `d982445`：App Server model-selection gateway、turn gateway 的 round pin/unpin 接入。
+- `f7b04ce`：`QueueRepositorySql`，CoordinationStore 只保留队列生命周期门禁和兼容 facade。
+- `pnpm verify`：439 tests passed，typecheck/build 通过。
+- `pnpm release:check`：`RELEASE_CHECK_OK`，打包审计和 offline doctor 通过。
+- `pnpm host:check`：`ok=true`，DSH `0.1.7-rc.2`、插件 `1.1.5`、8 tools、卸载成功、peer compatible。
+
+仍明确保留在后续范围的只有 CoordinationStore 的 prune/legacy-import 编排，以及
+WorkflowManager 的 Review/Submission 主状态机；它们没有被用空壳 adapter 冒充完成，当前
+调用链和取消/恢复所有权已经由上述模块实际承载。
