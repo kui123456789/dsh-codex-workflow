@@ -214,8 +214,13 @@ test("end-to-end: CLI dispatch -> followup -> submit -> same-task review -> fina
       assert.equal(calls.filter((call) => call.params.threadId === codexThreadId).length, 0,
         "the originating task is never read, resumed, renamed or written");
       assert.equal(starts.length, 1, "exactly ONE dedicated Reviewer task is created");
-      assert.ok(calls.some((call) => call.method === "thread/resume" && call.params.threadId === submitted.reviewerThreadId),
-        "the dedicated Reviewer is the task that gets resumed");
+      // 1.1.5: a Reviewer created by THIS submission is never resumed —
+      // `thread/resume` paginates the thread's history and a task that never ran
+      // a turn has a registered rollout path whose file does not exist yet
+      // (`invalid paginated history lineage … missing source rollout`). It is
+      // still the task that takes the visible turn.
+      assert.equal(calls.filter((call) => call.method === "thread/resume").length, 0,
+        "a freshly created dedicated Reviewer is never resumed");
       // 1.0.7: the VISIBLE Reviewer turn runs on the durable Reviewer WITHOUT
       // an outputSchema; the structured verdict is produced by ONE ephemeral
       // fork conversion turn. 1.0.10 adds a SECOND ephemeral fork: the

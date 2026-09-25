@@ -217,8 +217,16 @@ export class AppServerCodexCallbackDispatcher {
       // the bounded callback retry + the periodic `recoverCallbacks` sweep)
       // instead of becoming a terminal callback failure.
       try {
+        // 1.1.5: resume ONLY a PRE-EXISTING Reviewer. `thread/resume` paginates
+        // the thread's history, and a task THIS invocation just created has a
+        // registered rollout path whose file does not exist yet — the App Server
+        // rejects that with `invalid paginated history lineage for <id>: missing
+        // source rollout`, which made every bridge review fail on a fresh
+        // Reviewer. Creation already leaves the task loaded under this client, so
+        // the subscription is ours either way; the DSH-led path has always worked
+        // exactly like this (its creation branch never resumes).
         if (!reviewerThreadId) reviewerThreadId = await this.createReviewer(request, signal);
-        await this.resumeReviewer(reviewerThreadId, request.cwd, signal);
+        else await this.resumeReviewer(reviewerThreadId, request.cwd, signal);
       } catch (error) {
         // A task THIS invocation just created is bound to nothing and owned by
         // nobody — release its hold instead of leaving an orphaned subscription

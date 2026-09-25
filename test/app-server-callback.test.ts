@@ -117,26 +117,37 @@ test("a NEWLY created Reviewer whose resume fails is released; a pre-existing on
     args: [fixture],
     requestTimeoutMs: 5_000,
     idleProcessMs: 0,
-    env: { ...process.env, FAKE_CODEX_THREAD_PARAMS_MARKER: marker, FAKE_CODEX_ROLLOUT_REQUIRED: "1" },
+    env: {
+      ...process.env,
+      FAKE_CODEX_THREAD_PARAMS_MARKER: marker,
+      FAKE_CODEX_ROLLOUT_REQUIRED: "1",
+      FAKE_CODEX_PLAIN_REVIEW_MARKDOWN: "1",
+      FAKE_CODEX_REVIEW_VERDICT: JSON.stringify({ verdict: "pass", findings: [], testGaps: [], summary: "ok" }),
+    },
   });
   const callback = new AppServerCodexCallbackDispatcher(codex);
   const readCalls = async () => (await readFile(marker, "utf8")).trim().split("\n").filter(Boolean)
     .map((line) => JSON.parse(line) as { method: string; params: Record<string, any> });
   try {
-    // (a) The task THIS invocation created could not be resumed: it is bound to
-    // nothing and owned by nobody, so its hold is released — no orphan.
-    await assert.rejects(callback.send({
-      workflowId: "workflow-orphan",
-      submissionId: "submission-orphan",
-      codexThreadId: "origin-task-orphan",
+    // (a) 1.1.5: a task THIS invocation created is NEVER resumed. `thread/resume`
+    // paginates the thread's history, and a freshly created task has a registered
+    // rollout path whose file does not exist yet — against the real App Server
+    // that is `invalid paginated history lineage … missing source rollout`, which
+    // made every bridge review fail. The rollout constraint is active in this
+    // fixture, so a resume here WOULD fail: completing the round proves the
+    // resume is gone.
+    const outcome = await callback.send({
+      workflowId: "workflow-fresh",
+      submissionId: "submission-fresh",
+      codexThreadId: "origin-task-fresh",
       cwd: directory,
       prompt: "Review this implementation.",
-    }));
+    });
+    assert.equal(outcome.kind, "verdict", "the round completes without resuming the task it just created");
     const created = await readCalls();
     assert.equal(created.filter((call) => call.method === "thread/start").length, 1, "the review created its own Reviewer");
-    const unsubs = created.filter((call) => call.method === "thread/unsubscribe");
-    assert.equal(unsubs.length, 1, "the orphaned created task is released exactly once");
-    assert.ok(unsubs[0]!.params.threadId, "the released task is the one that was created");
+    assert.equal(created.filter((call) => call.method === "thread/resume").length, 0,
+      "a freshly created Reviewer is never resumed — resume would paginate a rollout that does not exist yet");
 
     // (b) An ALREADY BOUND Reviewer that fails to resume belongs to a workflow
     // (possibly another concurrent review): it is NEVER released here, because
@@ -331,7 +342,10 @@ test("creates and reuses a dedicated Reviewer task for every background review, 
     assert.ok(forks.every((call) => call.params.threadId === reviewerThreadId), "forks are created from the dedicated Reviewer task");
     assert.ok(forks.every((call) => call.params.cwd === directory), "forks bind the workflow cwd");
 
-    assert.equal(resumes.length, 2, "each review resumes the dedicated Reviewer task before writing its visible turn");
+    // 1.1.5: only the SECOND cycle resumes — the first one CREATED the task, and
+    // resuming a freshly created task paginates a rollout that does not exist yet
+    // (`invalid paginated history lineage … missing source rollout`).
+    assert.equal(resumes.length, 1, "only a REUSED Reviewer is resumed; a freshly created one is never");
     assert.ok(resumes.every((call) => call.params.threadId === reviewerThreadId));
 
     // FOUR turns per two cycles: two VISIBLE review turns (no outputSchema,
