@@ -10,7 +10,7 @@
 | # | 阶段 | 范围 | 状态 |
 |---|---|---|---|
 | 1 | **ports / facades** | 声明端口层，不改任何行为；`src/index.ts` 仍是唯一 composition root | ✅ 完成（本次提交） |
-| 2 | WorkflowManager 内部拆分 | planner-flow / review-flow / submission-flow / lifecycle + 窄 `WorkflowContext`，保留 active-turn、heartbeat、stop、cancel、recovery 的单一所有权 | 🟡 流程边界已提取；内部状态机仍在 facade 内，后续继续拆分 |
+| 2 | WorkflowManager 内部拆分 | planner-flow / review-flow / submission-flow / lifecycle + 窄 `WorkflowContext`，保留 active-turn、heartbeat、stop、cancel、recovery 的单一所有权 | 🟡 flow boundary + runtime state 已提取；业务状态机仍在 facade 内，后续继续拆分 |
 | 3 | App Server 拆分 | process-transport / thread-gateway / turn-gateway / reviewer-gateway；JSON-RPC、子进程与 waiter 状态不得泄漏到业务流程 | 🟡 process-transport + Reviewer gateway 已提取；thread/turn gateway 待继续 |
 | 4 | Bridge Runtime 拆分 | queue-pump / session-router / delivery-coordinator / terminal-relay-guard；Bridge 依赖窄 port | 🟡 queue/session/delivery/terminal guard 已提取；内部 delivery 迁移待继续 |
 | 5 | CoordinationStore 拆分 | coordination-database / lease-repository / queue-repository / workflow-repository / live-session-repository / legacy-import；共享同一 SQLite 连接与事务 | 🟡 database lifecycle + repository seams 已提取；SQL repositories 待迁移 |
@@ -41,9 +41,10 @@
 ## 阶段 2（flow boundaries）— 当前提交
 
 新增 `src/application/planner-flow.ts`、`review-flow.ts`、`submission-flow.ts` 和
-`lifecycle-flow.ts`。`WorkflowManager` 现在组合这四个 application flow，并保留原有
+`lifecycle-flow.ts` 和 `workflow-runtime-state.ts`。`WorkflowManager` 现在组合这四个 application flow，并保留原有
 public facade 供 DSH tools、BridgeRuntime 和 npm consumers 使用；每个 flow 只接收对应
-的 port，legacy state machine 仍由 manager 单独持有。这样先固定了依赖方向和兼容边界，
+的 port；active turns、foreground/background tasks、recovery、heartbeat 和 teardown
+状态集中由 runtime state 单一持有。legacy business state machine 仍由 manager 单独持有。这样先固定了依赖方向和兼容边界，
 后续提交可以逐个把内部方法移入 flow，而不需要一次性改写所有状态/取消/恢复逻辑。
 
 **阶段门禁**：`pnpm typecheck`、`pnpm test`（438/438）通过。此阶段尚未声称完成
