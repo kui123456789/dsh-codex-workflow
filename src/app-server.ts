@@ -1,6 +1,4 @@
 import { EventEmitter } from "node:events";
-import { createInterface } from "node:readline";
-import crossSpawn from "cross-spawn";
 import type { ChildProcess } from "node:child_process";
 import { CodexInvalidThreadError } from "./codex-callback.js";
 import {
@@ -15,6 +13,7 @@ import type {
   TurnWaitResult,
 } from "./types.js";
 import { PLUGIN_VERSION } from "./version.js";
+import { spawnProcess, stopProcess } from "./infrastructure/process-transport.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -292,15 +291,7 @@ export class CodexAppServerClient {
     // turn back with its final message intact). Where the client is idle there
     // is no active turn/request; for teardown the dispatcher interrupts active
     // turns first, so EOF is never sent to abort a live review.
-    try { child.stdin?.end(); } catch {
-      // stdin may already be closed by the child side.
-    }
-    if (child.exitCode !== null) return;
-    await waitExitOr(child, this.options.quitGraceMs ?? 5_000);
-    if (child.exitCode !== null) return;
-    child.kill();
-    await waitExitOr(child, this.options.killGraceMs ?? 2_000);
-    if (child.exitCode === null) child.kill("SIGKILL");
+    await stopProcess(child, this.options.quitGraceMs ?? 5_000, this.options.killGraceMs ?? 2_000);
   }
 
   async health(signal?: AbortSignal): Promise<{ modelCount: number }> {
@@ -706,13 +697,8 @@ export class CodexAppServerClient {
 
   private async startProcess(signal?: AbortSignal): Promise<void> {
     this.stderr = "";
-    const child = crossSpawn(this.options.command, this.options.args ?? ["app-server", "--stdio"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-      env: this.options.env ?? process.env,
-    });
+    const { child, lines } = spawnProcess(this.options);
     this.child = child;
-    const lines = createInterface({ input: child.stdout! });
     lines.on("line", (line) => this.onLine(line));
     child.stderr!.on("data", (chunk: Buffer | string) => {
       this.stderr = `${this.stderr}${String(chunk)}`.slice(-16_384);
@@ -1174,15 +1160,7 @@ export class CodexAppServerClient {
     // and exit before we escalate. The client is idle by construction (no
     // pending RPC, no active turn waiter), so EOF is never sent to abort a
     // live review.
-    try { child.stdin?.end(); } catch {
-      // stdin may already be closed by the child side.
-    }
-    if (child.exitCode !== null) return;
-    await waitExitOr(child, this.options.quitGraceMs ?? 5_000);
-    if (child.exitCode !== null) return;
-    child.kill();
-    await waitExitOr(child, this.options.killGraceMs ?? 2_000);
-    if (child.exitCode === null) child.kill("SIGKILL");
+    await stopProcess(child, this.options.quitGraceMs ?? 5_000, this.options.killGraceMs ?? 2_000);
   }
 
   private isIdle(): boolean {
@@ -1299,10 +1277,3 @@ function abortError(signal: AbortSignal): Error {
 }
 
 /** Wait for a child to exit or until the timeout, whichever comes first. */
-function waitExitOr(child: ChildProcess, timeoutMs: number): Promise<void> {
-  if (child.exitCode !== null) return Promise.resolve();
-  return Promise.race([
-    new Promise<void>((resolve) => child.once("exit", () => resolve())),
-    new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
-  ]);
-}
