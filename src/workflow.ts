@@ -41,6 +41,7 @@ import { LifecycleFlow } from "./application/lifecycle-flow.js";
 import { PlannerFlow } from "./application/planner-flow.js";
 import { ReviewFlow } from "./application/review-flow.js";
 import { SubmissionFlow } from "./application/submission-flow.js";
+import { ReviewerGateway } from "./application/app-server/reviewer-gateway.js";
 import type {
   AlignmentOutcome,
   PersistedTurnBaseline,
@@ -247,6 +248,7 @@ export class WorkflowManager {
   private readonly reviewFlow: ReviewFlow;
   private readonly submissionFlow: SubmissionFlow;
   private readonly lifecycleFlow: LifecycleFlow;
+  private readonly reviewerGateway: ReviewerGateway;
   private readonly pending = new Map<string, TurnNeedsInputResult>();
   private readonly nudgedTurns = new Set<string>();
   private readonly recovering = new Set<string>();
@@ -325,6 +327,7 @@ export class WorkflowManager {
       cancel: this.cancelInternal.bind(this),
       stop: this.stopInternal.bind(this),
     });
+    this.reviewerGateway = new ReviewerGateway(this.codex);
   }
 
   // ---------------------------------------------------------------- facade
@@ -647,10 +650,11 @@ export class WorkflowManager {
     workflowId?: string,
   ): Promise<void> {
     await this.retryTransientControl(async () => {
-      await this.codex.resumeThread(threadId, cwd, signal);
+      await this.reviewerGateway.resume(threadId, cwd, signal);
       try {
         // Auxiliary refresh of the hidden channel; never load-bearing.
-        await this.codex.updateReviewerInstructions?.(threadId, cwd, contract, signal);
+        const refresh = this.reviewerGateway.updateInstructions(threadId, cwd, contract, signal);
+        if (refresh) await refresh;
       } catch (error) {
         this.reportCleanupNote(workflowId, await this.releaseUnboundReviewer(threadId, signal));
         throw error;
@@ -669,19 +673,12 @@ export class WorkflowManager {
     options: { cwd: string; name: string; model?: string; developerInstructions?: string; workflowId?: string },
     signal?: AbortSignal,
   ): Promise<string> {
-    if (!this.codex.startReviewerThread) throw new Error("codex gateway has no startReviewerThread");
-    const shell = this.codex.startReviewerThreadShell?.bind(this.codex);
-    const configure = this.codex.configureReviewerThread?.bind(this.codex);
-    if (!shell || !configure) {
-      // Limited gateway: the creation is retried as ONE unit (its own failure
-      // path already releases whatever it created).
-      return this.retryTransientControl(() => this.codex.startReviewerThread!(options, signal), signal);
-    }
     let threadId: string | undefined;
     try {
       return await this.retryTransientControl(async () => {
-        threadId ??= await shell(options, signal);
-        await configure(threadId, options, signal);
+        threadId ??= await this.reviewerGateway.startShell(options, signal) ?? await this.reviewerGateway.start(options, signal);
+        const configured = this.reviewerGateway.configure(threadId, options, signal);
+        if (configured) await configured;
         return threadId;
       }, signal);
     } catch (error) {
@@ -1477,10 +1474,9 @@ export class WorkflowManager {
           if (boundReviewer) {
             // 1.1.4: signal-free but BOUNDED — a handoff that never settles must
             // not wedge the round (or cancel/teardown) either.
-            const handoffNote = await this.boundedCleanup("external handoff", () => (
-              this.codex.releaseThreadForExternal
-                ? this.codex.releaseThreadForExternal(boundReviewer)
-                : this.codex.unsubscribeThread?.(boundReviewer)
+           const handoffNote = await this.boundedCleanup("external handoff", () => (
+              this.reviewerGateway.externalRelease(boundReviewer)
+                ?? this.reviewerGateway.unsubscribe(boundReviewer)
             ));
             this.reportCleanupNote(workflowId, handoffNote);
           }
@@ -2729,12 +2725,11 @@ export class WorkflowManager {
    */
   private async renameLegacyReviewer(record: WorkflowRecord, workflowId: string): Promise<void> {
     const threadId = record.reviewerThreadId;
-    if (!threadId || !this.codex.nameThread) return;
+    if (!threadId) return;
     if (isSharedReviewerAlias(record)) return;
     if (record.reviewerThreadOrigin === "app-server") return;
-    await this.codex
-      .nameThread(threadId, `DSH Reviewer (legacy, not renderable in Desktop): ${workflowId}`)
-      .catch(() => undefined);
+    await this.reviewerGateway.rename(threadId, `DSH Reviewer (legacy, not renderable in Desktop): ${workflowId}`)
+      ?.catch(() => undefined);
   }
 
   /** 1.1.2: release the App Server hold on a Reviewer task that could NOT be
@@ -2840,7 +2835,7 @@ export class WorkflowManager {
   }
 
   private async releaseReviewerHold(threadId: string): Promise<string | undefined> {
-    return this.boundedCleanup("reviewer release", () => this.codex.unsubscribeThread?.(threadId));
+    return this.boundedCleanup("reviewer release", () => this.reviewerGateway.unsubscribe(threadId));
   }
 
   /** Fail-closed read-back of the turn appended to the durable Reviewer thread
@@ -2961,9 +2956,8 @@ export class WorkflowManager {
       // 1.1.4: signal-free but BOUNDED — the CLI reconciliation below resumes the
       // thread, so the handoff still has to happen, just never unboundedly.
       const handoffNote = await this.boundedCleanup("external handoff", () => (
-        this.codex.releaseThreadForExternal
-          ? this.codex.releaseThreadForExternal(threadId)
-          : this.codex.unsubscribeThread?.(threadId)
+        this.reviewerGateway.externalRelease(threadId)
+          ?? this.reviewerGateway.unsubscribe(threadId)
       ));
       this.reportCleanupNote(record.id, handoffNote);
       const corrected = await this.audit.reconcile({
