@@ -135,10 +135,12 @@ Bridge queue/delivery port 迁移由全量测试覆盖，最终 `release:check` 
 - `ef13816`：Planner execution、Review observation、Bridge queue/delivery ports、Lease/LiveSession SQL。
 - `d982445`：App Server model-selection gateway、turn gateway 的 round pin/unpin 接入。
 - `f7b04ce`：`QueueRepositorySql`，CoordinationStore 只保留队列生命周期门禁和兼容 facade。
+- `8a1c045`：`LegacyQueueImporter`，旧文件队列迁移从 BridgeStore 移入 infrastructure。
+- `ebe0fc1`：`WorkflowRepositorySql`，workflow row/load/save/revision CAS SQL 移入 infrastructure。
 - `pnpm verify`：439 tests passed，typecheck/build 通过。
 - `pnpm release:check`：`RELEASE_CHECK_OK`，打包审计和 offline doctor 通过。
 - `pnpm host:check`：`ok=true`，DSH `0.1.7-rc.2`、插件 `1.1.5`、8 tools、卸载成功、peer compatible。
 
-仍明确保留在后续范围的只有 CoordinationStore 的 prune/legacy-import 编排，以及
-WorkflowManager 中少量外部 verdict 的 CAS delivery helpers；它们没有被用空壳 adapter 冒充
-完成，Planner/Review/Submission 主调用链和取消/恢复所有权已经由上述模块实际承载。
+仍明确保留在后续范围的只有 CoordinationStore 的 prune ops 编排，以及 WorkflowManager
+中少量外部 verdict 的 CAS delivery helpers；它们没有被用空壳 adapter 冒充完成，
+Planner/Review/Submission 主调用链和取消/恢复所有权已经由上述模块实际承载。
