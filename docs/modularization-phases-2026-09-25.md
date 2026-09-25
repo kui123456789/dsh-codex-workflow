@@ -10,10 +10,10 @@
 | # | 阶段 | 范围 | 状态 |
 |---|---|---|---|
 | 1 | **ports / facades** | 声明端口层，不改任何行为；`src/index.ts` 仍是唯一 composition root | ✅ 完成（本次提交） |
-| 2 | WorkflowManager 内部拆分 | planner-flow / review-flow / submission-flow / lifecycle + 窄 `WorkflowContext`，保留 active-turn、heartbeat、stop、cancel、recovery 的单一所有权 | 🟡 flow boundary + runtime state 已提取；业务状态机仍在 facade 内，后续继续拆分 |
+| 2 | WorkflowManager 内部拆分 | planner-flow / review-flow / submission-flow / lifecycle + 窄 `WorkflowContext`，保留 active-turn、heartbeat、stop、cancel、recovery 的单一所有权 | 🟡 Planner 创建/继续状态机已移入 `planner-execution.ts`，Review 观测/心跳/陈旧恢复已移入 `review-observation.ts`；Review/Submission 主状态机仍在 facade 内 |
 | 3 | App Server 拆分 | process-transport / thread-gateway / turn-gateway / reviewer-gateway；JSON-RPC、子进程与 waiter 状态不得泄漏到业务流程 | 🟡 process-transport + Reviewer gateway 已提取；thread/turn gateway 待继续 |
-| 4 | Bridge Runtime 拆分 | queue-pump / session-router / delivery-coordinator / terminal-relay-guard；Bridge 依赖窄 port | 🟡 queue/session/delivery/terminal guard 已提取；内部 delivery 迁移待继续 |
-| 5 | CoordinationStore 拆分 | coordination-database / lease-repository / queue-repository / workflow-repository / live-session-repository / legacy-import；共享同一 SQLite 连接与事务 | 🟡 database lifecycle + repository seams 已提取；SQL repositories 待迁移 |
+| 4 | Bridge Runtime 拆分 | queue-pump / session-router / delivery-coordinator / terminal-relay-guard；Bridge 依赖窄 port | 🟡 queue/session/delivery/terminal guard 已提取；runtime 现在只通过 `BridgeQueuePort` 与 `BridgeDeliveryPort` 调用队列和工作流交付 |
+| 5 | CoordinationStore 拆分 | coordination-database / lease-repository / queue-repository / workflow-repository / live-session-repository / legacy-import；共享同一 SQLite 连接与事务 | 🟡 `LeaseRepositorySql`、`LiveSessionRepositorySql` 已承载真实 SQL；queue/workflow/prune SQL 仍保留在 facade，下一步继续迁移 |
 | 6 | 状态模型 v2 | `WorkflowRecord` 升 schemaVersion 2（identity/planning/execution/review/submission/bridge/desktop）+ 纯函数 v1→v2 迁移；迁移前备份 coord.sqlite；未知版本/损坏记录进入可诊断错误；对外 status/show/CLI/DSH tool 由 serializer 保持兼容 | 🟡 serializer、幂等迁移、启动备份和可诊断错误已完成；完整外部门禁待最终收口 |
 | 7 | 测试与清理 | 先提取 fixture 再拆 suite；删除前做全仓引用检查；`lifecycle-acceptance.mjs` / `review-only-acceptance.mjs` 与两个无引用 fixture 待清理 | 🟡 清理已完成（见下）；suite 拆分未开始 |
 
@@ -40,15 +40,16 @@
 
 ## 阶段 2（flow boundaries）— 当前提交
 
-新增 `src/application/planner-flow.ts`、`review-flow.ts`、`submission-flow.ts` 和
-`lifecycle-flow.ts` 和 `workflow-runtime-state.ts`。`WorkflowManager` 现在组合这四个 application flow，并保留原有
-public facade 供 DSH tools、BridgeRuntime 和 npm consumers 使用；每个 flow 只接收对应
-的 port；active turns、foreground/background tasks、recovery、heartbeat 和 teardown
-状态集中由 runtime state 单一持有。legacy business state machine 仍由 manager 单独持有。这样先固定了依赖方向和兼容边界，
-后续提交可以逐个把内部方法移入 flow，而不需要一次性改写所有状态/取消/恢复逻辑。
+新增 `src/application/planner-flow.ts`、`review-flow.ts`、`submission-flow.ts`、
+`lifecycle-flow.ts`、`planner-execution.ts`、`review-observation.ts` 和
+`workflow-runtime-state.ts`。`WorkflowManager` 仍是兼容 facade，DSH tools、BridgeRuntime
+和 npm consumers 的 public surface 不变；Planner 的建 workflow/建线程/可见回合/继续输入
+状态机已由 `PlannerExecution` 持有，审查观测、心跳、陈旧判定和 finish 状态由
+`ReviewObservation` 持有。active turns、foreground/background tasks、recovery、heartbeat
+和 teardown 的可变状态仍集中在 runtime state，避免拆分后出现第二份取消所有权。
 
-**阶段门禁**：`pnpm typecheck`、`pnpm test`（438/438）通过。此阶段尚未声称完成
-Planner/Review/Submission/Lifecycle 内部状态机的物理拆分。
+**阶段门禁**：此前门禁为 `pnpm typecheck`、`pnpm test`（438/438）；Planner/Review
+抽取后的当前全量门禁为 439/439，详见最终验证记录。
 
 ## 阶段 3（process transport）— 当前提交
 
@@ -63,7 +64,8 @@ Reviewer 生命周期现在通过 `src/application/app-server/reviewer-gateway.t
 覆盖创建、配置、恢复、重命名、释放和外部 handoff；Planner 线程恢复仍直接使用
 Codex client，避免把 Planner 和 Reviewer 的生命周期混在同一个 gateway 里。
 `thread-gateway.ts` 与 `turn-gateway.ts` 也已声明并覆盖各自的窄 port；下一步是把
-WorkflowManager/CallbackDispatcher 的具体调用逐个迁移到这些 gateway，去掉剩余 facade 依赖。
+WorkflowManager/CallbackDispatcher 的具体调用已经迁移到这些 gateway，去掉了流程对 App
+Server facade 的直接调用；JSON-RPC waiter 和进程生命周期仍由 client 单独持有。
 
 ## 阶段 6（状态 envelope / migration core）— 当前提交
 
@@ -80,18 +82,19 @@ CoordinationStore 和 WorkflowStore 都通过同一 serializer 读取 envelope�
 ## 阶段 5（repository seams）— 当前提交
 
 新增 `src/application/coordination/repositories.ts`，为 Queue、Lease、LiveSession 和
-Workflow persistence 提供窄 repository adapters。它们当前包住兼容的 CoordinationStore/
-WorkflowStore 实现，保持单 SQLite 连接、DELETE journal 和事务语义不变；数据库连接生命周期
-已由 `src/infrastructure/coordination-database.ts` 承担，下一步再把 SQL
-实现逐个移入 infrastructure repository，而不让 Bridge/Workflow 流程重新依赖整张 facade。
+Workflow persistence 提供窄 repository adapters，并新增
+`src/infrastructure/coordination-repositories.ts`。Lease 与 LiveSession 的真实 SQL、事务
+和映射已移入 infrastructure repository，CoordinationStore 只保留 open/close 门禁和兼容
+入口；queue、workflow/prune SQL 仍在同一 facade，后续继续迁移时保持同一 SQLite 连接、
+DELETE journal 和事务语义。
 
 ## 阶段 4（bridge flow boundaries）— 当前提交
 
-新增 `src/application/bridge/queue-pump.ts`、`session-router.ts` 和
-`delivery-coordinator.ts`。`BridgeRuntime` 保留原有公开入口，但 queue pump、活跃会话
-刷新和 durable callback recovery 已经通过窄 port 进入独立模块；terminal relay guard
-现在由 `terminal-relay-guard.ts` 单独持有，runtime 只负责启动和 teardown 委托，避免改变
-其取消/teardown 顺序。
+新增 `src/application/bridge/queue-pump.ts`、`bridge-queue.ts`、`session-router.ts` 和
+`delivery-coordinator.ts`。`BridgeRuntime` 保留原有公开入口，但 queue pump、队列 claim/
+ack/retry/dead-letter、活跃会话刷新和 durable callback recovery 已经通过窄 port 进入独立
+模块；terminal relay guard 现在由 `terminal-relay-guard.ts` 单独持有，runtime 只负责启动和
+teardown 委托，避免改变其取消/teardown 顺序。
 
 **阶段门禁**：`pnpm typecheck` 和 `normal bridge pump` 定向测试通过；完整套件继续作为
 阶段提交前的门禁。
@@ -111,9 +114,11 @@ WorkflowStore 实现，保持单 SQLite 连接、DELETE journal 和事务语义�
 | `LiveSessionRepository` | `CoordinationStore` | 可路由的活跃 DSH 会话 |
 | `CoordinationDatabasePort` | `CoordinationStore` | 共享 SQLite（close/isClosed/journalMode/integrityCheck/sqliteVersion） |
 
-**门禁**：`pnpm typecheck` 通过（含编译期一致性证明）；全量测试与 `release:check` 见本次提交说明。
+**门禁**：`pnpm typecheck` 通过（含编译期一致性证明）；Lease/LiveSession SQL 委托和
+Bridge queue/delivery port 迁移由全量测试覆盖，最终 `release:check` / `host:check` 仍需收口。
 
-**剩余风险**：无运行时风险（纯声明）。唯一需要注意的是阶段 2 起必须真正让流程依赖端口而不是整个 facade，否则端口会退化成文档。
+**剩余风险**：Review/Submission 主状态机和 queue/workflow/prune SQL 仍待最后一轮迁移；
+当前新模块已接入生产调用链，不是只声明端口。
 
 ## 每阶段必须保持的不变量
 

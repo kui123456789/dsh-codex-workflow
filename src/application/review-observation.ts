@@ -1,0 +1,137 @@
+import type { WorkflowStore } from "../store.js";
+import type { ReviewStep, WorkflowProcessState, WorkflowRecord } from "../types.js";
+import { WorkflowRuntimeState } from "./workflow-runtime-state.js";
+
+export interface ReviewObservationOptions {
+  store: WorkflowStore;
+  runtime: WorkflowRuntimeState;
+  heartbeatMs: number;
+  staleMs: number;
+  isSubmissionActive: (state: WorkflowRecord["submissionState"]) => boolean;
+}
+
+/**
+ * Owns durable review progress and the in-process heartbeat. Keeping this
+ * state machine outside WorkflowManager makes cancellation, stale detection
+ * and teardown share one implementation across DSH-led and bridge reviews.
+ */
+export class ReviewObservation {
+  private readonly store: WorkflowStore;
+  private readonly runtime: WorkflowRuntimeState;
+  private readonly heartbeatMs: number;
+  private readonly staleMs: number;
+  private readonly isSubmissionActive: ReviewObservationOptions["isSubmissionActive"];
+
+  constructor(options: ReviewObservationOptions) {
+    this.store = options.store;
+    this.runtime = options.runtime;
+    this.heartbeatMs = Math.max(250, options.heartbeatMs);
+    this.staleMs = Math.max(1_000, options.staleMs);
+    this.isSubmissionActive = options.isSubmissionActive;
+  }
+
+  async begin(
+    workflowId: string,
+    options: { enterReviewing?: boolean; step?: ReviewStep; message?: string } = {},
+  ) {
+    this.runtime.cleanupNotes.delete(workflowId);
+    const now = new Date().toISOString();
+    const outcome = await this.store.update(workflowId, (record) => {
+      if (options.enterReviewing !== false) record.phase = "reviewing";
+      record.processState = "running";
+      record.reviewStep = options.step ?? "reviewing";
+      record.reviewStartedAt = now;
+      record.lastProgressAt = now;
+      record.reviewAttempt = (record.reviewAttempt ?? 0) + 1;
+      record.reviewElapsedMs = 0;
+      record.activeTurnId = undefined;
+      record.lastProgressMessage = options.message ?? "Review started";
+    }, { ignoreCancelled: false });
+    if (!outcome.suppressed) this.startHeartbeat(workflowId);
+    return outcome;
+  }
+
+  startHeartbeat(workflowId: string): void {
+    this.stopHeartbeat(workflowId);
+    const timer = setInterval(() => {
+      void this.mark(workflowId).catch(() => undefined);
+    }, this.heartbeatMs);
+    timer.unref();
+    this.runtime.reviewHeartbeats.set(workflowId, timer);
+  }
+
+  stopHeartbeat(workflowId: string): void {
+    const timer = this.runtime.reviewHeartbeats.get(workflowId);
+    if (timer) clearInterval(timer);
+    this.runtime.reviewHeartbeats.delete(workflowId);
+  }
+
+  async mark(
+    workflowId: string,
+    step?: ReviewStep,
+    message?: string,
+    activeTurnId?: string | null,
+  ): Promise<WorkflowRecord | undefined> {
+    const now = new Date();
+    const iso = now.toISOString();
+    const outcome = await this.store.update(workflowId, (record) => {
+      if (record.processState !== "running") return;
+      if (step) record.reviewStep = step;
+      record.lastProgressAt = iso;
+      if (record.reviewStartedAt) {
+        const started = Date.parse(record.reviewStartedAt);
+        if (Number.isFinite(started)) record.reviewElapsedMs = Math.max(0, now.getTime() - started);
+      }
+      if (activeTurnId !== undefined) record.activeTurnId = activeTurnId ?? undefined;
+      if (message) record.lastProgressMessage = message;
+    }, { ignoreCancelled: false });
+    return outcome.record;
+  }
+
+  async finish(workflowId: string, fallbackState?: WorkflowProcessState): Promise<void> {
+    this.stopHeartbeat(workflowId);
+    const now = new Date();
+    const iso = now.toISOString();
+    await this.store.update(workflowId, (record) => {
+      if (record.processState !== "running") return;
+      const terminalState: WorkflowProcessState = record.phase === "cancelled"
+        ? "cancelled"
+        : fallbackState
+          ?? (this.isSubmissionActive(record.submissionState)
+            ? "waiting"
+            : record.phase === "reviewing" || record.phase === "executing" || record.phase === "fixing"
+              ? "failed"
+              : "completed");
+      record.processState = terminalState;
+      record.activeTurnId = undefined;
+      record.lastProgressAt = iso;
+      if (record.reviewStartedAt) {
+        const started = Date.parse(record.reviewStartedAt);
+        if (Number.isFinite(started)) record.reviewElapsedMs = Math.max(0, now.getTime() - started);
+      }
+      record.lastProgressMessage = terminalState === "completed"
+        ? "Review completed"
+        : terminalState === "waiting"
+          ? "Review waiting for retry or verdict delivery"
+          : terminalState === "cancelled"
+            ? "Review cancelled"
+            : terminalState === "stale"
+              ? "Review heartbeat became stale"
+              : "Review failed; retry is available";
+    }, { ignoreCancelled: true }).catch(() => undefined);
+  }
+
+  async refreshStale(record: WorkflowRecord): Promise<WorkflowRecord> {
+    if (record.processState !== "running" || !record.lastProgressAt) return record;
+    const age = Date.now() - Date.parse(record.lastProgressAt);
+    if (!Number.isFinite(age) || age <= this.staleMs) return record;
+    const outcome = await this.store.update(record.id, (current) => {
+      if (current.processState !== "running" || current.lastProgressAt !== record.lastProgressAt) return;
+      current.processState = "stale";
+      current.activeTurnId = undefined;
+      current.lastProgressMessage = `No Review heartbeat for ${Math.floor(age / 1000)} seconds`;
+    }, { ignoreCancelled: true });
+    this.stopHeartbeat(record.id);
+    return outcome.record;
+  }
+}

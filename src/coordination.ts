@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { isAbsolute, join, resolve } from "node:path";
 import { parseWorkflowJson } from "./state/workflow-schema.js";
 import { CoordinationDatabase } from "./infrastructure/coordination-database.js";
+import { LeaseRepositorySql, LiveSessionRepositorySql } from "./infrastructure/coordination-repositories.js";
 
 /**
  * SQLite-backed coordination state shared by every DSH process and the CLI.
@@ -159,11 +160,15 @@ export function closeCoordinationStoresForDirectory(directory: string): void {
 export class CoordinationStore {
   readonly db: DatabaseSync;
   private readonly database: CoordinationDatabase;
+  private readonly leases: LeaseRepositorySql;
+  private readonly liveSessions: LiveSessionRepositorySql;
   private closed = false;
 
   constructor(readonly path: string, options: CoordinationOptions = {}) {
     this.database = new CoordinationDatabase(path, options, SCHEMA);
     this.db = this.database.db;
+    this.leases = new LeaseRepositorySql(this.db);
+    this.liveSessions = new LiveSessionRepositorySql(this.db);
     const key = normalizeDbPath(path);
     let group = LIVE_BY_PATH.get(key);
     if (!group) {
@@ -227,62 +232,31 @@ export class CoordinationStore {
    */
   acquireLease(resource: string, ttlMs: number, owner: string, now = Date.now()): LeaseGrant | undefined {
     this.assertOpen();
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const row = this.db.prepare("SELECT epoch, owner, lease_until FROM leases WHERE resource = ?").get(resource) as
-        | { epoch: number | bigint; owner: string; lease_until: number | bigint }
-        | undefined;
-      if (row && Number(row.lease_until) > now) {
-        this.db.exec("ROLLBACK");
-        return undefined; // live lease: never stolen
-      }
-      const epoch = Number(row?.epoch ?? 0) + 1;
-      this.db.prepare(
-        `INSERT INTO leases (resource, epoch, owner, lease_until) VALUES (?, ?, ?, ?)
-         ON CONFLICT(resource) DO UPDATE SET epoch = excluded.epoch, owner = excluded.owner, lease_until = excluded.lease_until`,
-      ).run(resource, epoch, owner, now + ttlMs);
-      this.db.exec("COMMIT");
-      return { epoch, owner };
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
+    return this.leases.acquireLease(resource, ttlMs, owner, now);
   }
 
   /** Heartbeat: extend the lease only while THIS epoch+owner still owns it.
    * changes=0 means ownership was lost — the caller must abort immediately. */
   renewLease(resource: string, epoch: number, owner: string, ttlMs: number, now = Date.now()): boolean {
     this.assertOpen();
-    const result = this.db.prepare(
-      "UPDATE leases SET lease_until = ? WHERE resource = ? AND epoch = ? AND owner = ?",
-    ).run(now + ttlMs, resource, epoch, owner);
-    return Number(result.changes) === 1;
+    return this.leases.renewLease(resource, epoch, owner, ttlMs, now);
   }
 
   /** Release: clears the row (never deletes it) only while THIS epoch+owner
    * still owns it; a stale owner's release changes 0 rows. */
   releaseLease(resource: string, epoch: number, owner: string): boolean {
     this.assertOpen();
-    const result = this.db.prepare(
-      "UPDATE leases SET owner = '', lease_until = 0 WHERE resource = ? AND epoch = ? AND owner = ?",
-    ).run(resource, epoch, owner);
-    return Number(result.changes) === 1;
+    return this.leases.releaseLease(resource, epoch, owner);
   }
 
   isLeaseOwner(resource: string, epoch: number, owner: string, now = Date.now()): boolean {
     this.assertOpen();
-    const row = this.db.prepare(
-      "SELECT lease_until FROM leases WHERE resource = ? AND epoch = ? AND owner = ?",
-    ).get(resource, epoch, owner) as { lease_until: number | bigint } | undefined;
-    return !!row && Number(row.lease_until) > now;
+    return this.leases.isLeaseOwner(resource, epoch, owner, now);
   }
 
   leaseInfo(resource: string): { epoch: number; owner: string; leaseUntil: number } | undefined {
     this.assertOpen();
-    const row = this.db.prepare("SELECT epoch, owner, lease_until FROM leases WHERE resource = ?").get(resource) as
-      | { epoch: number | bigint; owner: string; lease_until: number | bigint }
-      | undefined;
-    return row ? { epoch: Number(row.epoch), owner: row.owner, leaseUntil: Number(row.lease_until) } : undefined;
+    return this.leases.leaseInfo(resource);
   }
 
   // ------------------------------------------------------------------ queue
@@ -544,63 +518,37 @@ export class CoordinationStore {
    */
   refreshOwnerSessions(owner: string, rows: Array<{ sessionId: string; cwd: string }>, ttlMs: number, now = Date.now()): void {
     this.assertOpen();
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      this.db.prepare("DELETE FROM live_sessions WHERE runtime_owner = ?").run(owner);
-      const upsert = this.db.prepare(
-        `INSERT INTO live_sessions (session_id, runtime_owner, cwd, cwd_key, lease_until, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(session_id) DO UPDATE SET runtime_owner = excluded.runtime_owner, cwd = excluded.cwd,
-           cwd_key = excluded.cwd_key, lease_until = excluded.lease_until, updated_at = excluded.updated_at`,
-      );
-      for (const row of rows) {
-        upsert.run(row.sessionId, owner, row.cwd, cwdKey(row.cwd), now + ttlMs, now);
-      }
-      this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
+    this.liveSessions.refreshOwnerSessions(owner, rows, ttlMs, now);
   }
 
   /** Heartbeat: extend every live session row owned by `owner`. */
   renewOwnerSessions(owner: string, ttlMs: number, now = Date.now()): number {
     this.assertOpen();
-    const result = this.db.prepare(
-      "UPDATE live_sessions SET lease_until = ?, updated_at = ? WHERE runtime_owner = ?",
-    ).run(now + ttlMs, now, owner);
-    return Number(result.changes);
+    return this.liveSessions.renewOwnerSessions(owner, ttlMs, now);
   }
 
   /** Release every session of `owner` (graceful stop). */
   releaseOwnerSessions(owner: string): number {
     this.assertOpen();
-    const result = this.db.prepare("DELETE FROM live_sessions WHERE runtime_owner = ?").run(owner);
-    return Number(result.changes);
+    return this.liveSessions.releaseOwnerSessions(owner);
   }
 
   /** Read-only: this owner's still-live sessions. */
   sessionsForOwner(owner: string, now = Date.now()): LiveSessionRow[] {
     this.assertOpen();
-    return this.db.prepare(
-      "SELECT session_id, runtime_owner, cwd, cwd_key, lease_until, updated_at FROM live_sessions WHERE runtime_owner = ? AND lease_until > ?",
-    ).all(owner, now).map(mapSessionRow);
+    return this.liveSessions.sessionsForOwner(owner, now);
   }
 
   /** Read-only: live sessions matching a normalized cwd. */
   liveSessionsForCwd(cwdKeyValue: string, now = Date.now()): LiveSessionRow[] {
     this.assertOpen();
-    return this.db.prepare(
-      "SELECT session_id, runtime_owner, cwd, cwd_key, lease_until, updated_at FROM live_sessions WHERE cwd_key = ? AND lease_until > ?",
-    ).all(cwdKeyValue, now).map(mapSessionRow);
+    return this.liveSessions.liveSessionsForCwd(cwdKeyValue, now);
   }
 
   /** Read-only: every live session (for the CLI). */
   listLiveSessions(now = Date.now()): LiveSessionRow[] {
     this.assertOpen();
-    return this.db.prepare(
-      "SELECT session_id, runtime_owner, cwd, cwd_key, lease_until, updated_at FROM live_sessions WHERE lease_until > ? ORDER BY session_id",
-    ).all(now).map(mapSessionRow);
+    return this.liveSessions.listLiveSessions(now);
   }
 
   /** Read-only: the DSH session owning a workflow (from its record). */
@@ -888,17 +836,6 @@ function mapQueueRow(row: Record<string, unknown>): QueueRow {
   if (row.receipt_json !== null && row.receipt_json !== undefined) result.receiptJson = String(row.receipt_json);
   if (row.dead_letter_at !== null && row.dead_letter_at !== undefined) result.deadLetterAt = Number(row.dead_letter_at);
   return result;
-}
-
-function mapSessionRow(row: Record<string, unknown>): LiveSessionRow {
-  return {
-    sessionId: String(row.session_id),
-    runtimeOwner: String(row.runtime_owner),
-    cwd: String(row.cwd),
-    cwdKey: String(row.cwd_key),
-    leaseUntil: Number(row.lease_until),
-    updatedAt: Number(row.updated_at),
-  };
 }
 
 /** Database file location for a storage directory (shared by all stores). */

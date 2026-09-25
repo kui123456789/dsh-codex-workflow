@@ -39,12 +39,14 @@ import { PLANNER_OUTPUT_SCHEMA, REVIEW_OUTPUT_SCHEMA } from "./schemas.js";
 import { WorkflowStore } from "./store.js";
 import { LifecycleFlow } from "./application/lifecycle-flow.js";
 import { PlannerFlow } from "./application/planner-flow.js";
+import { PlannerExecution } from "./application/planner-execution.js";
 import { ReviewFlow } from "./application/review-flow.js";
 import { SubmissionFlow } from "./application/submission-flow.js";
 import { ReviewerGateway } from "./application/app-server/reviewer-gateway.js";
 import { ThreadGateway } from "./application/app-server/thread-gateway.js";
 import { TurnGateway } from "./application/app-server/turn-gateway.js";
 import { WorkflowRuntimeState } from "./application/workflow-runtime-state.js";
+import { ReviewObservation } from "./application/review-observation.js";
 import type {
   AlignmentOutcome,
   PersistedTurnBaseline,
@@ -57,8 +59,6 @@ import type {
   SubmissionState,
   TurnNeedsInputResult,
   TurnWaitResult,
-  ReviewStep,
-  WorkflowProcessState,
   WorkflowConfig,
   WorkflowPhase,
   WorkflowRecord,
@@ -244,9 +244,10 @@ export interface CodexCallback {
 }
 
 export class WorkflowManager {
-  /** Phase 2 application flows. The manager remains the compatibility facade;
-   * each flow owns one public use-case boundary and delegates to the legacy
-   * implementation while its internals are extracted incrementally. */
+  /** Compatibility facade. Public calls enter the application flows while
+   * planner execution and review observation are owned by dedicated modules;
+   * the remaining review/submission state machines stay behind this facade
+   * until their ports can be moved without widening cancellation ownership. */
   private readonly plannerFlow: PlannerFlow;
   private readonly reviewFlow: ReviewFlow;
   private readonly submissionFlow: SubmissionFlow;
@@ -254,6 +255,8 @@ export class WorkflowManager {
   private readonly reviewerGateway: ReviewerGateway;
   private readonly threadGateway: ThreadGateway;
   private readonly turnGateway: TurnGateway;
+  private readonly plannerExecution: PlannerExecution;
+  private readonly reviewObservation: ReviewObservation;
   /** The only owner of in-process flow lifecycle state. */
   private readonly runtime = new WorkflowRuntimeState();
   /** Submission lease lifetime; heartbeats renew at ttl/3 while a callback
@@ -305,6 +308,33 @@ export class WorkflowManager {
     this.reviewerGateway = new ReviewerGateway(this.codex);
     this.threadGateway = new ThreadGateway(this.codex);
     this.turnGateway = new TurnGateway(this.codex);
+    this.reviewObservation = new ReviewObservation({
+      store: this.store,
+      runtime: this.runtime,
+      heartbeatMs: config.reviewHeartbeatMs ?? 15_000,
+      staleMs: config.reviewStaleMs ?? 60_000,
+      isSubmissionActive: submissionActive,
+    });
+    this.plannerExecution = new PlannerExecution({
+      store: this.store,
+      config: this.config,
+      pending: this.runtime.pending,
+      requireAgent,
+      acquireCreateLease: this.acquireWorkflowCreateLease.bind(this),
+      assertNoActiveWorkflow: this.assertNoActiveWorkflow.bind(this),
+      startThread: this.threadGateway.startThread.bind(this.threadGateway),
+      resumeThread: this.threadGateway.resumeThread.bind(this.threadGateway),
+      startTurnWithRetry: this.startTurnWithTransientRetry.bind(this),
+      continueTurn: this.turnGateway.continueTurn.bind(this.turnGateway),
+      registerActiveTurn: this.registerActiveTurn.bind(this),
+      acceptPlannerOutcome: this.acceptPlannerOutcome.bind(this),
+      owned: this.owned.bind(this),
+      trackForeground: this.trackForeground.bind(this),
+      plannerPrompt,
+      resumedAnswerPrompt,
+      threadName,
+      errorMessage,
+    });
   }
 
   /** Compatibility view retained for the existing single-flight recovery test. */
@@ -378,123 +408,6 @@ export class WorkflowManager {
 
   stop(): Promise<void> {
     return this.lifecycleFlow.stop();
-  }
-
-  private reviewHeartbeatMs(): number {
-    return Math.max(250, this.config.reviewHeartbeatMs ?? 15_000);
-  }
-
-  private reviewStaleMs(): number {
-    return Math.max(1_000, this.config.reviewStaleMs ?? 60_000);
-  }
-
-  /** Start a durable Review attempt and its independent heartbeat. */
-  private async beginReviewObservation(
-    workflowId: string,
-    options: { enterReviewing?: boolean; step?: ReviewStep; message?: string } = {},
-  ) {
-    // A new round starts with an empty note buffer: a note left by an earlier
-    // round that never flushed must never be attributed to this one.
-    this.runtime.cleanupNotes.delete(workflowId);
-    const now = new Date().toISOString();
-    const outcome = await this.store.update(workflowId, (record) => {
-      if (options.enterReviewing !== false) record.phase = "reviewing";
-      record.processState = "running";
-      record.reviewStep = options.step ?? "reviewing";
-      record.reviewStartedAt = now;
-      record.lastProgressAt = now;
-      record.reviewAttempt = (record.reviewAttempt ?? 0) + 1;
-      record.reviewElapsedMs = 0;
-      record.activeTurnId = undefined;
-      record.lastProgressMessage = options.message ?? "Review started";
-    }, { ignoreCancelled: false });
-    if (!outcome.suppressed) this.startReviewHeartbeat(workflowId);
-    return outcome;
-  }
-
-  private startReviewHeartbeat(workflowId: string): void {
-    this.stopReviewHeartbeat(workflowId);
-    const timer = setInterval(() => {
-      void this.markReviewProgress(workflowId).catch(() => undefined);
-    }, this.reviewHeartbeatMs());
-    timer.unref();
-    this.runtime.reviewHeartbeats.set(workflowId, timer);
-  }
-
-  private stopReviewHeartbeat(workflowId: string): void {
-    const timer = this.runtime.reviewHeartbeats.get(workflowId);
-    if (timer) clearInterval(timer);
-    this.runtime.reviewHeartbeats.delete(workflowId);
-  }
-
-  /** Persist only safe phase diagnostics; never model text or raw JSONL. */
-  private async markReviewProgress(
-    workflowId: string,
-    step?: ReviewStep,
-    message?: string,
-    activeTurnId?: string | null,
-  ): Promise<WorkflowRecord | undefined> {
-    const now = new Date();
-    const iso = now.toISOString();
-    const outcome = await this.store.update(workflowId, (record) => {
-      if (record.processState !== "running") return;
-      if (step) record.reviewStep = step;
-      record.lastProgressAt = iso;
-      if (record.reviewStartedAt) {
-        const started = Date.parse(record.reviewStartedAt);
-        if (Number.isFinite(started)) record.reviewElapsedMs = Math.max(0, now.getTime() - started);
-      }
-      if (activeTurnId !== undefined) record.activeTurnId = activeTurnId ?? undefined;
-      if (message) record.lastProgressMessage = message;
-    }, { ignoreCancelled: false });
-    return outcome.record;
-  }
-
-  private async finishReviewObservation(workflowId: string, fallbackState?: WorkflowProcessState): Promise<void> {
-    this.stopReviewHeartbeat(workflowId);
-    const now = new Date();
-    const iso = now.toISOString();
-    await this.store.update(workflowId, (record) => {
-      if (record.processState !== "running") return;
-      const terminalState: WorkflowProcessState = record.phase === "cancelled"
-        ? "cancelled"
-        : fallbackState
-          ?? (submissionActive(record.submissionState)
-            ? "waiting"
-            : record.phase === "reviewing" || record.phase === "executing" || record.phase === "fixing"
-              ? "failed"
-              : "completed");
-      record.processState = terminalState;
-      record.activeTurnId = undefined;
-      record.lastProgressAt = iso;
-      if (record.reviewStartedAt) {
-        const started = Date.parse(record.reviewStartedAt);
-        if (Number.isFinite(started)) record.reviewElapsedMs = Math.max(0, now.getTime() - started);
-      }
-      record.lastProgressMessage = terminalState === "completed"
-        ? "Review completed"
-        : terminalState === "waiting"
-          ? "Review waiting for retry or verdict delivery"
-        : terminalState === "cancelled"
-          ? "Review cancelled"
-          : terminalState === "stale"
-            ? "Review heartbeat became stale"
-            : "Review failed; retry is available";
-    }, { ignoreCancelled: true }).catch(() => undefined);
-  }
-
-  private async refreshStaleReview(record: WorkflowRecord): Promise<WorkflowRecord> {
-    if (record.processState !== "running" || !record.lastProgressAt) return record;
-    const age = Date.now() - Date.parse(record.lastProgressAt);
-    if (!Number.isFinite(age) || age <= this.reviewStaleMs()) return record;
-    const outcome = await this.store.update(record.id, (current) => {
-      if (current.processState !== "running" || current.lastProgressAt !== record.lastProgressAt) return;
-      current.processState = "stale";
-      current.activeTurnId = undefined;
-      current.lastProgressMessage = `No Review heartbeat for ${Math.floor(age / 1000)} seconds`;
-    }, { ignoreCancelled: true });
-    this.stopReviewHeartbeat(record.id);
-    return outcome.record;
   }
 
   /** 1.1.1: the shared retry policy for TRANSIENT upstream failures. A config
@@ -712,7 +625,7 @@ export class WorkflowManager {
   /** Track every foreground tool flow so teardown can interrupt and await it
    * before stopping the App Server and closing the stores. Registered at the
    * method boundary so even a tool call that dies mid-flight is awaited. */
-  private trackForeground(task: Promise<unknown>): Promise<unknown> {
+  private trackForeground<T>(task: Promise<T>): Promise<T> {
     this.runtime.foreground.add(task);
     void task.finally(() => {
       this.runtime.foreground.delete(task);
@@ -764,84 +677,11 @@ export class WorkflowManager {
   }
 
   /** Foreground tool flow: tracked so teardown interrupts and awaits it. */
-  private async startInternal(
+  private startInternal(
     args: { task: string; plannerModel?: string; plannerEffort?: WorkflowConfig["plannerEffort"] },
     exec: ToolRunContext,
   ): Promise<WorkflowRecord> {
-    return this.trackForeground(this.startInner(args, exec)) as Promise<WorkflowRecord>;
-  }
-
-  private async startInner(
-    args: { task: string; plannerModel?: string; plannerEffort?: WorkflowConfig["plannerEffort"] },
-    exec: ToolRunContext,
-  ): Promise<WorkflowRecord> {
-    const agent = requireAgent(exec);
-    const createLease = await this.acquireWorkflowCreateLease(agent.id);
-    if (!createLease) {
-      throw new Error(`session ${agent.id} is already creating a Codex workflow; continue the existing workflow instead of starting another`);
-    }
-    let record: WorkflowRecord;
-    try {
-      await this.assertNoActiveWorkflow(agent.id);
-      const now = new Date().toISOString();
-      record = {
-        schemaVersion: 1,
-        id: randomUUID(),
-        dshSessionId: agent.id,
-        cwd: agent.session.header.cwd ?? process.cwd(),
-        task: args.task.trim(),
-        mode: "planned",
-        phase: "planning",
-        createdAt: now,
-        updatedAt: now,
-        assumptions: [],
-        questions: [],
-        reviewCycles: 0,
-        noChangeReviewRounds: 0,
-      };
-      await this.store.save(record);
-    } finally {
-      await createLease.release().catch(() => undefined);
-    }
-    try {
-      const plannerThreadId = await this.threadGateway.startThread({
-        cwd: record.cwd,
-        ...(args.plannerModel || this.config.plannerModel
-          ? { model: args.plannerModel || this.config.plannerModel }
-          : {}),
-        name: threadName("DSH Plan", args.task),
-      }, exec.signal);
-      const threadCommit = await this.store.update(record.id, (r) => {
-        r.plannerThreadId = plannerThreadId;
-      }, { ignoreCancelled: false });
-      if (threadCommit.suppressed) return threadCommit.record;
-      // The EFFECTIVE planner model: explicit override/config, or — when
-      // unconfigured — whatever the Plan collaboration mode resolves (the
-      // client reports it via onModel and the fork reuses the SAME model).
-      let plannerModel = args.plannerModel || this.config.plannerModel || undefined;
-      const outcome = await this.startTurnWithTransientRetry(plannerThreadId, {
-        prompt: plannerPrompt(record.task),
-        ...(plannerModel ? { model: plannerModel } : {}),
-        effort: args.plannerEffort ?? this.config.plannerEffort,
-        // Since 1.0.7 the VISIBLE planner turn carries no outputSchema: its
-        // readable reply (a <proposed_plan> Markdown block, numbered questions
-        // or a failure explanation) is what Codex Desktop shows. The structured
-        // PlannerResult is produced by an ephemeral-fork conversion turn inside
-        // acceptPlannerOutcome.
-        planMode: true,
-        onModel: (model) => { plannerModel = model; },
-        // Persist the planner turn the moment it starts so cancel can interrupt it.
-        onStarted: (started) => this.registerActiveTurn(record.id, started.threadId, started.turnId, "planner"),
-      }, exec.signal);
-      return await this.acceptPlannerOutcome(record.id, outcome, exec, plannerModel, record.cwd);
-    } catch (error) {
-      const failed = await this.store.update(record.id, (r) => {
-        r.phase = "failed";
-        r.error = errorMessage(error);
-      }, { ignoreCancelled: false });
-      if (failed.suppressed) return failed.record;
-      throw error;
-    }
+    return this.plannerExecution.start(args, exec);
   }
 
   /**
@@ -1173,37 +1013,12 @@ export class WorkflowManager {
     }
   }
 
-  private async continueInternal(
+  private continueInternal(
     workflowId: string,
     answers: Record<string, string[]>,
     exec: ToolRunContext,
   ): Promise<WorkflowRecord> {
-    const record = await this.owned(workflowId, exec);
-    if (record.phase !== "waiting_input" || !record.plannerThreadId) {
-      throw new Error(`workflow ${workflowId} is not waiting for planner input`);
-    }
-    let outcome: TurnWaitResult;
-    // Reuse the persisted EFFECTIVE planner model (start's override or the
-    // Plan-mode-resolved model) so continue/restart and the conversion fork
-    // all run with the SAME model the original planner turn used.
-    let plannerModel = record.plannerModel || this.config.plannerModel || undefined;
-    const pending = this.runtime.pending.get(workflowId);
-    if (pending) {
-      outcome = await this.turnGateway.continueTurn(pending, answers, exec.signal);
-    } else {
-      await this.threadGateway.resumeThread(record.plannerThreadId, record.cwd, exec.signal);
-      outcome = await this.startTurnWithTransientRetry(record.plannerThreadId, {
-        prompt: resumedAnswerPrompt(answers),
-        ...(plannerModel ? { model: plannerModel } : {}),
-        effort: this.config.plannerEffort,
-        // Same visible-reply contract as the first planner turn: no
-        // outputSchema, the readable reply is converted by an ephemeral fork.
-        planMode: true,
-        onModel: (model) => { plannerModel = model; },
-        onStarted: (started) => this.registerActiveTurn(workflowId, started.threadId, started.turnId, "planner"),
-      }, exec.signal);
-    }
-    return this.acceptPlannerOutcome(workflowId, outcome, exec, plannerModel, record.cwd);
+    return this.plannerExecution.continue(workflowId, answers, exec);
   }
 
   /** Foreground tool flow: tracked so teardown interrupts and awaits it. */
@@ -1300,7 +1115,7 @@ export class WorkflowManager {
       // now durably persisted); release it before the long callback runs.
       await submitLease.release();
       submitReleased = true;
-      await this.beginReviewObservation(workflowId, {
+      await this.reviewObservation.begin(workflowId, {
         enterReviewing: false,
         step: "reviewing",
         message: "Review queued; waiting for Reviewer",
@@ -1426,7 +1241,7 @@ export class WorkflowManager {
         if (sending.submissionId !== submissionId || submissionTerminal(sending.submissionState)) {
           return sending; // cancelled or re-claimed by another restarter
         }
-        await this.markReviewProgress(workflowId, "review_native_turn", "Running Reviewer turn");
+        await this.reviewObservation.mark(workflowId, "review_native_turn", "Running Reviewer turn");
         let outcome:
           | { kind: "verdict"; verdict: ReviewResult }
           | { kind: "retryable_busy"; reason?: string };
@@ -1557,14 +1372,14 @@ export class WorkflowManager {
           let verdict = applyReviewConsistency(outcome.verdict);
           let contractFailed = false;
           try {
-        await this.markReviewProgress(workflowId, "review_alignment", "Checking Review authority alignment", null);
+        await this.reviewObservation.mark(workflowId, "review_alignment", "Checking Review authority alignment", null);
             // The alignment prompt receives the PREVIOUSLY APPLIED review and
             // THIS submission's fix summary (both persisted on the record), so
             // a legitimately carried-forward finding is never misjudged as a
             // generic conflict.
             const alignment = await this.alignReview(current, verdict, signal, current.pendingReviewRequest);
             if (!alignment.aligned) {
-              await this.markReviewProgress(workflowId, "review_reconciliation", "Reconciling Review findings", null);
+              await this.reviewObservation.mark(workflowId, "review_reconciliation", "Reconciling Review findings", null);
               const reconciled = await this.reconcileReview(current, verdict, alignment.conflicts, signal, current.pendingReviewRequest);
               contractConflict = {
                 conflicts: alignment.conflicts,
@@ -1636,7 +1451,7 @@ export class WorkflowManager {
           }
         }
         if (outcome.kind === "verdict") {
-          await this.markReviewProgress(workflowId, "review_finalizing", "Finalizing Review status", null);
+          await this.reviewObservation.mark(workflowId, "review_finalizing", "Finalizing Review status", null);
           if (!this.bridgeQueue) {
             const committed = await updateCurrent((r) => {
               r.submissionState = "waiting_verdict";
@@ -1723,7 +1538,7 @@ export class WorkflowManager {
       return current;
     } finally {
       lease?.stopHeartbeat();
-      await this.finishReviewObservation(workflowId);
+      await this.reviewObservation.finish(workflowId);
       await this.flushCleanupNotes(workflowId);
     }
   }
@@ -2118,7 +1933,7 @@ export class WorkflowManager {
       }, { ignoreCancelled: true });
       record = hydrated.record;
     }
-    record = await this.refreshStaleReview(record);
+    record = await this.reviewObservation.refreshStale(record);
     if (!record.processState && ["passed", "blocked", "waiting_review_decision"].includes(record.phase)) {
       record = { ...record, processState: "completed" };
     } else if (!record.processState && record.phase === "cancelled") {
@@ -2195,7 +2010,7 @@ export class WorkflowManager {
         r.callbackState = "failed";
       }
     }, { ignoreCancelled: true });
-    this.stopReviewHeartbeat(workflowId);
+    this.reviewObservation.stopHeartbeat(workflowId);
     if (active) target = { threadId: active.threadId, turnId: active.turnId };
     if (target) {
       await this.turnGateway.interrupt(target.threadId, target.turnId, exec.signal).catch(() => undefined);
@@ -2254,7 +2069,7 @@ export class WorkflowManager {
   ): Promise<WorkflowRecord> {
     const pre = await this.store.load(workflowId);
     const priorPhase: WorkflowPhase = pre?.phase === "fixing" ? "fixing" : "executing";
-    const entering = await this.beginReviewObservation(workflowId, {
+    const entering = await this.reviewObservation.begin(workflowId, {
       enterReviewing: true,
       step: "reviewing",
       message: "Review started; collecting workspace evidence",
@@ -2370,7 +2185,7 @@ export class WorkflowManager {
       }
 
       if (current.reviewerThreadId === reviewerThreadId && current.reviewStep !== "review_native_turn") {
-        await this.markReviewProgress(workflowId, "review_native_turn", "Running Reviewer turn");
+        await this.reviewObservation.mark(workflowId, "review_native_turn", "Running Reviewer turn");
       }
 
       // Git AND non-Git reviews use the SAME `review/start` custom target. Its
@@ -2426,7 +2241,7 @@ export class WorkflowManager {
         return afterReview!;
       }
       current = afterReview;
-      await this.markReviewProgress(workflowId, "review_readback", "Reading persisted Reviewer result", null);
+      await this.reviewObservation.mark(workflowId, "review_readback", "Reading persisted Reviewer result", null);
       // BOTH the visible review turn AND the ephemeral normalization turn must
       // have genuinely completed (`status === "completed"`, not just the
       // `completed` kind): interrupted/failed/timed-out turns carry no usable
@@ -2475,7 +2290,7 @@ export class WorkflowManager {
         // rewrite's persisted output is detected as an APPENDED turn, never by
         // assuming the `turn/start` RPC id equals the persisted rollout id.
         const rewriteBaseline = await this.turnGateway.captureTurnBaseline?.(reviewerThreadId, exec.signal);
-        await this.markReviewProgress(workflowId, "review_display_rewrite", "Rewriting Reviewer display output", null);
+        await this.reviewObservation.mark(workflowId, "review_display_rewrite", "Rewriting Reviewer display output", null);
         const rewrite = await this.startTurnWithTransientRetry(reviewerThreadId, {
           prompt: reviewRewritePrompt(authoritativeText, current),
           ...(reviewerModel ? { model: reviewerModel } : {}),
@@ -2531,7 +2346,7 @@ export class WorkflowManager {
           ...(reviewerModel ? { model: reviewerModel } : {}),
         }, exec.signal));
       } else {
-        await this.markReviewProgress(workflowId, "review_conversion", "Converting Reviewer result", null);
+        await this.reviewObservation.mark(workflowId, "review_conversion", "Converting Reviewer result", null);
         let normalized: TurnWaitResult;
         try {
           normalized = await this.turnGateway.normalizeInFork({
@@ -2571,12 +2386,12 @@ export class WorkflowManager {
       // conflicts block the workflow with a reportable contract failure.
       let applied: ReviewResult | undefined;
       let conflictInfo: ReviewConflictInfo | undefined;
-      await this.markReviewProgress(workflowId, "review_alignment", "Checking Review authority alignment", null);
+      await this.reviewObservation.mark(workflowId, "review_alignment", "Checking Review authority alignment", null);
       const alignment = await this.alignReview(current, result, exec.signal, input);
       if (alignment.aligned) {
         applied = result;
       } else {
-        await this.markReviewProgress(workflowId, "review_reconciliation", "Reconciling Review findings");
+        await this.reviewObservation.mark(workflowId, "review_reconciliation", "Reconciling Review findings");
         const reconciled = await this.reconcileReview(current, result, alignment.conflicts, exec.signal, input);
         conflictInfo = {
           conflicts: alignment.conflicts,
@@ -2621,7 +2436,7 @@ export class WorkflowManager {
       // the outcome policy includes this round; the message is only injected
       // after the commit confirmed we were not cancelled in the meantime.
       let outcomeMessage: string | undefined;
-      await this.markReviewProgress(workflowId, "review_finalizing", "Finalizing Review status");
+      await this.reviewObservation.mark(workflowId, "review_finalizing", "Finalizing Review status");
       const commit = await this.store.update(workflowId, (r) => {
         r.latestReview = applied!;
         // A cycle is consumed only now that a structured verdict is applied:
@@ -2674,7 +2489,7 @@ export class WorkflowManager {
         ? await this.releaseReviewerSubscription(reviewerThreadId)
         : undefined;
       this.reportCleanupNote(workflowId, releaseNote);
-      await this.finishReviewObservation(workflowId);
+      await this.reviewObservation.finish(workflowId);
       await this.flushCleanupNotes(workflowId);
       // The pin is released LAST: the cleanup above still runs on this child.
       this.codex.endRound?.();
@@ -3084,7 +2899,7 @@ export class WorkflowManager {
     this.runtime.activeTurns.set(workflowId, { threadId, turnId, kind, ephemeral: true });
     const record = await this.store.load(workflowId);
     if (record?.processState === "running" && kind === "reviewer") {
-      await this.markReviewProgress(workflowId, undefined, "Reviewer conversion turn is running", turnId);
+      await this.reviewObservation.mark(workflowId, undefined, "Reviewer conversion turn is running", turnId);
     }
     if (!record || record.phase === "cancelled") {
       this.runtime.activeTurns.delete(workflowId);

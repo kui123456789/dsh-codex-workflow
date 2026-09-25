@@ -9,12 +9,13 @@ import { relaySource } from "./message-source.js";
 import type { BridgeStore, ClaimedBridgeCommand } from "./bridge-store.js";
 import { WorkflowStore } from "./store.js";
 import type { WorkflowRecord } from "./types.js";
-import { executionPrompt, formatFindings, type WorkflowManager } from "./workflow.js";
+import { executionPrompt, formatFindings } from "./workflow.js";
 import { SystemDesktopThreadOpener, type DesktopThreadOpener } from "./desktop-thread-opener.js";
-import { DeliveryCoordinator } from "./application/bridge/delivery-coordinator.js";
+import { DeliveryCoordinator, type BridgeDeliveryPort } from "./application/bridge/delivery-coordinator.js";
 import { QueuePump } from "./application/bridge/queue-pump.js";
 import { SessionRouter } from "./application/bridge/session-router.js";
 import { TerminalRelayGuard } from "./application/bridge/terminal-relay-guard.js";
+import { BridgeQueueCoordinator, type BridgeQueuePort } from "./application/bridge/bridge-queue.js";
 import { LiveSessionRepositoryAdapter, WorkflowRepositoryAdapter } from "./application/coordination/repositories.js";
 
 export interface AgentRegistryLike {
@@ -29,7 +30,7 @@ export interface BridgeRuntimeOptions {
   terminalRelayTimeoutMs?: number;
   /** Plugin storage directory; the session registry lives under `bridge/`. */
   storageDir: string;
-  manager: WorkflowManager;
+  manager: BridgeDeliveryPort;
   workflowStore: WorkflowStore;
   /** Exponential backoff base for retryable delivery failures. */
   retryBaseMs?: number;
@@ -115,6 +116,7 @@ export class BridgeRuntime {
   private liveSessionRepository?: LiveSessionRepositoryAdapter;
   private readonly workflowRepository: WorkflowRepositoryAdapter;
   private readonly store: BridgeStore;
+  private readonly queue: BridgeQueuePort;
   private readonly agents: AgentRegistryLike;
   private readonly options: BridgeRuntimeOptions & {
     retryBaseMs: number;
@@ -141,6 +143,7 @@ export class BridgeRuntime {
       desktopOpener: options.desktopOpener ?? new SystemDesktopThreadOpener(),
     };
     this.claimOwner = randomUUID();
+    this.queue = new BridgeQueueCoordinator(store);
     this.queuePump = new QueuePump({
       start: this.startInternal.bind(this),
       stop: this.stopInternal.bind(this),
@@ -162,7 +165,7 @@ export class BridgeRuntime {
 
   startInternal(): void {
     this.stopped = false;
-    void this.store.recoverOrphans().catch(() => undefined);
+    void this.queue.recoverOrphans().catch(() => undefined);
     // Resume callbacks that were durably persisted but never finished.
     void this.deliveryCoordinator.recoverCallbacks().catch(() => undefined);
     void this.retryPendingDesktopOpens().catch(() => undefined);
@@ -171,7 +174,7 @@ export class BridgeRuntime {
     // never let this runtime's live sessions expire, and agent churn (created /
     // disposed) is reflected promptly. Period is a third of the lease TTL; the
     // refresh chain is serialized and gated on `stopped`.
-    const sessionPeriod = Math.max(100, Math.floor(this.store.leaseMs / 3));
+    const sessionPeriod = Math.max(100, Math.floor(this.queue.leaseMs / 3));
     this.sessionHeartbeat = setInterval(() => {
       void this.refreshSessionsInternal(true).catch(() => undefined);
     }, sessionPeriod);
@@ -244,14 +247,14 @@ export class BridgeRuntime {
       .sort((left, right) => left.sessionId.localeCompare(right.sessionId));
     const snapshot = JSON.stringify(rows);
     if (!force && snapshot === this.sessionSnapshot) return;
-    this.liveSessions().refreshOwnerSessions(this.claimOwner, rows, this.store.leaseMs, now);
+    this.liveSessions().refreshOwnerSessions(this.claimOwner, rows, this.queue.leaseMs, now);
     this.sessionSnapshot = snapshot;
     // Preserve audit rows, but close old workflows whose owning DSH session has
     // disappeared. A two-lease grace period lets a normal runtime restart
     // re-register the same session before it is considered abandoned.
     await this.workflowRepository.abandonOrphaned(
       rows.map((row) => row.sessionId),
-      this.store.leaseMs * 2,
+      this.queue.leaseMs * 2,
       now,
     ).catch(() => undefined);
   }
@@ -309,13 +312,13 @@ export class BridgeRuntime {
       await this.deliveryCoordinator.recoverCallbacks().catch(() => 0);
       await this.retryPendingDesktopOpens();
       for (;;) {
-        const claim = await this.store.claimNext(this.claimOwner, (command) => this.isClaimEligible(command));
+        const claim = await this.queue.claimNext(this.claimOwner, (command) => this.isClaimEligible(command));
         if (!claim) break;
         try {
           await this.withClaimHeartbeat(claim, (isLost) => this.handle(claim, isLost));
         } catch (error) {
           // A stale owner's dead-letter changes 0 rows and is a no-op.
-          await this.store.deadLetter(claim, errorMessage(error)).catch(() => undefined);
+          await this.queue.deadLetter(claim, errorMessage(error)).catch(() => undefined);
         }
       }
     } finally {
@@ -353,12 +356,12 @@ export class BridgeRuntime {
     claim: ClaimedBridgeCommand,
     fn: (isLost: () => boolean) => Promise<T>,
   ): Promise<T> {
-    const period = Math.max(100, Math.floor(this.store.leaseMs / 3));
+    const period = Math.max(100, Math.floor(this.queue.leaseMs / 3));
     let lost = false;
     const renewForTest = this.options.renewClaimForTest;
     const renew = renewForTest
       ? (c: ClaimedBridgeCommand) => Promise.resolve(renewForTest(c))
-      : (c: ClaimedBridgeCommand) => this.store.renewClaim(c);
+      : (c: ClaimedBridgeCommand) => this.queue.renewClaim(c);
     const timer = setInterval(() => {
       void renew(claim).then((ok) => {
         if (!ok) {
@@ -402,7 +405,7 @@ export class BridgeRuntime {
     }
     if (target.kind === "terminal") {
       if (isLost()) return; // a stale owner must not ack the new owner's claim
-      await this.store.ack(claim, {
+      await this.queue.ack(claim, {
         requestId: claim.requestId,
         status: "failed",
         error: target.reason,
@@ -418,7 +421,7 @@ export class BridgeRuntime {
       if (existing.bridgeDeliveryState === "delivered") {
         // Delivered before the crash, but the receipt never landed: just ack.
         if (isLost()) return;
-        await this.store.ack(claim, {
+        await this.queue.ack(claim, {
           requestId: claim.requestId,
           status: "delivered",
           workflowId: existing.id,
@@ -430,7 +433,7 @@ export class BridgeRuntime {
     } else {
       try {
         if (isLost()) return;
-        record = await this.options.manager.startExternalPlan(command, target.agent);
+        record = await this.deliveryCoordinator.startExternalPlan(command, target.agent);
       } catch (error) {
         // Busy session or transient store failure: retry with backoff.
         await this.retryOrDeadLetter(claim, errorMessage(error), isLost);
@@ -448,7 +451,7 @@ export class BridgeRuntime {
       await this.options.workflowStore.update(record.id, (r) => {
         r.bridgeDeliveryState = "delivered";
       }, { ignoreCancelled: false });
-      await this.store.ack(claim, {
+      await this.queue.ack(claim, {
         requestId: claim.requestId,
         status: "delivered",
         workflowId: record.id,
@@ -474,7 +477,7 @@ export class BridgeRuntime {
       r.bridgeDeliveryState = "delivered";
     }, { ignoreCancelled: false });
     if (isLost()) return;
-    await this.store.ack(claim, {
+    await this.queue.ack(claim, {
       requestId: claim.requestId,
       status: "delivered",
       workflowId: record.id,
@@ -541,11 +544,11 @@ export class BridgeRuntime {
     if (isLost()) return; // a stale owner must not move the new owner's claim
     const attempts = claim.attempts + 1;
     if (attempts > this.options.maxRetryAttempts) {
-      await this.store.deadLetter(claim, error);
+      await this.queue.deadLetter(claim, error);
       return;
     }
     const delayMs = this.options.retryBaseMs * 2 ** (attempts - 1);
-    await this.store.retry(claim, error, new Date(Date.now() + delayMs).toISOString());
+    await this.queue.retry(claim, error, new Date(Date.now() + delayMs).toISOString());
   }
 
   private async handleSubmissionNotice(
@@ -560,7 +563,7 @@ export class BridgeRuntime {
       || record.submissionId !== command.submissionId
       || record.submissionNotice?.command.requestId !== command.requestId) {
       if (!isLost()) {
-        await this.store.ack(claim, {
+        await this.queue.ack(claim, {
           requestId: claim.requestId,
           status: "no_such_workflow",
           workflowId: command.workflowId,
@@ -572,7 +575,7 @@ export class BridgeRuntime {
     }
     if (record.phase === "cancelled") {
       if (!isLost()) {
-        await this.store.ack(claim, {
+        await this.queue.ack(claim, {
           requestId: claim.requestId,
           status: "cancelled",
           workflowId: command.workflowId,
@@ -600,9 +603,9 @@ export class BridgeRuntime {
       return;
     }
     if (isLost()) return;
-    const committed = await this.options.manager.commitSubmissionNoticeDelivery(command);
+    const committed = await this.deliveryCoordinator.commitSubmissionNoticeDelivery(command);
     if (!committed.committed) {
-      await this.store.ack(claim, {
+      await this.queue.ack(claim, {
         requestId: claim.requestId,
         status: committed.record.phase === "cancelled" ? "cancelled" : "no_such_workflow",
         workflowId: command.workflowId,
@@ -611,7 +614,7 @@ export class BridgeRuntime {
       });
       return;
     }
-    await this.store.ack(claim, {
+    await this.queue.ack(claim, {
       requestId: claim.requestId,
       status: "delivered",
       workflowId: command.workflowId,
@@ -637,14 +640,14 @@ export class BridgeRuntime {
     try {
       if (this.options.beforeApplyHook) await this.options.beforeApplyHook();
       if (isLost()) return; // never apply a verdict with a lost claim
-      record = await this.options.manager.applyExternalVerdict(command);
+      record = await this.deliveryCoordinator.applyExternalVerdict(command);
     } catch (error) {
       const message = errorMessage(error);
       if (/unknown workflow|not a Codex-bridge workflow|thread mismatch|session mismatch|stale submission|missing its submission id|before any submission|already staged|cannot be applied|already applied as request/i.test(message)) {
         // Terminal: stale/unknown identities and conflicting request ids are
         // rejected for good; the expected verdict is the only valid one.
         if (!isLost()) {
-          await this.store.ack(claim, {
+          await this.queue.ack(claim, {
             requestId: claim.requestId,
             status: /already applied as request/i.test(message) ? "duplicate" : "no_such_workflow",
             error: message,
@@ -654,7 +657,7 @@ export class BridgeRuntime {
       } else {
         // Not yet applicable (still staging) or transient: retry with backoff.
         if (!isLost()) {
-          await this.store.retry(claim, message, new Date(Date.now() + 1_000).toISOString());
+          await this.queue.retry(claim, message, new Date(Date.now() + 1_000).toISOString());
         }
       }
       return;
@@ -662,7 +665,7 @@ export class BridgeRuntime {
     if (record.phase === "cancelled") {
       // Late verdict on a cancelled workflow: idempotent receipt, never wake DSH.
       if (!isLost()) {
-        await this.store.ack(claim, {
+        await this.queue.ack(claim, {
           requestId: claim.requestId,
           status: "cancelled",
           workflowId: record.id,
@@ -679,7 +682,7 @@ export class BridgeRuntime {
       // duplicating the automatic path): idempotent ack, no second relay.
       await this.tryOpenDesktopReview(record, command, isLost);
       if (!isLost()) {
-        await this.store.ack(claim, {
+        await this.queue.ack(claim, {
           requestId: claim.requestId,
           status: "delivered",
           workflowId: record.id,
@@ -704,7 +707,7 @@ export class BridgeRuntime {
     // fingerprint and void an applied verdict (even a pass) if the workspace
     // changed while the outcome was pending delivery. This verifies but does
     // NOT yet write delivered (invalidation stays pending-applied).
-    const validity = await this.options.manager.assertVerdictStillValid(command);
+      const validity = await this.deliveryCoordinator.assertVerdictStillValid(command);
     record = validity.record;
 
     let messageId: MessageId;
@@ -714,14 +717,14 @@ export class BridgeRuntime {
       // workspace, the old verdict (a pass) must be invalidated here, before
       // any relay; if the hook cancelled the workflow, this returns without
       // touching state and the pre-relay check below acks cancelled.
-      const final = await this.options.manager.assertVerdictStillValid(command);
+      const final = await this.deliveryCoordinator.assertVerdictStillValid(command);
       record = final.record;
       // Pre-relay re-check: a cancel or a new submission that won between
       // prepare and relay must NOT wake the session or write delivered.
       const fresh = await this.options.workflowStore.load(record.id);
       if (!fresh || fresh.phase === "cancelled") {
         if (!isLost()) {
-          await this.store.ack(claim, {
+          await this.queue.ack(claim, {
             requestId: claim.requestId,
             status: "cancelled",
             workflowId: record.id,
@@ -735,7 +738,7 @@ export class BridgeRuntime {
         || fresh.appliedVerdictRequestId !== command.requestId
         || (command.submissionId !== undefined && fresh.submissionId !== command.submissionId)) {
         if (!isLost()) {
-          await this.store.ack(claim, {
+          await this.queue.ack(claim, {
             requestId: claim.requestId,
             status: "no_such_workflow",
             workflowId: record.id,
@@ -786,10 +789,10 @@ export class BridgeRuntime {
     }
     if (isLost()) return; // a stale owner must not mark delivered
     // Commit delivered only AFTER the relay landed; fenced on identity/state.
-    const commit = await this.options.manager.commitVerdictDelivery(command);
+    const commit = await this.deliveryCoordinator.commitVerdictDelivery(command);
     if (commit.committed) {
       if (isLost()) return;
-      await this.store.ack(claim, {
+      await this.queue.ack(claim, {
         requestId: claim.requestId,
         status: "delivered",
         workflowId: record.id,
@@ -803,7 +806,7 @@ export class BridgeRuntime {
     // The relay landed but the exact commit lost to a cancel/new submission:
     // never overwrite the new state with delivered.
     if (isLost()) return;
-    await this.store.ack(claim, {
+    await this.queue.ack(claim, {
       requestId: claim.requestId,
       status: commit.record.phase === "cancelled" ? "cancelled" : "no_such_workflow",
       workflowId: record.id,
@@ -819,7 +822,7 @@ export class BridgeRuntime {
   private async retryPersistent(claim: ClaimedBridgeCommand, error: string): Promise<void> {
     const attempts = claim.attempts + 1;
     const delayMs = Math.min(60_000, this.options.retryBaseMs * 2 ** Math.min(attempts - 1, 6));
-    await this.store.retry(claim, error, new Date(Date.now() + delayMs).toISOString());
+    await this.queue.retry(claim, error, new Date(Date.now() + delayMs).toISOString());
   }
 
   /** Resume due desktop-open work after startup and on every normal pump. */
