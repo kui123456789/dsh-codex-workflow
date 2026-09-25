@@ -42,6 +42,8 @@ import { PlannerFlow } from "./application/planner-flow.js";
 import { ReviewFlow } from "./application/review-flow.js";
 import { SubmissionFlow } from "./application/submission-flow.js";
 import { ReviewerGateway } from "./application/app-server/reviewer-gateway.js";
+import { ThreadGateway } from "./application/app-server/thread-gateway.js";
+import { TurnGateway } from "./application/app-server/turn-gateway.js";
 import type {
   AlignmentOutcome,
   PersistedTurnBaseline,
@@ -249,6 +251,8 @@ export class WorkflowManager {
   private readonly submissionFlow: SubmissionFlow;
   private readonly lifecycleFlow: LifecycleFlow;
   private readonly reviewerGateway: ReviewerGateway;
+  private readonly threadGateway: ThreadGateway;
+  private readonly turnGateway: TurnGateway;
   private readonly pending = new Map<string, TurnNeedsInputResult>();
   private readonly nudgedTurns = new Set<string>();
   private readonly recovering = new Set<string>();
@@ -328,6 +332,8 @@ export class WorkflowManager {
       stop: this.stopInternal.bind(this),
     });
     this.reviewerGateway = new ReviewerGateway(this.codex);
+    this.threadGateway = new ThreadGateway(this.codex);
+    this.turnGateway = new TurnGateway(this.codex);
   }
 
   // ---------------------------------------------------------------- facade
@@ -554,7 +560,7 @@ export class WorkflowManager {
     signal?: AbortSignal,
   ): Promise<TurnWaitResult> {
     return this.retryTransientTurn(
-      () => this.codex.startTurn(threadId, options, signal),
+      () => this.turnGateway.startTurn(threadId, options, signal),
       transientTurnReason,
       signal,
     );
@@ -575,7 +581,7 @@ export class WorkflowManager {
     signal?: AbortSignal,
   ): Promise<{ threadId: string; result: TurnWaitResult }> {
     return this.retryTransientTurn(
-      () => this.codex.startReview(options, signal),
+      () => this.turnGateway.startReview(options, signal),
       (outcome) => transientTurnReason(outcome.result),
       signal,
     );
@@ -717,7 +723,7 @@ export class WorkflowManager {
     // their own abort/interrupt paths instead of timing out into a closed
     // store. Background Reviewer turns are interrupted by callback.stop().
     for (const active of this.activeTurns.values()) {
-      void this.codex.interrupt(active.threadId, active.turnId).catch(() => undefined);
+      void this.turnGateway.interrupt(active.threadId, active.turnId).catch(() => undefined);
     }
     const foreground = [...this.foreground];
     const callbackStop = this.callback?.stop();
@@ -827,7 +833,7 @@ export class WorkflowManager {
       await createLease.release().catch(() => undefined);
     }
     try {
-      const plannerThreadId = await this.codex.startThread({
+      const plannerThreadId = await this.threadGateway.startThread({
         cwd: record.cwd,
         ...(args.plannerModel || this.config.plannerModel
           ? { model: args.plannerModel || this.config.plannerModel }
@@ -1212,9 +1218,9 @@ export class WorkflowManager {
     let plannerModel = record.plannerModel || this.config.plannerModel || undefined;
     const pending = this.pending.get(workflowId);
     if (pending) {
-      outcome = await this.codex.continueTurn(pending, answers, exec.signal);
+      outcome = await this.turnGateway.continueTurn(pending, answers, exec.signal);
     } else {
-      await this.codex.resumeThread(record.plannerThreadId, record.cwd, exec.signal);
+      await this.threadGateway.resumeThread(record.plannerThreadId, record.cwd, exec.signal);
       outcome = await this.startTurnWithTransientRetry(record.plannerThreadId, {
         prompt: resumedAnswerPrompt(answers),
         ...(plannerModel ? { model: plannerModel } : {}),
@@ -2060,7 +2066,7 @@ export class WorkflowManager {
     // re-pick).
     const reviewerModel = args.reviewerModel
       || this.config.reviewerModel
-      || await this.codex.resolveDefaultModel?.(exec.signal)
+      || await this.turnGateway.resolveDefaultModel?.(exec.signal)
       || undefined;
     const record: WorkflowRecord = {
       schemaVersion: 1,
@@ -2221,7 +2227,7 @@ export class WorkflowManager {
     this.stopReviewHeartbeat(workflowId);
     if (active) target = { threadId: active.threadId, turnId: active.turnId };
     if (target) {
-      await this.codex.interrupt(target.threadId, target.turnId, exec.signal).catch(() => undefined);
+      await this.turnGateway.interrupt(target.threadId, target.turnId, exec.signal).catch(() => undefined);
     }
     // Cancel the active Reviewer operation, if any; cancelled is terminal for it too.
     if (outcome.record.submissionId) {
@@ -2332,7 +2338,7 @@ export class WorkflowManager {
       // `review/start` custom target on every path (see below).
       const reviewerModel = current.reviewerModel
         || this.config.reviewerModel
-        || await this.codex.resolveDefaultModel?.(exec.signal)
+        || await this.turnGateway.resolveDefaultModel?.(exec.signal)
         || undefined;
       const contract = reviewContractInstructions(current, input, evidence);
       reviewerThreadId = current.reviewerThreadId;
@@ -2410,7 +2416,7 @@ export class WorkflowManager {
       // to equal the persisted `thread.turns[].id` (real App Server
       // evidence). The baseline read is metadata-only and never touches the
       // thread's writer.
-      const reviewBaseline = await this.codex.captureTurnBaseline?.(reviewerThreadId, exec.signal);
+      const reviewBaseline = await this.turnGateway.captureTurnBaseline?.(reviewerThreadId, exec.signal);
       // 1.1.2: the visible review turn runs through the SAME transient-retry
       // wrapper as every other visible turn (1.1.1 parity on the App Server
       // path). A retried attempt re-registers its own turn, so the active-turn
@@ -2429,7 +2435,7 @@ export class WorkflowManager {
         // reached for the exact workflow task.
         onStarted: async (started) => {
           if (started.threadId !== reviewerThreadId) {
-            await this.codex.interrupt?.(started.threadId, started.turnId).catch(() => undefined);
+            await this.turnGateway.interrupt?.(started.threadId, started.turnId).catch(() => undefined);
             throw new Error(`review/start returned task ${started.threadId}, expected the workflow task ${reviewerThreadId}; refusing to persist a second visible task`);
           }
           await this.registerActiveTurn(workflowId, started.threadId, started.turnId, "reviewer");
@@ -2497,7 +2503,7 @@ export class WorkflowManager {
         // Baseline BEFORE the rewrite turn, exactly like the native turn: the
         // rewrite's persisted output is detected as an APPENDED turn, never by
         // assuming the `turn/start` RPC id equals the persisted rollout id.
-        const rewriteBaseline = await this.codex.captureTurnBaseline?.(reviewerThreadId, exec.signal);
+        const rewriteBaseline = await this.turnGateway.captureTurnBaseline?.(reviewerThreadId, exec.signal);
         await this.markReviewProgress(workflowId, "review_display_rewrite", "Rewriting Reviewer display output", null);
         const rewrite = await this.startTurnWithTransientRetry(reviewerThreadId, {
           prompt: reviewRewritePrompt(authoritativeText, current),
@@ -2557,7 +2563,7 @@ export class WorkflowManager {
         await this.markReviewProgress(workflowId, "review_conversion", "Converting Reviewer result", null);
         let normalized: TurnWaitResult;
         try {
-          normalized = await this.codex.normalizeInFork({
+          normalized = await this.turnGateway.normalizeInFork({
             threadId: review.threadId,
             cwd: current.cwd,
             prompt: reviewConversionPrompt(authoritativeText, workflowId),
@@ -2848,8 +2854,8 @@ export class WorkflowManager {
     baseline: PersistedTurnBaseline | undefined,
     signal?: AbortSignal,
   ): Promise<{ text: string; itemType?: string } | undefined> {
-    if (!this.codex.readAppendedTurnText || !baseline) return undefined;
-    return this.codex.readAppendedTurnText(threadId, baseline, signal);
+    if (!this.turnGateway.readAppendedTurnText || !baseline) return undefined;
+    return this.turnGateway.readAppendedTurnText(threadId, baseline, signal);
   }
 
   /** 1.0.10 Review Authority alignment: an INVISIBLE ephemeral fork of the
@@ -2897,11 +2903,11 @@ export class WorkflowManager {
     if (!threadId) throw new Error("review authority alignment requires the workflow review thread");
     const model = record.reviewerModel
       || this.config.reviewerModel
-      || await this.codex.resolveDefaultModel?.(signal)
+      || await this.turnGateway.resolveDefaultModel?.(signal)
       || undefined;
     let normalized: TurnWaitResult;
     try {
-      normalized = await this.codex.normalizeInFork({
+      normalized = await this.turnGateway.normalizeInFork({
         threadId,
         cwd: record.cwd,
         prompt: reviewAlignPrompt(result, {
@@ -2988,7 +2994,7 @@ export class WorkflowManager {
     const model = record.reviewerModel || this.config.reviewerModel;
     // Baseline BEFORE the reconciliation turn, exactly like the native
     // review/rewrite turns: the appended turn is detected against these ids.
-    const baseline = await this.codex.captureTurnBaseline?.(threadId, signal);
+    const baseline = await this.turnGateway.captureTurnBaseline?.(threadId, signal);
     let reconcile: TurnWaitResult;
     try {
       reconcile = await this.startTurnWithTransientRetry(threadId, {
@@ -3024,7 +3030,7 @@ export class WorkflowManager {
     if (displayError) throw new Error(`reconciled review violates the display contract: ${displayError}`);
     let corrected: TurnWaitResult;
     try {
-      corrected = await this.codex.normalizeInFork({
+      corrected = await this.turnGateway.normalizeInFork({
         threadId,
         cwd: after.cwd,
         prompt: reviewConversionPrompt(persisted.text, after.id),
@@ -3087,7 +3093,7 @@ export class WorkflowManager {
       // Cancelled while the turn was being registered: kill the turn we just
       // started, never the record.
       this.activeTurns.delete(workflowId);
-      await this.codex.interrupt(threadId, turnId).catch(() => undefined);
+      await this.turnGateway.interrupt(threadId, turnId).catch(() => undefined);
     }
   }
 
@@ -3111,7 +3117,7 @@ export class WorkflowManager {
     }
     if (!record || record.phase === "cancelled") {
       this.activeTurns.delete(workflowId);
-      await this.codex.interrupt(threadId, turnId).catch(() => undefined);
+      await this.turnGateway.interrupt(threadId, turnId).catch(() => undefined);
     }
   }
 
@@ -3242,7 +3248,7 @@ export class WorkflowManager {
     const convert = async (visibleText: string): Promise<PlannerResult | WorkflowRecord> => {
       let normalized: TurnWaitResult;
       try {
-        normalized = await this.codex.normalizeInFork({
+        normalized = await this.turnGateway.normalizeInFork({
           threadId: outcome.threadId,
           cwd: cwd ?? process.cwd(),
           prompt: plannerConvertPrompt(visibleText),
