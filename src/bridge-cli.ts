@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { encodeBridgeCommand, newRequestId, parseReviewResult, type DispatchPlanCommand, type SubmitVerdictCommand } from "./bridge-protocol.js";
 import { BridgeStore } from "./bridge-store.js";
 import { PLUGIN_VERSION } from "./version.js";
+import { parseWorkflowJson } from "./state/workflow-schema.js";
 
 const WORKFLOW_PHASES = new Set([
   "planning", "waiting_input", "executing", "reviewing", "fixing",
@@ -256,7 +257,7 @@ async function loadWorkflowSummaries(storageDir: string): Promise<WorkflowSummar
     for (const row of rows) {
       let record: Record<string, unknown>;
       try {
-        record = JSON.parse(row.recordJson) as Record<string, unknown>;
+        record = parseWorkflowJson(row.recordJson);
       } catch {
         continue;
       }
@@ -305,7 +306,7 @@ async function commandShow(args: ParsedArgs): Promise<void> {
   }
   let record: Record<string, unknown>;
   try {
-    record = JSON.parse(row.recordJson) as Record<string, unknown>;
+    record = parseWorkflowJson(row.recordJson);
   } catch {
     record = {};
   }

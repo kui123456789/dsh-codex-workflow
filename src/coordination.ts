@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { isAbsolute, join, resolve } from "node:path";
+import { parseWorkflowJson } from "./state/workflow-schema.js";
 
 /**
  * SQLite-backed coordination state shared by every DSH process and the CLI.
@@ -631,7 +632,7 @@ export class CoordinationStore {
     const row = this.loadWorkflow(workflowId);
     if (!row) return undefined;
     try {
-      const record = JSON.parse(row.recordJson) as { dshSessionId?: string };
+      const record = parseWorkflowJson(row.recordJson) as { dshSessionId?: string };
       return typeof record.dshSessionId === "string" ? record.dshSessionId : undefined;
     } catch {
       return undefined;
@@ -704,7 +705,7 @@ export class CoordinationStore {
       let phase = "";
       let submissionActive = false;
       try {
-        const record = JSON.parse(row.record_json) as {
+        const record = parseWorkflowJson(row.record_json) as {
           phase?: string;
           submissionState?: string;
           submissionActive?: boolean;
@@ -833,7 +834,7 @@ export class CoordinationStore {
         throw new Error(`unknown workflow ${id}`);
       }
       const loadedRevision = Number(existing.revision);
-      const raw = JSON.parse(existing.record_json) as unknown;
+      const raw = parseWorkflowJson(existing.record_json);
       if (!opts.ignoreCancelled && (raw as { phase?: string }).phase === "cancelled") {
         this.db.exec("ROLLBACK");
         return { kind: "suppressed", revision: loadedRevision, recordJson: existing.record_json };
@@ -879,7 +880,7 @@ function receiptDeliveredAt(receiptJson: string): number | undefined {
 
 function workflowPruneState(recordJson: string): { phase: string; submissionActive: boolean } | undefined {
   try {
-    const record = JSON.parse(recordJson) as { phase?: string; submissionState?: string };
+    const record = parseWorkflowJson(recordJson) as { phase?: string; submissionState?: string };
     return {
       phase: record.phase ?? "",
       submissionActive: record.submissionState === "queued"

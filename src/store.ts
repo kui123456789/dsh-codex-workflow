@@ -2,6 +2,7 @@ import { mkdir, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { CoordinationStore, coordinationPath } from "./coordination.js";
 import type { ReviewFinding, ReviewStep, WorkflowMode, WorkflowPhase, WorkflowProcessState, WorkflowRecord } from "./types.js";
+import { deserializeWorkflowRecord, serializeWorkflowRecord } from "./state/workflow-schema.js";
 
 export interface UpdateOutcome<T> {
   /** The record as persisted after this update (or the untouched current
@@ -268,8 +269,7 @@ const PROCESS_STATES = new Set<WorkflowProcessState>([
 ]);
 
 function parseRecord(value: unknown): WorkflowRecord {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid workflow record");
-  const record = value as Partial<WorkflowRecord>;
+  const record = deserializeWorkflowRecord(value) as Partial<WorkflowRecord>;
   if (record.schemaVersion !== 1 || typeof record.id !== "string" || typeof record.dshSessionId !== "string") {
     throw new Error("unsupported workflow record");
   }
@@ -322,13 +322,13 @@ function normalizeFinding(finding: ReviewFinding): ReviewFinding {
 }
 
 function recordJson(record: WorkflowRecord): string {
-  return `${JSON.stringify(record, null, 2)}\n`;
+  return `${serializeWorkflowRecord(record)}\n`;
 }
 
 /** Parse a workflow row, overriding `record.revision` with the database row's
  * revision — the JSON inside record_json must never be trusted for it. */
 function parseWorkflowRow(row: { id: string; revision: number; recordJson: string }): WorkflowRecord {
-  const record = parseRecord(JSON.parse(row.recordJson));
+  const record = parseRecord(deserializeWorkflowRecord(JSON.parse(row.recordJson)));
   record.revision = row.revision;
   return record;
 }
