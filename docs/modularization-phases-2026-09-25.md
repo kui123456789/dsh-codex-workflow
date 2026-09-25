@@ -46,7 +46,7 @@ public facade 供 DSH tools、BridgeRuntime 和 npm consumers 使用；每个 fl
 的 port，legacy state machine 仍由 manager 单独持有。这样先固定了依赖方向和兼容边界，
 后续提交可以逐个把内部方法移入 flow，而不需要一次性改写所有状态/取消/恢复逻辑。
 
-**阶段门禁**：`pnpm typecheck`、`pnpm test`（434/434）通过。此阶段尚未声称完成
+**阶段门禁**：`pnpm typecheck`、`pnpm test`（438/438）通过。此阶段尚未声称完成
 Planner/Review/Submission/Lifecycle 内部状态机的物理拆分。
 
 ## 阶段 3（process transport）— 当前提交
