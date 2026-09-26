@@ -23,9 +23,17 @@ window.__ModuleLoader__.load({
     }
 
     function LiveLog({ entries }) {
+      const scrollRef = React.useRef(null);
+      const followRef = React.useRef(true);
+      React.useEffect(() => {
+        const node = scrollRef.current;
+        if (node && followRef.current) node.scrollTop = node.scrollHeight;
+      }, [entries]);
       if (!Array.isArray(entries) || entries.length === 0) return null;
       const labels = { message: "Codex", plan: "计划", reasoning: "思路摘要", tool: "工具" };
-      return h("div", { "aria-label": "Codex 实时输出", style: { display: "grid", gap: 10, margin: "12px 0" } },
+      return h("div", { "aria-label": "Codex 实时输出", ref: scrollRef,
+        onScroll: (event) => { const node = event.currentTarget; followRef.current = node.scrollHeight - node.scrollTop - node.clientHeight < 40; },
+        style: { display: "grid", gap: 10, margin: "12px 0", maxHeight: 420, overflowY: "auto", paddingRight: 6 } },
         ...entries.map((entry, index) => h("div", { key: `${entry.kind}:${entry.itemId}:${index}`,
           style: { borderLeft: "2px solid var(--border-color, #4a5568)", paddingLeft: 12, minWidth: 0 } },
           h("div", { style: { fontSize: 12, opacity: 0.7, marginBottom: 4 } }, labels[entry.kind] || "Codex"),

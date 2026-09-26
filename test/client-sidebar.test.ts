@@ -42,7 +42,8 @@ test("sidebar body renders Planner and Reviewer activity while they are running"
     return { type, props, children };
   };
   runInNewContext(source, { window: { __ModuleLoader__: { load: (entry: { factory(require: (name: string) => unknown): { apply(ctx: unknown): void } }) => {
-    plugin = entry.factory(() => ({ createElement: h, useSyncExternalStore: (_subscribe: unknown, getSnapshot: () => unknown) => getSnapshot() }));
+    plugin = entry.factory(() => ({ createElement: h, useSyncExternalStore: (_subscribe: unknown, getSnapshot: () => unknown) => getSnapshot(),
+      useRef: (initial: unknown) => ({ current: initial }), useEffect: () => undefined }));
   } } } });
   assert.ok(plugin);
   let body: ((props: unknown) => unknown) | undefined;
