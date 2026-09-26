@@ -10,6 +10,7 @@
 
 - The Codex Review right sidebar now opens when `codex_workflow_start` publishes a plan, before the first review round; review events continue to reuse the same tab.
 - The host plugin now declares its `sessionProjections` dependency and registers the projection synchronously before Session Controller history replay.
+- Plugin-owned session events are emitted through the host event bus with `ignorable: true`, allowing older clients to replay history while the current projection consumes the events.
 
 All notable changes to `dsh-codex-workflow`.
 

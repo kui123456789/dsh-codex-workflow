@@ -1221,7 +1221,17 @@ export class WorkflowManager {
     const agent = this.agents?.get(record.dshSessionId);
     if (!agent) return;
     try {
-      agent.session.append(event.type, event.data as never);
+      // Route through the host event bus so the Session Controller persists
+      // plugin-owned events with `ignorable: true`. That marker lets older or
+      // refreshed clients retain the log and lets the registered projection
+      // consume it; direct session.append() creates a required unknown event
+      // that makes history replay fail before the sidebar can mount.
+      const agentContext = (agent as unknown as { ctx?: { emit?: (...args: unknown[]) => unknown } }).ctx;
+      if (typeof agentContext?.emit === "function") {
+        agentContext.emit("session/event", agent.session, { type: event.type, data: event.data, ignorable: true });
+      } else {
+        agent.session.append(event.type, event.data as never);
+      }
     } catch {
       // A session can be disposing while a background callback settles. The
       // coordination record remains authoritative and will be shown on reload.
