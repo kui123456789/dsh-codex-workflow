@@ -20,14 +20,20 @@ import { WorkflowManager } from "./workflow.js";
 import { codexWorkflowProjectionDefinition } from "./review-events.js";
 
 export const name = "dsh-codex-workflow";
-export const inject = ["tools", "agents", "systemPrompt"];
+// The projection must be registered before Session Controller replays history;
+// otherwise a refreshed DSH page rejects our namespaced workflow events as
+// unknown and the browser cannot open the Codex Review tab.
+export const inject = ["tools", "agents", "systemPrompt", "sessionProjections"];
 export const Config = ConfigSchema;
 export type Config = RawConfig;
 
 export async function apply(ctx: Context, raw: Config): Promise<void> {
+  const projections = ctx.get("sessionProjections") as { register(definition: typeof codexWorkflowProjectionDefinition): () => void } | undefined;
+  // Register synchronously at plugin activation. Session Controller may replay
+  // existing history before async host setup finishes; delaying this until the
+  // effect body makes our namespaced events appear unknown after a page refresh.
+  const disposeProjection = projections?.register(codexWorkflowProjectionDefinition) ?? (() => undefined);
   await ctx.effect(async () => {
-    const projections = ctx.get("sessionProjections") as { register(definition: typeof codexWorkflowProjectionDefinition): () => void } | undefined;
-    const disposeProjection = projections?.register(codexWorkflowProjectionDefinition) ?? (() => undefined);
     const config = resolveConfig(raw);
     const store = new WorkflowStore(config.storageDir);
     await store.init();

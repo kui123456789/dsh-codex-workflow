@@ -113,12 +113,23 @@ window.__ModuleLoader__.load({
           if (!projection) return;
           const active = projection.activeReview;
           const latest = active || projection.reviews?.at?.(-1);
-          if (!latest) return;
-          const key = `${sessionId}:${latest.reviewId}`;
+          const target = latest
+            ? {
+                key: `${sessionId}:review:${latest.reviewId}`,
+                params: { workflowId: latest.workflowId, reviewId: latest.reviewId },
+              }
+            : projection.plan && projection.currentWorkflowId
+              ? {
+                  key: `${sessionId}:plan:${projection.currentWorkflowId}`,
+                  params: { workflowId: projection.currentWorkflowId },
+                }
+              : undefined;
+          if (!target) return;
+          const key = target.key;
           if (!opened.has(key)) {
             opened.add(key);
             try {
-              ctx.sidebarRight.openTabIn(sessionId, TAB_KIND, { revealIfOpened: true, params: { workflowId: latest.workflowId, reviewId: latest.reviewId } });
+              ctx.sidebarRight.openTabIn(sessionId, TAB_KIND, { revealIfOpened: true, params: target.params });
             } catch {
               // The current session surface can be between teardown and mount;
               // the next list/projection notification retries the open.

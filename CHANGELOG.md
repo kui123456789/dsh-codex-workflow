@@ -6,6 +6,11 @@
 - Ephemeral review paths no longer attempt persisted thread read-back; readable streamed output is used for the private conversion and DSH Session projection.
 - Added regression coverage proving ephemeral conversion emits a schema turn without `thread/fork`.
 
+## [1.1.9] - 2026-09-26
+
+- The Codex Review right sidebar now opens when `codex_workflow_start` publishes a plan, before the first review round; review events continue to reuse the same tab.
+- The host plugin now declares its `sessionProjections` dependency and registers the projection synchronously before Session Controller history replay.
+
 All notable changes to `dsh-codex-workflow`.
 
 ## [1.1.7] - 2026-09-26

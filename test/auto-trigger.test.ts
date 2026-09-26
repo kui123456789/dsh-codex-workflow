@@ -17,8 +17,8 @@ test("autoTriggerMode defaults to complex and validates the public modes", () =>
   assert.throws(() => Config({ autoTriggerMode: "sometimes" as never }));
 });
 
-test("plugin declares systemPrompt as a required injected service", () => {
-  assert.deepEqual(inject, ["tools", "agents", "systemPrompt"]);
+test("plugin declares systemPrompt and session projections as required services", () => {
+  assert.deepEqual(inject, ["tools", "agents", "systemPrompt", "sessionProjections"]);
 });
 
 test("off mode registers no prompt section and has a harmless disposer", () => {
