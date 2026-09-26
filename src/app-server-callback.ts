@@ -273,6 +273,7 @@ export class AppServerCodexCallbackDispatcher {
         ...(request.model ? { model: request.model } : {}),
         ...(request.effort ? { effort: request.effort } : {}),
         silentReview: true,
+        onProgress: request.onProgress,
         onStarted: async (started) => {
           // Same 1.0.8 invariant as the DSH-led path, enforced BEFORE any
           // tracking: the App Server's reported review task must be the
@@ -373,6 +374,7 @@ export class AppServerCodexCallbackDispatcher {
             ...(request.model ? { model: request.model } : {}),
             effort: "low",
             silentReview: true,
+            onProgress: request.onProgress,
             onStarted: async (started) => {
               this.active.set(key, started);
               if (this.isLatched(key, request.workflowId)) {

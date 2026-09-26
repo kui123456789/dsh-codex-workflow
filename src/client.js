@@ -22,6 +22,18 @@ window.__ModuleLoader__.load({
       );
     }
 
+    function LiveLog({ entries }) {
+      if (!Array.isArray(entries) || entries.length === 0) return null;
+      const labels = { message: "Codex", plan: "计划", reasoning: "思路摘要", tool: "工具" };
+      return h("div", { "aria-label": "Codex 实时输出", style: { display: "grid", gap: 10, margin: "12px 0" } },
+        ...entries.map((entry, index) => h("div", { key: `${entry.kind}:${entry.itemId}:${index}`,
+          style: { borderLeft: "2px solid var(--border-color, #4a5568)", paddingLeft: 12, minWidth: 0 } },
+          h("div", { style: { fontSize: 12, opacity: 0.7, marginBottom: 4 } }, labels[entry.kind] || "Codex"),
+          h("pre", { style: { margin: 0, whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontFamily: "inherit", fontSize: 13, lineHeight: 1.55 } }, entry.text),
+        )),
+      );
+    }
+
     function ReviewBody({ projectionFace, useTabInfo }) {
       const projection = useProjection(projectionFace);
       const info = useTabInfo();
@@ -30,16 +42,25 @@ window.__ModuleLoader__.load({
         h("header", { className: "dsh-codex-review-header" },
           h("h2", null, "Codex Review"),
           projection.activeReview
-            ? h("span", { role: "status" }, projection.activeReview.message || "审查进行中")
+            ? h("span", { role: "status" }, projection.activeReview.message || "Codex 正在审查")
+            : projection.plan?.status === "planning"
+              ? h("span", { role: "status" }, "Codex 正在规划")
             : h("span", { role: "status" }, reviews.length ? "最近审查已完成" : "等待审查"),
         ),
         projection.plan && h("details", { open: true },
           h("summary", null, "Planner", " · ", projection.plan.status),
-          projection.plan.planMarkdown && h("pre", { className: "dsh-codex-review-plan" }, projection.plan.planMarkdown),
+          h(LiveLog, { entries: projection.plan.live }),
+          projection.plan.planMarkdown && h("pre", { className: "dsh-codex-review-plan",
+            style: { whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontFamily: "inherit", fontSize: 13, lineHeight: 1.55 } }, projection.plan.planMarkdown),
           projection.plan.questions?.length > 0 && h("div", null,
             h("h3", null, "待回答问题"),
             ...projection.plan.questions.map((question, index) => h("p", { key: question.id || index }, `${index + 1}. ${question.question}`)),
           ),
+          projection.plan.assumptions?.length > 0 && h("div", null,
+            h("h3", null, "假设"),
+            h("ul", null, ...projection.plan.assumptions.map((assumption, index) => h("li", { key: index }, assumption))),
+          ),
+          projection.plan.status === "failed" && projection.plan.message && h("p", { role: "alert" }, projection.plan.message),
         ),
         reviews.length === 0 && h("p", null, "暂无审查结果"),
         ...reviews.map((review, index) => h("details", {
@@ -48,7 +69,9 @@ window.__ModuleLoader__.load({
         },
           h("summary", null, `第 ${review.attempt || index + 1} 轮`, " · ", review.processState, review.verdict ? ` · ${review.verdict}` : ""),
           h("p", null, review.message || ""),
-          review.visibleText && h("pre", { className: "dsh-codex-review-text" }, review.visibleText),
+          h(LiveLog, { entries: review.live }),
+          review.visibleText && h("pre", { className: "dsh-codex-review-text",
+            style: { whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontFamily: "inherit", fontSize: 13, lineHeight: 1.55 } }, review.visibleText),
           review.result && h("div", { className: "dsh-codex-review-result" },
             h("h3", null, "VERDICT"), h("p", null, review.result.verdict),
             h("h3", null, "FINDINGS"),

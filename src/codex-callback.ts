@@ -3,6 +3,7 @@ import type { ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { parseReviewResult } from "./bridge-protocol.js";
 import type { ReasoningEffort, ReviewResult } from "./types.js";
+import type { AppServerLiveEvent } from "./app-server.js";
 
 export interface CodexCallbackRequest {
   workflowId: string;
@@ -26,6 +27,7 @@ export interface CodexCallbackRequest {
   effort?: ReasoningEffort;
   onThread?: (threadId: string) => Promise<void> | void;
   onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
+  onProgress?: (entry: AppServerLiveEvent) => void;
   /** Called when the EPHEMERAL conversion fork's turn starts, with the FORK
    * thread/turn. Never persisted: the fork id must not land in
    * plannerThreadId/reviewerThreadId. */

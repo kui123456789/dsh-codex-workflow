@@ -10,6 +10,7 @@ import { transientReason } from "../transient-retry.js";
 import type { ReviewConflictInfo, ReviewInput, ReviewResult, SubmissionState, WorkflowConfig, WorkflowPhase, WorkflowRecord } from "../types.js";
 import { applyReviewConsistency, abortError, callbackRecoveryDelay, delay, errorMessage, submissionTerminal } from "../workflow.js";
 import type { CodexReviewEndEvent } from "../review-events.js";
+import type { LiveRelay } from "./live-relay.js";
 
 type AnyFn = (...args: any[]) => any;
 
@@ -31,6 +32,7 @@ export interface SubmissionExecutionContext {
   alignReview: AnyFn;
   reconcileReview: AnyFn;
   errorMessage: (error: unknown) => string;
+  createLiveRelay(record: WorkflowRecord, stage: "reviewing", reviewId: string): LiveRelay;
 }
 
 /** Owns one durable bridge callback state machine, including lease fencing,
@@ -46,6 +48,8 @@ export class SubmissionExecution {
     lease?: ManagerLease,
   ): Promise<WorkflowRecord> {
     let current = seed;
+    const liveRecord = await this.ctx.store.load(workflowId) ?? seed;
+    const live = this.ctx.createLiveRelay(liveRecord, "reviewing", `${workflowId}:${liveRecord.reviewAttempt ?? 1}`);
     const roundStartAttempt = current.submissionAttempts ?? 0;
     let leaseLost = false;
     let reviewEndDetail: Pick<CodexReviewEndEvent, "verdict" | "result" | "visibleText" | "summary" | "error"> | undefined;
@@ -150,6 +154,7 @@ export class SubmissionExecution {
                 throw new Error("submission no longer owns the active reviewer turn");
               }
             },
+            onProgress: live.onProgress,
           }, signal);
         } catch (error) {
           if (leaseLost) return current; // we were taken over mid-flight: write nothing
@@ -374,6 +379,7 @@ export class SubmissionExecution {
       await this.ctx.enqueueSubmissionNotice(workflowId, submissionId, failed, signal);
       return current;
     } finally {
+      live.close();
       lease?.stopHeartbeat();
       await this.ctx.reviewObservation.finish(workflowId, undefined, reviewEndDetail);
       await this.ctx.flushCleanupNotes(workflowId);

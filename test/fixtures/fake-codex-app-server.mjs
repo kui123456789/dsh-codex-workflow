@@ -303,6 +303,11 @@ function handleClientRequest(message) {
             : "<proposed_plan>\nImplement safely\n</proposed_plan>";
     const delay = (prompt.includes("SLOW") ? Number(process.env.FAKE_CODEX_SLOW_DELAY_MS || 0) : 0)
       || Number(process.env.FAKE_CODEX_TURN_DELAY_MS || 0);
+    if (process.env.FAKE_CODEX_STREAM_VISIBLE === "1" && !params.outputSchema) {
+      send({ method: "item/started", params: { threadId: params.threadId, turnId, item: { type: "commandExecution", id: `command-${turnId}`, command: "git status --short", status: "inProgress" } } });
+      send({ method: "item/plan/delta", params: { threadId: params.threadId, turnId, itemId: `item-${turnId}`, delta: "<proposed_plan>\n" } });
+      send({ method: "item/plan/delta", params: { threadId: params.threadId, turnId, itemId: `item-${turnId}`, delta: "Implement safely\n</proposed_plan>" } });
+    }
     // Interrupted/failed turns carry NO final agent message: a provisional pass
     // alone must never become a verdict.
     const emission = !reviewSchema || finalStatus === "completed" ? finalText : null;
@@ -319,7 +324,14 @@ function handleClientRequest(message) {
     subscribed.add(reviewThreadId);
     knownThreads.add(reviewThreadId);
     send({ id, result: { reviewThreadId, turn: { id: turnId, items: [], itemsView: "full", status: "inProgress", error: null, startedAt: 1, completedAt: null, durationMs: null } } });
-    return setTimeout(() => complete(reviewThreadId, turnId, "No actionable findings."), 0);
+    if (process.env.FAKE_CODEX_STREAM_VISIBLE === "1") {
+      send({ method: "item/agentMessage/delta", params: { threadId: reviewThreadId, turnId, itemId: `item-${turnId}`, delta: "VERDICT: " } });
+      send({ method: "item/agentMessage/delta", params: { threadId: reviewThreadId, turnId, itemId: `item-${turnId}`, delta: "pass" } });
+    }
+    return setTimeout(() => complete(reviewThreadId, turnId,
+      process.env.FAKE_CODEX_NATIVE_REVIEW_TEXT
+        || (process.env.FAKE_CODEX_STREAM_VISIBLE === "1" ? "VERDICT: pass" : "No actionable findings.")),
+    Number(process.env.FAKE_CODEX_TURN_DELAY_MS || 0));
   }
   send({ id, error: { code: -32601, message: `unknown ${method}` } });
 }

@@ -5,6 +5,23 @@ import type { PlannerQuestion, ReviewResult, ReviewStep, WorkflowProcessState } 
 
 export type CodexReviewId = string;
 
+export interface CodexLiveEntry {
+  kind: "message" | "plan" | "reasoning" | "tool";
+  itemId: string;
+  text: string;
+  replace?: boolean;
+}
+
+export interface CodexLiveEvent {
+  workflowId: string;
+  stage: "planning" | "reviewing";
+  reviewId?: CodexReviewId;
+  entries: CodexLiveEntry[];
+  at: string;
+}
+
+export type CodexLiveViewEntry = Omit<CodexLiveEntry, "replace">;
+
 export interface CodexPlanUpdatedEvent {
   workflowId: string;
   status: "planning" | "waiting_input" | "ready" | "failed";
@@ -50,6 +67,7 @@ declare module "@deepseek-ai/dsh-session/types" {
     "dsh-codex-workflow/review-start": CodexReviewStartEvent;
     "dsh-codex-workflow/review-progress": CodexReviewProgressEvent;
     "dsh-codex-workflow/review-end": CodexReviewEndEvent;
+    "dsh-codex-workflow/live": CodexLiveEvent;
   }
 }
 
@@ -60,6 +78,7 @@ export interface CodexPlanView {
   questions: PlannerQuestion[];
   assumptions: string[];
   message?: string;
+  live?: CodexLiveViewEntry[];
 }
 
 export interface CodexReviewView {
@@ -77,6 +96,7 @@ export interface CodexReviewView {
   visibleText?: string;
   summary?: string;
   error?: string;
+  live?: CodexLiveViewEntry[];
 }
 
 export interface CodexWorkflowProjectionState {
@@ -98,7 +118,8 @@ export type CodexWorkflowSessionEvent =
   | { type: "dsh-codex-workflow/plan-updated"; data: CodexPlanUpdatedEvent }
   | { type: "dsh-codex-workflow/review-start"; data: CodexReviewStartEvent }
   | { type: "dsh-codex-workflow/review-progress"; data: CodexReviewProgressEvent }
-  | { type: "dsh-codex-workflow/review-end"; data: CodexReviewEndEvent };
+  | { type: "dsh-codex-workflow/review-end"; data: CodexReviewEndEvent }
+  | { type: "dsh-codex-workflow/live"; data: CodexLiveEvent };
 
 declare module "@deepseek-ai/dsh-session-projection/types" {
   interface SessionProjectionStateMap {
@@ -123,6 +144,7 @@ const planSchema = z.object({
   questions: z.array(z.any()),
   assumptions: z.array(z.string()),
   message: z.string().optional(),
+  live: z.array(z.object({ kind: z.enum(["message", "plan", "reasoning", "tool"]), itemId: z.string(), text: z.string() })).optional(),
 }).passthrough();
 
 const reviewSchema = z.object({
@@ -143,6 +165,7 @@ const reviewSchema = z.object({
   visibleText: z.string().optional(),
   summary: z.string().optional(),
   error: z.string().optional(),
+  live: z.array(z.object({ kind: z.enum(["message", "plan", "reasoning", "tool"]), itemId: z.string(), text: z.string() })).optional(),
 }).passthrough();
 
 const projectionSchema = z.object({
@@ -166,6 +189,20 @@ function upsert(reviews: CodexReviewView[], next: CodexReviewView): CodexReviewV
   return reviews.map((entry, i) => i === index ? next : entry);
 }
 
+function appendLive(current: CodexLiveViewEntry[] | undefined, entries: CodexLiveEntry[]): CodexLiveViewEntry[] {
+  const next = [...(current ?? [])];
+  for (const entry of entries) {
+    const index = next.findIndex((item) => item.kind === entry.kind && item.itemId === entry.itemId);
+    if (index < 0) {
+      if (next.length >= 96) next.shift();
+      next.push({ kind: entry.kind, itemId: entry.itemId, text: entry.text.slice(0, 65_536) });
+    } else {
+      next[index] = { ...next[index]!, text: (entry.replace ? entry.text : next[index]!.text + entry.text).slice(0, 65_536) };
+    }
+  }
+  return next;
+}
+
 export function applyCodexWorkflowProjection(
   state: CodexWorkflowProjectionState,
   event: SessionEvent,
@@ -174,15 +211,22 @@ export function applyCodexWorkflowProjection(
   try {
     switch (event.type) {
       case "dsh-codex-workflow/plan-updated": {
+        const newWorkflow = state.currentWorkflowId !== event.data.workflowId;
         const plan: CodexPlanView = { workflowId: event.data.workflowId, status: event.data.status,
           ...(event.data.planMarkdown === undefined ? {} : { planMarkdown: event.data.planMarkdown }),
           questions: event.data.questions, assumptions: event.data.assumptions,
-          ...(event.data.message === undefined ? {} : { message: event.data.message }) };
-        return { ...state, currentWorkflowId: event.data.workflowId, plan };
+          ...(event.data.message === undefined ? {} : { message: event.data.message }),
+          live: state.plan?.workflowId === event.data.workflowId ? state.plan.live ?? [] : [] };
+        return { ...state, currentWorkflowId: event.data.workflowId, plan,
+          activeReview: newWorkflow ? null : state.activeReview,
+          reviews: newWorkflow ? [] : state.reviews };
       }
       case "dsh-codex-workflow/review-start": {
         const review: CodexReviewView = { ...event.data, processState: "running" };
-        return { ...state, currentWorkflowId: event.data.workflowId, activeReview: review, reviews: upsert(state.reviews, review) };
+        const newWorkflow = state.currentWorkflowId !== event.data.workflowId;
+        return { ...state, currentWorkflowId: event.data.workflowId,
+          plan: newWorkflow ? null : state.plan,
+          activeReview: review, reviews: upsert(newWorkflow ? [] : state.reviews, review) };
       }
       case "dsh-codex-workflow/review-progress": {
         const current = state.reviews.find(entry => entry.reviewId === event.data.reviewId)
@@ -195,6 +239,26 @@ export function applyCodexWorkflowProjection(
           ?? { workflowId: event.data.workflowId, reviewId: event.data.reviewId, attempt: 0, startedAt: event.data.finishedAt };
         const review: CodexReviewView = { ...current, ...event.data };
         return { ...state, currentWorkflowId: event.data.workflowId, activeReview: null, reviews: upsert(state.reviews, review) };
+      }
+      case "dsh-codex-workflow/live": {
+        if (event.data.stage === "planning") {
+          const newWorkflow = state.currentWorkflowId !== event.data.workflowId;
+          const plan = state.plan?.workflowId === event.data.workflowId
+            ? state.plan
+            : { workflowId: event.data.workflowId, status: "planning" as const, questions: [], assumptions: [] };
+          return { ...state, currentWorkflowId: event.data.workflowId,
+            plan: { ...plan, live: appendLive(plan.live, event.data.entries) },
+            activeReview: newWorkflow ? null : state.activeReview,
+            reviews: newWorkflow ? [] : state.reviews };
+        }
+        if (!event.data.reviewId) return state;
+        const review = state.reviews.find((item) => item.reviewId === event.data.reviewId)
+          ?? { workflowId: event.data.workflowId, reviewId: event.data.reviewId, attempt: 0,
+            startedAt: event.data.at, processState: "running" as const };
+        const updated = { ...review, live: appendLive(review.live, event.data.entries) };
+        return { ...state, currentWorkflowId: event.data.workflowId,
+          activeReview: state.activeReview?.reviewId === event.data.reviewId ? updated : state.activeReview,
+          reviews: upsert(state.reviews, updated) };
       }
       default:
         return state;

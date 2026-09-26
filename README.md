@@ -11,7 +11,7 @@ No browser is opened or controlled anywhere in the product path; no network list
 
 Planner and Reviewer turns run through the NPM Codex CLI's `codex app-server --stdio`, but plugin-created threads use `thread/start { ephemeral: true }`. They remain available for the current App Server process, do not receive Desktop names, and do not appear in `thread/list`. A restarted DSH process rebuilds a Planner context from the durable workflow record and creates a fresh ephemeral thread. Structured conversion and authority alignment continue to use `codex exec --ephemeral` or an equivalent private App Server turn.
 
-Review progress and results are appended to the owning DSH Session as `dsh-codex-workflow/*` events and folded into the `codexWorkflow` Session projection. The browser half of the plugin registers a `codex-review` right-sidebar tab and opens it once per review round. The tab shows the current plan, progress, readable verdict, findings, test gaps and all rounds of the current workflow. The plugin never opens or focuses Codex Desktop.
+Planner and Reviewer activity is streamed from App Server notifications into bounded, batched `dsh-codex-workflow/*` Session events. The `codexWorkflow` projection retains visible text, plan text, reasoning summaries, and tool names/status across a DSH page refresh; private reasoning text and raw tool output are not forwarded. The browser half opens the `codex-review` right-sidebar tab when planning starts and updates it while Planner or Reviewer is still running. It also shows the final plan, verdict, findings, test gaps and review rounds. This is a live view of the plugin's private Codex run, not a writable Codex terminal. The plugin never opens or focuses Codex Desktop.
 
 ## Requirements
 

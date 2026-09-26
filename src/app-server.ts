@@ -34,6 +34,17 @@ interface TurnState {
   items: JsonObject[];
   completed?: JsonObject;
   input?: PendingInput;
+  liveTexts?: Map<string, string>;
+  pendingLive?: AppServerLiveEvent[];
+  onProgress?: (entry: AppServerLiveEvent) => void;
+}
+
+/** Displayable App Server activity. Raw reasoning and tool output are never forwarded. */
+export interface AppServerLiveEvent {
+  kind: "message" | "plan" | "reasoning" | "tool";
+  itemId: string;
+  text: string;
+  replace?: boolean;
 }
 
 export interface CodexAppServerOptions {
@@ -92,6 +103,7 @@ export interface StartTurnOptions {
    * for the turn to finish, so callers can persist the active turn for
    * cancellation while it is still running. */
   onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
+  onProgress?: (entry: AppServerLiveEvent) => void;
 }
 
 export interface ReviewerStartOptions {
@@ -132,6 +144,7 @@ export interface ReviewStartOptions {
    * settings are applied), before waiting for the turn to finish. Lets the
    * caller persist the reviewer ids so cancellation can interrupt the run. */
   onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
+  onProgress?: (entry: AppServerLiveEvent) => void;
 }
 
 /** Bounded wall-clock window each persisted read-back polls before declaring
@@ -546,6 +559,7 @@ export class CodexAppServerClient {
         throw error;
       }
     }
+    this.attachProgress(this.state(threadId, turnId), options.onProgress);
     return this.waitForTurn(threadId, turnId, signal);
   }
 
@@ -553,8 +567,10 @@ export class CodexAppServerClient {
     pending: TurnNeedsInputResult,
     answers: Record<string, string[]>,
     signal?: AbortSignal,
+    onProgress?: (entry: AppServerLiveEvent) => void,
   ): Promise<TurnWaitResult> {
     await this.start(signal);
+    this.attachProgress(this.state(pending.threadId, pending.turnId), onProgress);
     this.write({
       id: pending.request.requestId,
       result: {
@@ -590,6 +606,7 @@ export class CodexAppServerClient {
       await this.abandonTurn(reviewThreadId, turnId);
       throw error;
     }
+    this.attachProgress(this.state(reviewThreadId, turnId), options.onProgress);
     return { threadId: reviewThreadId, result: await this.waitForTurn(reviewThreadId, turnId, signal) };
   }
 
@@ -919,10 +936,54 @@ export class CodexAppServerClient {
   }
 
   private onNotification(method: string, params: JsonObject): void {
+    if (method === "turn/plan/updated" && typeof params.threadId === "string" && typeof params.turnId === "string"
+      && Array.isArray(params.plan)) {
+      const steps = params.plan.map(object).map((step) => `${step.status === "completed" ? "✓" : step.status === "inProgress" ? "→" : "·"} ${String(step.step ?? "")}`);
+      this.emitProgress(this.state(params.threadId, params.turnId), {
+        kind: "plan", itemId: "steps", text: steps.join("\n").slice(0, 4096), replace: true,
+      });
+      return;
+    }
+    if (method === "item/agentMessage/delta" || method === "item/plan/delta" || method === "item/reasoning/summaryTextDelta") {
+      if (typeof params.threadId !== "string" || typeof params.turnId !== "string"
+        || typeof params.itemId !== "string" || typeof params.delta !== "string") return;
+      const state = this.state(params.threadId, params.turnId);
+      const kind = method === "item/plan/delta" ? "plan" : method === "item/agentMessage/delta" ? "message" : "reasoning";
+      const key = `${kind}:${params.itemId}`;
+      state.liveTexts ??= new Map();
+      state.liveTexts.set(key, `${state.liveTexts.get(key) ?? ""}${params.delta}`.slice(0, 65_536));
+      this.emitProgress(state, { kind, itemId: params.itemId, text: params.delta });
+      return;
+    }
+    if (method === "item/started") {
+      if (typeof params.threadId !== "string" || typeof params.turnId !== "string") return;
+      const item = object(params.item);
+      const label = liveToolLabel(item);
+      if (label) this.emitProgress(this.state(params.threadId, params.turnId), {
+        kind: "tool", itemId: typeof item.id === "string" ? item.id : "tool", text: label,
+      });
+      return;
+    }
     if (method === "item/completed") {
       const threadId = string(params.threadId, "item/completed threadId");
       const turnId = string(params.turnId, "item/completed turnId");
-      this.state(threadId, turnId).items.push(object(params.item));
+      const state = this.state(threadId, turnId);
+      const item = object(params.item);
+      state.items.push(item);
+      const completedText = typeof item.text === "string" ? item.text : item.type === "exitedReviewMode" && typeof item.review === "string" ? item.review : undefined;
+      if ((item.type === "agentMessage" || item.type === "plan" || item.type === "exitedReviewMode") && typeof item.id === "string" && completedText !== undefined) {
+        const kind = item.type === "plan" ? "plan" : "message";
+        const key = `${kind}:${item.id}`;
+        const streamed = state.liveTexts?.get(key) ?? "";
+        const remainder = completedText.startsWith(streamed) ? completedText.slice(streamed.length) : completedText;
+        if (remainder) this.emitProgress(state, { kind, itemId: item.id, text: remainder,
+          ...(streamed && !completedText.startsWith(streamed) ? { replace: true } : {}) });
+        state.liveTexts ??= new Map();
+        state.liveTexts.set(key, completedText);
+      } else if (typeof item.id === "string" && liveToolLabel(item)) {
+        this.emitProgress(state, { kind: "tool", itemId: item.id,
+          text: `${item.status === "failed" || (typeof item.exitCode === "number" && item.exitCode !== 0) ? " · 失败" : " · 完成"}${typeof item.exitCode === "number" ? ` (exit ${item.exitCode})` : ""}` });
+      }
       return;
     }
     if (method === "turn/completed") {
@@ -966,6 +1027,25 @@ export class CodexAppServerClient {
       this.turns.set(key, state);
     }
     return state;
+  }
+
+  private attachProgress(state: TurnState, listener?: (entry: AppServerLiveEvent) => void): void {
+    state.onProgress = listener;
+    if (!listener) return;
+    for (const entry of state.pendingLive ?? []) {
+      try { listener(entry); } catch { /* Presentation must not abort a Codex turn. */ }
+    }
+    state.pendingLive = [];
+  }
+
+  private emitProgress(state: TurnState, entry: AppServerLiveEvent): void {
+    const scoped = { ...entry, itemId: `${state.turnId}/${entry.itemId}` };
+    if (state.onProgress) {
+      try { state.onProgress(scoped); } catch { /* Presentation must not abort a Codex turn. */ }
+    } else {
+      state.pendingLive ??= [];
+      if (state.pendingLive.length < 256) state.pendingLive.push(scoped);
+    }
   }
 
   private write(message: JsonObject): void {
@@ -1079,6 +1159,20 @@ export class CodexAppServerClient {
     if (this.pending.size > 0 || this.turnWaiters > 0) return false;
     return ![...this.turns.values()].some((turn) => !turn.completed);
   }
+}
+
+function liveToolLabel(item: JsonObject): string | undefined {
+  if (item.type === "commandExecution") {
+    const verb = typeof item.command === "string" ? item.command.trim().split(/\s+/)[0] : "";
+    return `命令 · ${verb ? verb.slice(0, 80) : "运行中"}`;
+  }
+  if (item.type === "mcpToolCall") {
+    return `工具 · ${typeof item.server === "string" ? `${item.server}/` : ""}${typeof item.tool === "string" ? item.tool : "运行中"}`;
+  }
+  if (item.type === "dynamicToolCall") {
+    return `工具 · ${typeof item.tool === "string" ? item.tool : "运行中"}`;
+  }
+  return undefined;
 }
 
 function turnResult(state: TurnState): TurnWaitResult | undefined {

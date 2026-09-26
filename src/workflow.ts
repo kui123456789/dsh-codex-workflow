@@ -68,6 +68,8 @@ import type {
 } from "./types.js";
 import type { CodexCliAuditGateway } from "./codex-cli-audit.js";
 import type { CodexWorkflowSessionEvent } from "./review-events.js";
+import type { AppServerLiveEvent } from "./app-server.js";
+import { LiveRelay } from "./application/live-relay.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -91,11 +93,13 @@ export interface CodexGateway {
      * persist it and reuse it for later turns and forks. */
     onModel?: (model: string) => void;
     onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
+    onProgress?: (entry: AppServerLiveEvent) => void;
   }, signal?: AbortSignal): Promise<TurnWaitResult>;
   continueTurn(
     pending: TurnNeedsInputResult,
     answers: Record<string, string[]>,
     signal?: AbortSignal,
+    onProgress?: (entry: AppServerLiveEvent) => void,
   ): Promise<TurnWaitResult>;
   startReview(options: {
     threadId: string;
@@ -103,6 +107,7 @@ export interface CodexGateway {
     target: Record<string, unknown>;
     detached: boolean;
     onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
+    onProgress?: (entry: AppServerLiveEvent) => void;
   }, signal?: AbortSignal): Promise<{ threadId: string; result: TurnWaitResult }>;
   /** 1.1.2: set a thread's display name. Works on a thread that is NOT loaded,
    * so it never takes the writer lock. Optional: limited gateways may omit it. */
@@ -353,6 +358,12 @@ export class WorkflowManager {
       resumedAnswerPrompt,
       threadName,
       errorMessage,
+      createLiveRelay: this.createLiveRelay.bind(this),
+      planStarted: (record) => this.emitSessionEvent(record, { type: "dsh-codex-workflow/plan-updated",
+        data: { workflowId: record.id, status: "planning", questions: [], assumptions: [] } }),
+      planFailed: (record) => this.emitSessionEvent(record, { type: "dsh-codex-workflow/plan-updated",
+        data: { workflowId: record.id, status: "failed", questions: record.questions, assumptions: record.assumptions,
+          message: record.error } }),
     });
     this.reviewExecution = new ReviewExecution({
       store: this.store,
@@ -375,6 +386,7 @@ export class WorkflowManager {
       releaseReviewerSubscription: this.releaseReviewerSubscription.bind(this),
       flushCleanupNotes: this.flushCleanupNotes.bind(this),
       errorMessage,
+      createLiveRelay: this.createLiveRelay.bind(this),
     });
     this.submissionExecution = new SubmissionExecution({
       store: this.store,
@@ -394,6 +406,7 @@ export class WorkflowManager {
       alignReview: this.alignReview.bind(this),
       reconcileReview: this.reconcileReview.bind(this),
       errorMessage,
+      createLiveRelay: this.createLiveRelay.bind(this),
     });
     this.lifecycleExecution = new LifecycleExecution({
       store: this.store,
@@ -1233,6 +1246,9 @@ export class WorkflowManager {
       // A session can be disposing while a background callback settles. The
       // coordination record remains authoritative and will be shown on reload.
     }
+  }
+  private createLiveRelay(record: WorkflowRecord, stage: "planning" | "reviewing", reviewId?: string): LiveRelay {
+    return new LiveRelay(record.id, stage, reviewId, (event) => this.emitSessionEvent(record, event));
   }
   private async stageSubmissionFailure(
     updateCurrent: (fn: (record: WorkflowRecord) => void) => Promise<WorkflowRecord>,
@@ -2284,6 +2300,9 @@ export class WorkflowManager {
       r.error = message;
     }, { ignoreCancelled: false });
     if (failed.suppressed) return failed.record;
+    this.emitSessionEvent(failed.record, { type: "dsh-codex-workflow/plan-updated",
+      data: { workflowId, status: "failed", questions: failed.record.questions,
+        assumptions: failed.record.assumptions, message } });
     throw new Error(message);
   }
 

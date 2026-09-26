@@ -1,10 +1,12 @@
 # Changelog
 
-## [1.1.8] - 2026-09-26
+All notable changes to `dsh-codex-workflow`.
 
-- Ephemeral Planner/Reviewer threads now run structured conversion on the same thread instead of forking, because Codex App Server does not provide a rollout for ephemeral fork sources.
-- Ephemeral review paths no longer attempt persisted thread read-back; readable streamed output is used for the private conversion and DSH Session projection.
-- Added regression coverage proving ephemeral conversion emits a schema turn without `thread/fork`.
+## [1.1.11] - 2026-09-26
+
+- The DSH Codex Review sidebar now shows bounded live Planner and Reviewer text, visible reasoning summaries, and tool activity before turns complete.
+- Live updates are batched into durable Session events, preserving the displayed run across page refreshes without exposing private reasoning text or raw tool output.
+- Planning publishes an immediate running state, so the sidebar opens when Codex begins rather than waiting for a finished plan.
 
 ## [1.1.10] - 2026-09-26
 
@@ -17,7 +19,11 @@
 - The host plugin now declares its `sessionProjections` dependency and registers the projection synchronously before Session Controller history replay.
 - Plugin-owned session events are emitted through the host event bus with `ignorable: true`, allowing older clients to replay history while the current projection consumes the events.
 
-All notable changes to `dsh-codex-workflow`.
+## [1.1.8] - 2026-09-26
+
+- Ephemeral Planner/Reviewer threads now run structured conversion on the same thread instead of forking, because Codex App Server does not provide a rollout for ephemeral fork sources.
+- Ephemeral review paths no longer attempt persisted thread read-back; readable streamed output is used for the private conversion and DSH Session projection.
+- Added regression coverage proving ephemeral conversion emits a schema turn without `thread/fork`.
 
 ## [1.1.7] - 2026-09-26
 

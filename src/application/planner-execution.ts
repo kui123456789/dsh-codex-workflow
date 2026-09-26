@@ -4,6 +4,8 @@ import type { ToolRunContext } from "@deepseek-ai/dsh-tools";
 import type { CodexGateway } from "../workflow.js";
 import type { WorkflowStore } from "../store.js";
 import type { TurnNeedsInputResult, TurnWaitResult, WorkflowConfig, WorkflowRecord } from "../types.js";
+import type { AppServerLiveEvent } from "../app-server.js";
+import type { LiveRelay } from "./live-relay.js";
 
 export interface PlannerExecutionContext {
   store: WorkflowStore;
@@ -19,7 +21,10 @@ export interface PlannerExecutionContext {
     options: Parameters<CodexGateway["startTurn"]>[1],
     signal?: AbortSignal,
   ): Promise<TurnWaitResult>;
-  continueTurn(pending: TurnNeedsInputResult, answers: Record<string, string[]>, signal?: AbortSignal): Promise<TurnWaitResult>;
+  continueTurn(pending: TurnNeedsInputResult, answers: Record<string, string[]>, signal?: AbortSignal, onProgress?: (entry: AppServerLiveEvent) => void): Promise<TurnWaitResult>;
+  createLiveRelay(record: WorkflowRecord, stage: "planning"): LiveRelay;
+  planStarted(record: WorkflowRecord): void;
+  planFailed(record: WorkflowRecord): void;
   registerActiveTurn(workflowId: string, threadId: string, turnId: string, kind: "planner" | "reviewer", ephemeral?: boolean): Promise<void> | void;
   acceptPlannerOutcome(workflowId: string, outcome: TurnWaitResult, exec: ToolRunContext, model: string | undefined, cwd: string): Promise<WorkflowRecord>;
   owned(workflowId: string, exec: ToolRunContext): Promise<WorkflowRecord>;
@@ -49,9 +54,16 @@ export class PlannerExecution {
     }
     let plannerModel = record.plannerModel || this.ctx.config.plannerModel || undefined;
     const pending = this.ctx.pending.get(workflowId);
-    const outcome = pending
-      ? await this.ctx.continueTurn(pending, answers, exec.signal)
-      : await this.resumeWithNewTurn(record, answers, exec, plannerModel, (model) => { plannerModel = model; });
+    this.ctx.planStarted(record);
+    const live = this.ctx.createLiveRelay(record, "planning");
+    let outcome: TurnWaitResult;
+    try {
+      outcome = pending
+        ? await this.ctx.continueTurn(pending, answers, exec.signal, live.onProgress)
+        : await this.resumeWithNewTurn(record, answers, exec, plannerModel, (model) => { plannerModel = model; }, live.onProgress);
+    } finally {
+      live.close();
+    }
     return this.ctx.acceptPlannerOutcome(workflowId, outcome, exec, plannerModel, record.cwd);
   }
 
@@ -61,6 +73,7 @@ export class PlannerExecution {
     exec: ToolRunContext,
     plannerModel: string | undefined,
     onModel: (model: string) => void,
+    onProgress: (entry: AppServerLiveEvent) => void,
   ): Promise<TurnWaitResult> {
     const plannerThreadId = await this.ctx.startThread({ cwd: record.cwd, model: plannerModel, name: this.ctx.threadName("DSH Plan", record.task), ephemeral: true }, exec.signal);
     return this.ctx.startTurnWithRetry(plannerThreadId, {
@@ -69,6 +82,7 @@ export class PlannerExecution {
       effort: this.ctx.config.plannerEffort,
       planMode: true,
       onModel,
+      onProgress,
       onStarted: (started) => this.ctx.registerActiveTurn(record.id, started.threadId, started.turnId, "planner", true),
     }, exec.signal);
   }
@@ -105,6 +119,8 @@ export class PlannerExecution {
     } finally {
       await createLease.release().catch(() => undefined);
     }
+    this.ctx.planStarted(record);
+    const live = this.ctx.createLiveRelay(record, "planning");
     try {
       const plannerThreadId = await this.ctx.startThread({
         cwd: record.cwd,
@@ -119,6 +135,7 @@ export class PlannerExecution {
         effort: args.plannerEffort ?? this.ctx.config.plannerEffort,
         planMode: true,
         onModel: (model) => { plannerModel = model; },
+        onProgress: live.onProgress,
         onStarted: (started) => this.ctx.registerActiveTurn(record.id, started.threadId, started.turnId, "planner", true),
       }, exec.signal);
       return this.ctx.acceptPlannerOutcome(record.id, outcome, exec, plannerModel, record.cwd);
@@ -128,7 +145,10 @@ export class PlannerExecution {
         r.error = this.ctx.errorMessage(error);
       }, { ignoreCancelled: false });
       if (failed.suppressed) return failed.record;
+      this.ctx.planFailed(failed.record);
       throw error;
+    } finally {
+      live.close();
     }
   }
 }

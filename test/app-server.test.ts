@@ -641,6 +641,52 @@ test("1.1.2: a freshly created Reviewer has no rollout until its first turn runs
   }
 });
 
+test("visible Planner activity streams before the turn finishes", async () => {
+  const codex = new CodexAppServerClient({ command: process.execPath, args: [fixture],
+    requestTimeoutMs: 5_000, idleProcessMs: 0,
+    env: { ...process.env, FAKE_CODEX_STREAM_VISIBLE: "1", FAKE_CODEX_TURN_DELAY_MS: "500" } });
+  let turn: Promise<unknown> | undefined;
+  try {
+    const threadId = await codex.startThread({ cwd: process.cwd(), ephemeral: true });
+    const seen: Array<{ kind: string; text: string }> = [];
+    let settled = false;
+    turn = codex.startTurn(threadId, { prompt: "Plan it", planMode: true,
+      onProgress: (entry: { kind: string; text: string }) => seen.push(entry) } as never)
+      .finally(() => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(settled, false, "the model turn is still running");
+    assert.ok(seen.some((entry) => entry.kind === "plan" && entry.text.includes("Implement")),
+      "the readable plan must be visible before turn completion");
+    assert.ok(seen.some((entry) => entry.kind === "tool"), "a command activity is visible");
+    await turn;
+  } finally {
+    await turn?.catch(() => undefined);
+    await codex.stop();
+  }
+});
+
+test("visible Reviewer text streams before the turn finishes", async () => {
+  const codex = new CodexAppServerClient({ command: process.execPath, args: [fixture],
+    requestTimeoutMs: 5_000, idleProcessMs: 0,
+    env: { ...process.env, FAKE_CODEX_STREAM_VISIBLE: "1", FAKE_CODEX_TURN_DELAY_MS: "500" } });
+  let turn: Promise<unknown> | undefined;
+  try {
+    const threadId = await codex.startThread({ cwd: process.cwd(), ephemeral: true });
+    const seen: Array<{ kind: string; text: string }> = [];
+    let settled = false;
+    turn = codex.startReview({ threadId, cwd: process.cwd(), detached: false,
+      target: { type: "custom", instructions: "Review" },
+      onProgress: (entry) => seen.push(entry) }).finally(() => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(settled, false);
+    assert.equal(seen.filter((entry) => entry.kind === "message").map((entry) => entry.text).join(""), "VERDICT: pass");
+    await turn;
+  } finally {
+    await turn?.catch(() => undefined);
+    await codex.stop();
+  }
+});
+
 test("ephemeral Planner/Reviewer threads are never named or persisted for Desktop", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-ephemeral-thread-"));
   const callsFile = join(directory, "calls.jsonl");

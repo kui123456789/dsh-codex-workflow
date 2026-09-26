@@ -1,6 +1,6 @@
-# Release checklist — dsh-codex-workflow 1.1.10
+# Release checklist — dsh-codex-workflow 1.1.11
 
-This is the operator checklist for shipping the CURRENT release (1.1.10; keep this line in sync with `package.json` on every release). It assumes the automated gates
+This is the operator checklist for shipping the CURRENT release (1.1.11; keep this line in sync with `package.json` on every release). It assumes the automated gates
 succeeded; this page is about the things automation cannot cover, plus the
 rollback story. It never authorizes touching user credentials or configuration
 outside `$DSH_HOME/storages/dsh-codex-workflow/`.
@@ -38,7 +38,7 @@ Run `pnpm release:check` twice in a row and confirm:
      then restore `complex`;
    - while one workflow is active, send another qualifying request and confirm
      no second WorkflowRecord or Planner task is created.
-3. **Current acceptance path (1.1.10).** The manual harnesses this step used to
+3. **Current acceptance path (1.1.11).** The manual harnesses this step used to
    name (`pnpm lifecycle:accept`, `pnpm review-only:accept`) were REMOVED: they
    drove the pre-1.1.0 CLI-visible wiring and could no longer be trusted as
    evidence. Run instead:
@@ -46,11 +46,15 @@ Run `pnpm release:check` twice in a row and confirm:
      offline doctor + pack audit + the static gates);
    - `pnpm host:check` against the operator's installed DSH (it also asserts the
      declared peer range with the host's own evaluator);
+   - one REAL `codex_workflow_start`: confirm the right tab opens as planning
+     begins, visible plan text and tool activity update before the call returns,
+     and the completed plan remains after refreshing the page;
    - one REAL review round (`codex_workflow_review_only`, or a DSH-led
      `start` → `review`) and confirm: `thread/start` receives
      `ephemeral: true`, no `thread/name/set` or legacy `thread/resume` is sent,
      no new plugin thread appears in Codex Desktop `thread/list`, and the
-     verdict plus progress appear in the DSH `Codex Review` right sidebar;
+     readable review text updates before completion while the verdict and
+     findings remain in the DSH `Codex Review` right sidebar after refresh;
    - one real bridge relay (Codex-led `dispatch` → `codex_workflow_submit`) and
      confirm the verdict returns to the originating task exactly once.
 

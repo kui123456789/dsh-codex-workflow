@@ -10,6 +10,7 @@ import { applyReviewConsistency, formatFindings, parseReview, pluginMessage, rev
 import type { ReviewConflictInfo, ReviewInput, ReviewResult, TurnWaitResult, WorkflowConfig, WorkflowPhase, WorkflowRecord } from "../types.js";
 import type { WorkflowRuntimeState } from "./workflow-runtime-state.js";
 import type { CodexReviewEndEvent } from "../review-events.js";
+import type { LiveRelay } from "./live-relay.js";
 
 type AnyFn = (...args: any[]) => any;
 
@@ -34,6 +35,7 @@ export interface ReviewExecutionContext {
   releaseReviewerSubscription: AnyFn;
   flushCleanupNotes: AnyFn;
   errorMessage: (error: unknown) => string;
+  createLiveRelay(record: WorkflowRecord, stage: "reviewing", reviewId: string): LiveRelay;
 }
 
 /** Owns the durable DSH-led review state machine. The manager remains a
@@ -54,6 +56,7 @@ export class ReviewExecution {
     });
     if (entering.suppressed) return entering.record;
     let current = entering.record;
+    const live = this.ctx.createLiveRelay(current, "reviewing", `${workflowId}:${current.reviewAttempt ?? 1}`);
     let reviewerClaimed = false;
     let reviewerThreadId: string | undefined;
     let visibleReviewText: string | undefined;
@@ -169,6 +172,7 @@ export class ReviewExecution {
           }
           await this.ctx.registerActiveTurn(workflowId, started.threadId, started.turnId, "reviewer", true);
         },
+        onProgress: live.onProgress,
       }, exec.signal);
       // Second net for the same invariant: a mismatched return value is
       // rejected fail-closed — the round becomes retryable and the persisted
@@ -230,6 +234,7 @@ export class ReviewExecution {
           // persist thread/turn so codex_workflow_cancel and teardown can
           // interrupt exactly this turn while it runs.
           onStarted: (started: { threadId: string; turnId: string }) => this.ctx.registerActiveTurn(workflowId, started.threadId, started.turnId, "reviewer", true),
+          onProgress: live.onProgress,
         }, exec.signal);
         const afterRewrite = await this.ctx.store.load(workflowId);
         if (!afterRewrite || afterRewrite.phase === "cancelled") {
@@ -418,6 +423,7 @@ export class ReviewExecution {
       reviewEndDetail = { error: this.ctx.errorMessage(error) };
       throw error;
     } finally {
+      live.close();
       const releaseNote = reviewerClaimed && reviewerThreadId
         ? await this.ctx.releaseReviewerSubscription(reviewerThreadId)
         : undefined;
