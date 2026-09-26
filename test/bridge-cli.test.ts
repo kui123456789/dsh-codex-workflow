@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import test from "node:test";
+import { PLUGIN_VERSION } from "../src/version.js";
 import { fileURLToPath } from "node:url";
 import { parseBridgeCommand, newRequestId } from "../src/bridge-protocol.js";
 
@@ -349,7 +350,7 @@ test("show reports one workflow's stage/submission/review/evidence summary", asy
     const result = await runCli(["show", "--workflow", "wf-show", "--json"], "", home);
     assert.equal(result.code, 0, result.stderr);
     const parsed = JSON.parse(result.stdout) as Record<string, unknown>;
-    assert.equal(parsed.pluginVersion, "1.1.7");
+    assert.equal(parsed.pluginVersion, PLUGIN_VERSION);
     assert.equal(parsed.phase, "fixing");
     assert.equal(parsed.originatingCodexTaskId, "codex-source-task");
     assert.equal(parsed.reviewerCodexTaskId, "codex-reviewer-task");

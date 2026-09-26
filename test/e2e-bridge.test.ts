@@ -206,7 +206,6 @@ test("end-to-end: CLI dispatch -> followup -> submit -> same-task review -> fina
         params: Record<string, any>;
       });
       const starts = calls.filter((call) => call.method === "thread/start");
-      const forks = calls.filter((call) => call.method === "thread/fork");
       const turns = calls.filter((call) => call.method === "turn/start");
       assert.equal(calls.filter((call) => call.params.threadId === codexThreadId).length, 0,
         "the originating task is never read, resumed, renamed or written");
@@ -214,14 +213,15 @@ test("end-to-end: CLI dispatch -> followup -> submit -> same-task review -> fina
       assert.ok(starts.every(call => call.params.ephemeral === true), "all plugin-created threads are ephemeral");
       assert.equal(calls.filter((call) => call.method === "thread/resume").length, 0,
         "an ephemeral Reviewer never resumes a Desktop task");
-      assert.ok(forks.length >= 1, "authority conversion may use a private ephemeral fork");
-      assert.ok(forks.every(call => call.params.ephemeral === true), "all forks stay ephemeral");
+      assert.equal(calls.filter((call) => call.method === "thread/fork").length, 0,
+        "ephemeral authority conversion stays on the same thread");
       assert.equal(turns.length, 3, "one visible turn + one conversion turn + one alignment turn");
       const visibleTurn = turns.find((call) => !call.params.outputSchema)!;
       const conversionTurn = turns.find((call) => call.params.outputSchema?.properties?.verdict)!;
       const alignmentTurn = turns.find((call) => call.params.outputSchema?.properties?.aligned)!;
       assert.equal(visibleTurn.params.outputSchema, undefined, "the visible review never carries the JSON schema");
-      assert.equal(conversionTurn.params.ephemeral, undefined, "the conversion uses the private App Server thread");
+      assert.equal(conversionTurn.params.threadId, visibleTurn.params.threadId,
+        "the conversion uses the same private App Server thread");
       assert.equal(conversionTurn.params.effort, "low", "conversion effort is fixed at low");
       assert.ok(conversionTurn.params.outputSchema?.properties?.verdict);
       assert.ok(alignmentTurn.params.outputSchema?.properties?.aligned);
@@ -380,7 +380,7 @@ test("codex_workflow_submit returns promptly; DSH turn-end never aborts the stil
       const starts = calls.filter((call) => call.method === "thread/start");
       assert.ok(starts.length >= 1, "ephemeral Reviewer work creates at least one private thread");
       assert.ok(starts.every(call => call.params.ephemeral === true), "every created thread is ephemeral");
-      assert.ok(calls.filter((call) => call.method === "thread/fork").every(call => call.params.ephemeral === true), "private forks do not create Desktop tasks");
+      assert.equal(calls.filter((call) => call.method === "thread/fork").length, 0, "ephemeral review does not fork");
       assert.ok(calls.filter((call) => call.method === "thread/unsubscribe").length >= 1, "private threads are released");
       void followups;
     } finally {

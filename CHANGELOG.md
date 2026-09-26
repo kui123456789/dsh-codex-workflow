@@ -6,6 +6,11 @@
 - Ephemeral review paths no longer attempt persisted thread read-back; readable streamed output is used for the private conversion and DSH Session projection.
 - Added regression coverage proving ephemeral conversion emits a schema turn without `thread/fork`.
 
+## [1.1.10] - 2026-09-26
+
+- The browser follows `sidebarRight.mounted` to identify the visible session. The Session list has no `current` property; reading it prevented every automatic tab open.
+- The host recognizes the four plugin event types before replaying existing sessions and resumes persisting them with `session.append`.
+
 ## [1.1.9] - 2026-09-26
 
 - The Codex Review right sidebar now opens when `codex_workflow_start` publishes a plan, before the first review round; review events continue to reuse the same tab.

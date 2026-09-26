@@ -100,8 +100,7 @@ window.__ModuleLoader__.load({
         let currentProjectionDisposer;
         const opened = new Set();
         const scan = () => {
-          const snapshot = ctx.sessions.list.getSnapshot();
-          const sessionId = snapshot.current;
+          const sessionId = ctx.sidebarRight.mounted.getSnapshot();
           if (sessionId !== currentSessionId) {
             currentProjectionDisposer?.();
             currentSessionId = sessionId;
@@ -137,7 +136,7 @@ window.__ModuleLoader__.load({
             }
           }
         };
-        disposers.push(ctx.sessions.list.subscribe(scan));
+        disposers.push(ctx.sidebarRight.mounted.subscribe(scan));
         scan();
         return () => {
           currentProjectionDisposer?.();

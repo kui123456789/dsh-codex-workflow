@@ -72,21 +72,24 @@ const dshPeerDrift = Object.entries(packageJson.peerDependencies ?? {})
 report("every dsh peer range matches its pinned dev dependency", dshPeerDrift.length === 0,
   dshPeerDrift.map(([name, range]) => `${name} peer ${range} != ^${packageJson.devDependencies?.[name]}`).join(", "));
 
-// 1.1.2 VISIBILITY CONTRACT. `source` is fixed by the creation path, and Codex
-// Desktop's sidebar (`thread/list`) only returns `source='vscode'` tasks, which
-// only an App Server `thread/start` produces — a `codex exec` task is never
-// listed (measured 0 of 15) and cannot be renamed into visibility. Two static
-// guards keep that from silently regressing:
-//   a) `workflow.ts` must never create a durable Reviewer through the CLI again
-//      (`createReview` / the CLI dispatcher's visible `review`), and
-//   b) the README must keep documenting the visible creation path + name.
+// 1.1.10 VISIBILITY CONTRACT. Plugin-created Planner/Reviewer threads are
+// App Server ephemeral threads: they are not named, are omitted from
+// `thread/list`, and the readable result is projected into DSH's sidebar.
+// Keep two static guards so a future change cannot silently restore Desktop
+// tasks or remove the sidebar contract:
+//   a) `workflow.ts` must never create a durable Reviewer through the CLI
+//      dispatcher, and
+//   b) the README must document the ephemeral + sidebar behavior.
 const workflowSource = await readFile(join(root, "src", "workflow.ts"), "utf8");
 report("workflow.ts never creates a durable CLI Reviewer",
   !/audit[?!]?\.(createReview|review)\s*\(/.test(workflowSource),
-  "src/workflow.ts calls the CLI dispatcher's visible-review path, which would create a source='exec' task that Codex Desktop can never render");
-report("README documents the Reviewer visibility contract",
-  /source='vscode'/.test(readme) && /thread\/name\/set/.test(readme) && /DSH Reviewer: <workflowId>/.test(readme),
-  "README.md does not document the source='vscode' / thread/name/set / DSH Reviewer naming contract");
+  "src/workflow.ts calls the CLI dispatcher's durable review path");
+report("README documents the ephemeral sidebar visibility contract",
+  /thread\/start\s*\{\s*ephemeral:\s*true\s*\}/.test(readme)
+    && /thread\/list/.test(readme)
+    && /codex-review/.test(readme)
+    && /never opens or focuses Codex Desktop/.test(readme),
+  "README.md does not document ephemeral threads, DSH codex-review sidebar, and Desktop suppression");
 
 // 1) verify
 report("typecheck", runPnpm(["typecheck"]) === 0, "pnpm typecheck failed");

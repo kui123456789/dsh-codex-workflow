@@ -36,6 +36,10 @@ try {
   await ctx.plugin(ToolRuntime, {});
   // An empty registry keeps all bridge work local and prevents model calls.
   ctx.provide("agents", { list: () => [], get: () => undefined });
+  // The real DSH host supplies this service; provide the smallest compatible
+  // registration surface here so the isolated compatibility harness reaches
+  // tool registration as well.
+  ctx.provide("sessionProjections", { register: () => () => undefined });
   const fiber = ctx.plugin(plugin, { storageDir: directory });
   await fiber;
   for (const name of names) assert.ok(ctx.tools.get(name), `${name} missing after activation`);
