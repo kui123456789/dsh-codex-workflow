@@ -72,7 +72,7 @@ const dshPeerDrift = Object.entries(packageJson.peerDependencies ?? {})
 report("every dsh peer range matches its pinned dev dependency", dshPeerDrift.length === 0,
   dshPeerDrift.map(([name, range]) => `${name} peer ${range} != ^${packageJson.devDependencies?.[name]}`).join(", "));
 
-// 1.1.10 VISIBILITY CONTRACT. Plugin-created Planner/Reviewer threads are
+// 1.1.12 VISIBILITY CONTRACT. Plugin-created Planner/Reviewer threads are
 // App Server ephemeral threads: they are not named, are omitted from
 // `thread/list`, and the readable result is projected into DSH's sidebar.
 // Keep two static guards so a future change cannot silently restore Desktop
@@ -87,9 +87,9 @@ report("workflow.ts never creates a durable CLI Reviewer",
 report("README documents the ephemeral sidebar visibility contract",
   /thread\/start\s*\{\s*ephemeral:\s*true\s*\}/.test(readme)
     && /thread\/list/.test(readme)
-    && /codex-review/.test(readme)
+    && /subagentchat/.test(readme)
     && /never opens or focuses Codex Desktop/.test(readme),
-  "README.md does not document ephemeral threads, DSH codex-review sidebar, and Desktop suppression");
+  "README.md does not document ephemeral threads, DSH subagentchat sidebar, and Desktop suppression");
 
 // 1) verify
 report("typecheck", runPnpm(["typecheck"]) === 0, "pnpm typecheck failed");

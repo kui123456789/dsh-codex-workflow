@@ -36,7 +36,7 @@ export class ReviewObservation {
 
   async begin(
     workflowId: string,
-    options: { enterReviewing?: boolean; step?: ReviewStep; message?: string } = {},
+    options: { enterReviewing?: boolean; step?: ReviewStep; message?: string; childSessionId?: string } = {},
   ) {
     this.runtime.cleanupNotes.delete(workflowId);
     const now = new Date().toISOString();
@@ -58,6 +58,7 @@ export class ReviewObservation {
         type: "dsh-codex-workflow/review-start",
         data: {
           workflowId, reviewId, attempt: outcome.record.reviewAttempt ?? 1,
+          ...(options.childSessionId ? { childSessionId: options.childSessionId } : {}),
           startedAt: now, mode: outcome.record.mode === "review_only" ? "review_only" : outcome.record.origin === "codex_bridge" ? "bridge" : "planned",
         },
       });

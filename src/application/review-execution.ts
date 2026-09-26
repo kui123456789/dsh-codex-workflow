@@ -11,6 +11,7 @@ import type { ReviewConflictInfo, ReviewInput, ReviewResult, TurnWaitResult, Wor
 import type { WorkflowRuntimeState } from "./workflow-runtime-state.js";
 import type { CodexReviewEndEvent } from "../review-events.js";
 import type { LiveRelay } from "./live-relay.js";
+import type { CodexChildSessionHandle } from "../codex-child-session.js";
 
 type AnyFn = (...args: any[]) => any;
 
@@ -36,6 +37,8 @@ export interface ReviewExecutionContext {
   flushCleanupNotes: AnyFn;
   errorMessage: (error: unknown) => string;
   createLiveRelay(record: WorkflowRecord, stage: "reviewing", reviewId: string): LiveRelay;
+  createChildSession(record: WorkflowRecord, exec: ToolRunContext, label: string): Promise<CodexChildSessionHandle | undefined>;
+  disposeChildSession(workflowId: string, child: CodexChildSessionHandle | undefined): Promise<void>;
 }
 
 /** Owns the durable DSH-led review state machine. The manager remains a
@@ -49,12 +52,15 @@ export class ReviewExecution {
   ): Promise<WorkflowRecord> {
     const pre = await this.ctx.store.load(workflowId);
     const priorPhase: WorkflowPhase = pre?.phase === "fixing" ? "fixing" : "executing";
-    const entering = await this.ctx.reviewObservation.begin(workflowId, {
+    const child = pre ? await this.ctx.createChildSession(pre, exec, `Codex Reviewer · ${workflowId}`) : undefined;
+    let entering;
+    try { entering = await this.ctx.reviewObservation.begin(workflowId, {
       enterReviewing: true,
       step: "reviewing",
       message: "Review started; collecting workspace evidence",
-    });
-    if (entering.suppressed) return entering.record;
+      childSessionId: child?.id,
+    }); } catch (error) { await this.ctx.disposeChildSession(workflowId, child); throw error; }
+    if (entering.suppressed) { await this.ctx.disposeChildSession(workflowId, child); return entering.record; }
     let current = entering.record;
     const live = this.ctx.createLiveRelay(current, "reviewing", `${workflowId}:${current.reviewAttempt ?? 1}`);
     let reviewerClaimed = false;
@@ -172,7 +178,7 @@ export class ReviewExecution {
           }
           await this.ctx.registerActiveTurn(workflowId, started.threadId, started.turnId, "reviewer", true);
         },
-        onProgress: live.onProgress,
+        onProgress: (entry: any) => { live.onProgress(entry); child?.progress(entry); },
       }, exec.signal);
       // Second net for the same invariant: a mismatched return value is
       // rejected fail-closed — the round becomes retryable and the persisted
@@ -423,6 +429,8 @@ export class ReviewExecution {
       reviewEndDetail = { error: this.ctx.errorMessage(error) };
       throw error;
     } finally {
+      child?.finish(visibleReviewText ?? "", reviewEndDetail?.error ? "failed" : current.phase === "cancelled" ? "aborted" : "completed");
+      await this.ctx.disposeChildSession(workflowId, child);
       live.close();
       const releaseNote = reviewerClaimed && reviewerThreadId
         ? await this.ctx.releaseReviewerSubscription(reviewerThreadId)

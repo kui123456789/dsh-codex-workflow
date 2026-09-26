@@ -18,7 +18,7 @@ test("autoTriggerMode defaults to complex and validates the public modes", () =>
 });
 
 test("plugin declares systemPrompt and session projections as required services", () => {
-  assert.deepEqual(inject, ["tools", "agents", "systemPrompt", "sessionProjections"]);
+  assert.deepEqual(inject, ["tools", "agents", "systemPrompt", "sessionProjections", "subagents"]);
 });
 
 test("off mode registers no prompt section and has a harmless disposer", () => {

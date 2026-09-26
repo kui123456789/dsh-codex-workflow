@@ -8,7 +8,7 @@ test("Planner and Reviewer live events survive projection replay and final outco
   const apply = (type: string, data: unknown) => {
     state = applyCodexWorkflowProjection(state, { type, data, seq: 1 } as never);
   };
-  apply("dsh-codex-workflow/plan-updated", { workflowId: "wf", status: "planning", questions: [], assumptions: [] });
+  apply("dsh-codex-workflow/plan-updated", { workflowId: "wf", childSessionId: "child-plan", status: "planning", questions: [], assumptions: [] });
   apply("dsh-codex-workflow/live", { workflowId: "wf", stage: "planning", at: "now", entries: [
     { kind: "plan", itemId: "p1", text: "第一步" }, { kind: "plan", itemId: "p1", text: "：检查" },
     { kind: "tool", itemId: "t1", text: "命令 · git status" },
@@ -16,6 +16,7 @@ test("Planner and Reviewer live events survive projection replay and final outco
   assert.equal(state.plan?.status, "planning");
   assert.equal(state.plan?.live?.[0]?.text, "第一步：检查");
   apply("dsh-codex-workflow/plan-updated", { workflowId: "wf", status: "ready", planMarkdown: "正式计划", questions: [], assumptions: [] });
+  assert.equal(state.plan?.childSessionId, "child-plan", "refresh can reopen the native child after planning finishes");
   assert.equal(state.plan?.live?.[0]?.text, "第一步：检查");
   apply("dsh-codex-workflow/review-start", { workflowId: "wf", reviewId: "wf:1", attempt: 1, startedAt: "now", mode: "planned" });
   apply("dsh-codex-workflow/live", { workflowId: "wf", stage: "reviewing", reviewId: "wf:1", at: "now", entries: [

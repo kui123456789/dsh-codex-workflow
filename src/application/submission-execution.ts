@@ -33,6 +33,7 @@ export interface SubmissionExecutionContext {
   reconcileReview: AnyFn;
   errorMessage: (error: unknown) => string;
   createLiveRelay(record: WorkflowRecord, stage: "reviewing", reviewId: string): LiveRelay;
+  disposeChildSession(workflowId: string, child: import("../codex-child-session.js").CodexChildSessionHandle | undefined): Promise<void>;
 }
 
 /** Owns one durable bridge callback state machine, including lease fencing,
@@ -48,6 +49,7 @@ export class SubmissionExecution {
     lease?: ManagerLease,
   ): Promise<WorkflowRecord> {
     let current = seed;
+    const child = this.ctx.runtime.codexChildSessions.get(workflowId);
     const liveRecord = await this.ctx.store.load(workflowId) ?? seed;
     const live = this.ctx.createLiveRelay(liveRecord, "reviewing", `${workflowId}:${liveRecord.reviewAttempt ?? 1}`);
     const roundStartAttempt = current.submissionAttempts ?? 0;
@@ -154,7 +156,7 @@ export class SubmissionExecution {
                 throw new Error("submission no longer owns the active reviewer turn");
               }
             },
-            onProgress: live.onProgress,
+            onProgress: (entry: any) => { live.onProgress(entry); child?.progress(entry); },
           }, signal);
         } catch (error) {
           if (leaseLost) return current; // we were taken over mid-flight: write nothing
@@ -379,6 +381,8 @@ export class SubmissionExecution {
       await this.ctx.enqueueSubmissionNotice(workflowId, submissionId, failed, signal);
       return current;
     } finally {
+      child?.finish(reviewEndDetail?.visibleText ?? "", reviewEndDetail?.error ? "failed" : "completed");
+      await this.ctx.disposeChildSession(workflowId, child);
       live.close();
       lease?.stopHeartbeat();
       await this.ctx.reviewObservation.finish(workflowId, undefined, reviewEndDetail);

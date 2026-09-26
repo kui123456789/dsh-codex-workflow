@@ -24,6 +24,7 @@ export type CodexLiveViewEntry = Omit<CodexLiveEntry, "replace">;
 
 export interface CodexPlanUpdatedEvent {
   workflowId: string;
+  childSessionId?: string;
   status: "planning" | "waiting_input" | "ready" | "failed";
   planMarkdown?: string;
   questions: PlannerQuestion[];
@@ -33,6 +34,7 @@ export interface CodexPlanUpdatedEvent {
 
 export interface CodexReviewStartEvent {
   workflowId: string;
+  childSessionId?: string;
   reviewId: CodexReviewId;
   attempt: number;
   startedAt: string;
@@ -73,6 +75,7 @@ declare module "@deepseek-ai/dsh-session/types" {
 
 export interface CodexPlanView {
   workflowId: string;
+  childSessionId?: string;
   status: CodexPlanUpdatedEvent["status"];
   planMarkdown?: string;
   questions: PlannerQuestion[];
@@ -83,6 +86,7 @@ export interface CodexPlanView {
 
 export interface CodexReviewView {
   workflowId: string;
+  childSessionId?: string;
   reviewId: CodexReviewId;
   attempt: number;
   startedAt: string;
@@ -213,6 +217,8 @@ export function applyCodexWorkflowProjection(
       case "dsh-codex-workflow/plan-updated": {
         const newWorkflow = state.currentWorkflowId !== event.data.workflowId;
         const plan: CodexPlanView = { workflowId: event.data.workflowId, status: event.data.status,
+          ...(event.data.childSessionId ?? (!newWorkflow ? state.plan?.childSessionId : undefined)
+            ? { childSessionId: event.data.childSessionId ?? state.plan?.childSessionId } : {}),
           ...(event.data.planMarkdown === undefined ? {} : { planMarkdown: event.data.planMarkdown }),
           questions: event.data.questions, assumptions: event.data.assumptions,
           ...(event.data.message === undefined ? {} : { message: event.data.message }),

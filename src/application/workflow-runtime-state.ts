@@ -1,4 +1,5 @@
 import type { TurnNeedsInputResult } from "../types.js";
+import type { CodexChildSessionHandle } from "../codex-child-session.js";
 
 export interface ActiveWorkflowTurn {
   threadId: string;
@@ -19,6 +20,7 @@ export class WorkflowRuntimeState {
   readonly submissionControllers = new Map<string, AbortController>();
   readonly reviewHeartbeats = new Map<string, NodeJS.Timeout>();
   readonly cleanupNotes = new Map<string, string[]>();
+  readonly codexChildSessions = new Map<string, CodexChildSessionHandle>();
   stopped = false;
   stopPromise?: Promise<void>;
   readonly lifecycleController = new AbortController();

@@ -70,6 +70,7 @@ import type { CodexCliAuditGateway } from "./codex-cli-audit.js";
 import type { CodexWorkflowSessionEvent } from "./review-events.js";
 import type { AppServerLiveEvent } from "./app-server.js";
 import { LiveRelay } from "./application/live-relay.js";
+import { CodexChildSessionFactory, type CodexChildSessionHandle } from "./codex-child-session.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -287,6 +288,7 @@ export class WorkflowManager {
   private readonly retrySleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly retryRandom: () => number;
   private readonly agents?: { get(id: string): Agent | undefined };
+  private readonly codexChildFactory?: CodexChildSessionFactory;
   constructor(
     private readonly store: WorkflowStore,
     private readonly codex: CodexGateway,
@@ -298,8 +300,10 @@ export class WorkflowManager {
      * time in a test). Production passes nothing and uses real timers. */
     retryHooks: { sleep?: (ms: number, signal?: AbortSignal) => Promise<void>; now?: () => number; random?: () => number } = {},
     agents?: { get(id: string): Agent | undefined },
+    codexChildFactory?: CodexChildSessionFactory,
   ) {
     this.agents = agents;
+    this.codexChildFactory = codexChildFactory;
     this.leaseTtlMs = config.leaseTtlMs ?? 60_000;
     this.retryNow = retryHooks.now ?? Date.now;
     this.retrySleep = retryHooks.sleep ?? ((ms, signal) => delay(ms, signal));
@@ -359,8 +363,12 @@ export class WorkflowManager {
       threadName,
       errorMessage,
       createLiveRelay: this.createLiveRelay.bind(this),
-      planStarted: (record) => this.emitSessionEvent(record, { type: "dsh-codex-workflow/plan-updated",
-        data: { workflowId: record.id, status: "planning", questions: [], assumptions: [] } }),
+      planStarted: (record, childSessionId) => this.emitSessionEvent(record, { type: "dsh-codex-workflow/plan-updated",
+        data: { workflowId: record.id, ...(childSessionId ? { childSessionId } : {}), status: "planning", questions: [], assumptions: [] } }),
+      createChildSession: this.createCodexChildSession.bind(this),
+      disposeChildSession: this.disposeCodexChildSession.bind(this),
+      beginRound: this.turnGateway.beginRound.bind(this.turnGateway),
+      endRound: this.turnGateway.endRound.bind(this.turnGateway),
       planFailed: (record) => this.emitSessionEvent(record, { type: "dsh-codex-workflow/plan-updated",
         data: { workflowId: record.id, status: "failed", questions: record.questions, assumptions: record.assumptions,
           message: record.error } }),
@@ -387,6 +395,8 @@ export class WorkflowManager {
       flushCleanupNotes: this.flushCleanupNotes.bind(this),
       errorMessage,
       createLiveRelay: this.createLiveRelay.bind(this),
+      createChildSession: this.createCodexChildSessionWithLabel.bind(this),
+      disposeChildSession: this.disposeCodexChildSession.bind(this),
     });
     this.submissionExecution = new SubmissionExecution({
       store: this.store,
@@ -407,6 +417,7 @@ export class WorkflowManager {
       reconcileReview: this.reconcileReview.bind(this),
       errorMessage,
       createLiveRelay: this.createLiveRelay.bind(this),
+      disposeChildSession: this.disposeCodexChildSession.bind(this),
     });
     this.lifecycleExecution = new LifecycleExecution({
       store: this.store,
@@ -1138,6 +1149,7 @@ export class WorkflowManager {
         enterReviewing: false,
         step: "reviewing",
         message: "Review queued; waiting for Reviewer",
+        childSessionId: (await this.createCodexChildSessionWithLabel(prepared.record, exec, `Codex Reviewer · ${workflowId}`))?.id,
       });
       const prompt = callbackPrompt(prepared.record, input, evidence);
       this.startSubmissionTask(workflowId, submissionId, prompt, prepared.record, lease);
@@ -1249,6 +1261,24 @@ export class WorkflowManager {
   }
   private createLiveRelay(record: WorkflowRecord, stage: "planning" | "reviewing", reviewId?: string): LiveRelay {
     return new LiveRelay(record.id, stage, reviewId, (event) => this.emitSessionEvent(record, event));
+  }
+
+  private async createCodexChildSession(record: WorkflowRecord, exec: ToolRunContext): Promise<CodexChildSessionHandle | undefined> {
+    return this.createCodexChildSessionWithLabel(record, exec, `Codex Planner · ${record.id}`);
+  }
+
+  private async createCodexChildSessionWithLabel(record: WorkflowRecord, exec: ToolRunContext, label: string): Promise<CodexChildSessionHandle | undefined> {
+    if (!this.codexChildFactory) return undefined;
+    const parent = requireAgent(exec);
+    const child = await this.codexChildFactory.create(parent, record.cwd, label, record.task, exec.signal);
+    this.runtime.codexChildSessions.set(record.id, child);
+    return child;
+  }
+
+  private async disposeCodexChildSession(workflowId: string, child: CodexChildSessionHandle | undefined): Promise<void> {
+    if (!child) return;
+    if (this.runtime.codexChildSessions.get(workflowId) === child) this.runtime.codexChildSessions.delete(workflowId);
+    await child.dispose();
   }
   private async stageSubmissionFailure(
     updateCurrent: (fn: (record: WorkflowRecord) => void) => Promise<WorkflowRecord>,

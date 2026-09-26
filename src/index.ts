@@ -18,12 +18,14 @@ import { createWorkflowTools } from "./tools.js";
 import type { WorkflowConfig } from "./types.js";
 import { WorkflowManager } from "./workflow.js";
 import { codexWorkflowProjectionDefinition } from "./review-events.js";
+import { CodexChildSessionFactory } from "./codex-child-session.js";
+import type {} from "@deepseek-ai/dsh-subagent";
 
 export const name = "dsh-codex-workflow";
 // The projection must be registered before Session Controller replays history;
 // otherwise a refreshed DSH page rejects our namespaced workflow events as
 // unknown and the browser cannot open the Codex Review tab.
-export const inject = ["tools", "agents", "systemPrompt", "sessionProjections"];
+export const inject = ["tools", "agents", "systemPrompt", "sessionProjections", "subagents"];
 export const Config = ConfigSchema;
 export type Config = RawConfig;
 
@@ -45,6 +47,7 @@ export async function apply(ctx: Context, raw: Config): Promise<void> {
     await mkdir(join(config.storageDir, "bridge"), { recursive: true });
     await writeFile(schemaFile, `${JSON.stringify(REVIEW_OUTPUT_SCHEMA)}\n`, "utf8");
     await writeFile(alignmentSchemaFile, `${JSON.stringify(ALIGN_OUTPUT_SCHEMA)}\n`, "utf8");
+    const childFactory = new CodexChildSessionFactory(ctx.agents, ctx.subagents);
     const codex = new CodexAppServerClient({
       command: config.codexCommand,
       requestTimeoutMs: config.turnTimeoutMs,
@@ -88,7 +91,7 @@ export async function apply(ctx: Context, raw: Config): Promise<void> {
         jitterRatio: config.transientRetryJitterRatio,
       },
     });
-    const manager = new WorkflowManager(store, codex, config, callback, bridgeStore, audit, {}, ctx.agents);
+    const manager = new WorkflowManager(store, codex, config, callback, bridgeStore, audit, {}, ctx.agents, childFactory);
     const autoTriggerDisposer = registerAutoTriggerPrompt(ctx.systemPrompt, config.autoTriggerMode);
     const runtime = new BridgeRuntime(bridgeStore, ctx.agents, {
       pollMs: config.bridgePollMs,
@@ -111,6 +114,7 @@ export async function apply(ctx: Context, raw: Config): Promise<void> {
     runtime.start();
     return async () => {
       disposeProjection();
+      childFactory.unregisterProvider();
       await runtime.stop();
       stopListener();
       createdListener();

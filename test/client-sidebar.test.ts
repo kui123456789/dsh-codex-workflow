@@ -34,6 +34,35 @@ test("planner projection opens Codex Review in the mounted DSH session", () => {
   assert.equal(calls.length, 1, "ordinary projection updates do not reopen the tab");
 });
 
+test("planner child projection opens the native DSH subagent chat resource", () => {
+  let plugin: { apply(ctx: unknown): void } | undefined;
+  const source = readFileSync(join(process.cwd(), "src/client.js"), "utf8");
+  runInNewContext(source, {
+    window: { __ModuleLoader__: { load: (entry: { factory(require: (name: string) => unknown): { apply(ctx: unknown): void } }) => {
+      plugin = entry.factory(() => ({ createElement: () => null }));
+    } } },
+  });
+  const resources: Array<{ address: string; options: { kind?: string } }> = [];
+  let notifyMounted: (() => void) | undefined;
+  const projection = { currentWorkflowId: "workflow-1", plan: { workflowId: "workflow-1", childSessionId: "child-1", status: "planning", questions: [], assumptions: [] }, activeReview: null, reviews: [] };
+  const face = { getSnapshot: () => projection, subscribe: () => () => undefined };
+  const ctx = {
+    sidebarRightTabs: { register: () => () => undefined }, slots: { inject: () => () => undefined },
+    sidebarRight: {
+      mounted: { getSnapshot: () => "parent-1", subscribe: (listener: () => void) => { notifyMounted = listener; return () => undefined; } },
+      openResource: (address: string, options: { kind?: string }) => resources.push({ address, options }),
+      openTabIn: () => { throw new Error("custom review tab should not be used when a child exists"); },
+    },
+    sessions: { binding: () => ({ session: { projections: { faceOf: () => face } } }) },
+  };
+  plugin!.apply(ctx);
+  notifyMounted?.();
+  assert.equal(resources.length, 1);
+  assert.match(resources[0]!.address, /^dsh-resource:\/\/subagentchat\/session\/child-1/);
+  assert.match(resources[0]!.address, /parent=parent-1/);
+  assert.equal(resources[0]!.options.kind, "subagentchat");
+});
+
 test("sidebar body renders Planner and Reviewer activity while they are running", () => {
   let plugin: { apply(ctx: unknown): void } | undefined;
   const source = readFileSync(join(process.cwd(), "src/client.js"), "utf8");

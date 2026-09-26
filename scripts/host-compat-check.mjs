@@ -40,6 +40,7 @@ try {
   // registration surface here so the isolated compatibility harness reaches
   // tool registration as well.
   ctx.provide("sessionProjections", { register: () => () => undefined });
+  ctx.provide("subagents", { registerProvider: () => () => undefined });
   const fiber = ctx.plugin(plugin, { storageDir: directory });
   await fiber;
   for (const name of names) assert.ok(ctx.tools.get(name), `${name} missing after activation`);

@@ -9,6 +9,8 @@ window.__ModuleLoader__.load({
     const { useSyncExternalStore } = React;
     const TAB_ID = "dsh-codex-workflow-review";
     const TAB_KIND = "codex-review";
+    const codexSubagentAddress = (parentSessionId, childSessionId) =>
+      `dsh-resource://subagentchat/session/${encodeURIComponent(childSessionId)}?parent=${encodeURIComponent(parentSessionId)}&mode=one-shot`;
 
     function emptyProjection() {
       return { currentWorkflowId: null, plan: null, activeReview: null, reviews: [] };
@@ -143,6 +145,19 @@ window.__ModuleLoader__.load({
           if (!projection) return;
           const active = projection.activeReview;
           const latest = active || projection.reviews?.at?.(-1);
+          const childSessionId = active?.childSessionId || projection.plan?.childSessionId;
+          if (childSessionId && typeof ctx.sidebarRight.openResource === "function") {
+            const key = `${sessionId}:subagent:${childSessionId}`;
+            if (!opened.has(key)) {
+              opened.add(key);
+              try {
+                ctx.sidebarRight.openResource(codexSubagentAddress(sessionId, childSessionId), { kind: "subagentchat" });
+              } catch {
+                opened.delete(key);
+              }
+            }
+            return;
+          }
           const target = latest
             ? {
                 key: `${sessionId}:review:${latest.reviewId}`,

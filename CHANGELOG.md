@@ -2,6 +2,13 @@
 
 All notable changes to `dsh-codex-workflow`.
 
+## [1.1.12] - 2026-09-27
+
+- Planner and Reviewer runs now create native DSH child sessions with `origin: "subagent"`.
+- The right sidebar opens DSH's built-in `subagentchat` resource for the child session; Codex App Server remains the execution backend.
+- Codex output is written as native DSH assistant stream events, so the sidebar uses the normal DSH conversation renderer instead of a custom text projection.
+- The plugin now requires the DSH `subagents` service and registers its Codex provider through the native subagent seam.
+
 ## [1.1.11] - 2026-09-26
 
 - The DSH Codex Review sidebar now shows bounded live Planner and Reviewer text, visible reasoning summaries, and tool activity before turns complete.
