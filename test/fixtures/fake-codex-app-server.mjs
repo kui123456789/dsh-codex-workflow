@@ -304,7 +304,7 @@ function handleClientRequest(message) {
     const delay = (prompt.includes("SLOW") ? Number(process.env.FAKE_CODEX_SLOW_DELAY_MS || 0) : 0)
       || Number(process.env.FAKE_CODEX_TURN_DELAY_MS || 0);
     if (process.env.FAKE_CODEX_STREAM_VISIBLE === "1" && !params.outputSchema) {
-      send({ method: "item/started", params: { threadId: params.threadId, turnId, item: { type: "commandExecution", id: `command-${turnId}`, command: "git status --short", status: "inProgress" } } });
+      send({ method: "item/started", params: { threadId: params.threadId, turnId, item: { type: "commandExecution", id: `command-${turnId}`, command: '"C:\\Program Files\\Codex\\codex.exe" --stdio', status: "inProgress" } } });
       send({ method: "item/plan/delta", params: { threadId: params.threadId, turnId, itemId: `item-${turnId}`, delta: "<proposed_plan>\n" } });
       send({ method: "item/plan/delta", params: { threadId: params.threadId, turnId, itemId: `item-${turnId}`, delta: "Implement safely\n</proposed_plan>" } });
     }

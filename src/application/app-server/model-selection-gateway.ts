@@ -6,6 +6,7 @@ export interface ModelSelection {
   id: string;
   isDefault: boolean;
   hidden: boolean;
+  name?: string;
   defaultReasoningEffort?: string;
 }
 
@@ -64,7 +65,10 @@ export class ModelSelectionGateway {
       if (!id) continue;
       const defaultReasoningEffort = typeof value.defaultReasoningEffort === "string" && value.defaultReasoningEffort.length > 0
         ? value.defaultReasoningEffort : undefined;
-      parsed.push({ id, isDefault: value.isDefault === true, hidden: value.hidden === true, ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}) });
+      const name = typeof value.displayName === "string" && value.displayName.length > 0 ? value.displayName
+        : typeof value.name === "string" && value.name.length > 0 ? value.name : undefined;
+      parsed.push({ id, isDefault: value.isDefault === true, hidden: value.hidden === true,
+        ...(name ? { name } : {}), ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}) });
     }
     this.cachedModels = parsed;
     return parsed;
@@ -86,5 +90,9 @@ export class ModelSelectionGateway {
 
   async resolveDefaultModel(signal?: AbortSignal): Promise<string | undefined> {
     return (await this.defaultModel(signal))?.id;
+  }
+
+  async listVisibleModels(signal?: AbortSignal): Promise<ModelSelection[]> {
+    return (await this.modelSelections(signal)).filter((entry) => !entry.hidden);
   }
 }

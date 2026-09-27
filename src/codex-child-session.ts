@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Agent, AgentHandle, AgentRegistry } from "@deepseek-ai/dsh-agent";
-import { createAssistantMessage, createUserMessage, type AssistantStreamRecord, type StreamChunk } from "@deepseek-ai/dsh-llm";
+import { createAssistantMessage, createToolResultMessage, createUserMessage, ToolCallId, type AssistantStreamRecord, type StreamChunk } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
 import type { ResolvedSubagentStartRequest, SubagentProvider, SubagentResult, SubagentRun, SubagentRuntime } from "@deepseek-ai/dsh-subagent";
 import type { AppServerLiveEvent } from "./app-server.js";
@@ -87,6 +87,7 @@ class CodexChildSession {
   private chunkIndex = 0;
   private readonly attemptId: string;
   private readonly stream: AssistantStreamRecord[] = [];
+  private readonly toolCalls = new Set<string>();
 
   constructor(private readonly handle: AgentHandle,
     private readonly descriptor: ResolvedSubagentStartRequest["descriptor"],
@@ -121,7 +122,23 @@ class CodexChildSession {
 
   progress(entry: AppServerLiveEvent): void {
     if (this.closed || this.finished) return;
-    const rendered = entry.kind === "tool" || entry.kind === "reasoning" ? `\n\n[${entry.kind}] ${entry.text}` : entry.text;
+    if (entry.kind === "tool") {
+      const callId = ToolCallId(entry.itemId.slice(0, 128));
+      if (!this.toolCalls.has(callId)) {
+        this.session.append("tool/call", { turn: 1, step: 1, callId,
+          name: entry.command ? "commandExecution" : "codex-tool",
+          arguments: JSON.stringify({ ...(entry.command ? { command: entry.command } : {}), ...(entry.cwd ? { cwd: entry.cwd } : {}) }) });
+        this.toolCalls.add(callId);
+      }
+      const terminal = entry.exitCode !== undefined || entry.status === "completed" || entry.status === "failed";
+      if (terminal) {
+        this.session.append("tool/result", { turn: 1, step: 1,
+          message: createToolResultMessage({ callId, isError: entry.status === "failed" || (entry.exitCode !== undefined && entry.exitCode !== 0), content: [{ type: "text", text: entry.text }] }) }, { surfaceOp: "append" });
+        this.toolCalls.delete(callId);
+      }
+      return;
+    }
+    const rendered = entry.kind === "reasoning" ? `\n\n[${entry.kind}] ${entry.text}` : entry.text;
     if (this.stream.length === 0) this.pushChunk({ type: "block-start", index: 0, blockType: "text" });
     this.text += rendered;
     this.pushChunk({ type: "text-delta", index: 0, text: rendered });

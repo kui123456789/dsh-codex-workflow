@@ -1,6 +1,8 @@
 import type { SubmissionNoticeCommand, SubmitVerdictCommand } from "./bridge-protocol.js";
 
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+export type ConversionTransport = "app-server" | "cli";
+export type ConversionFallback = "cli" | "fail";
 
 export type WorkflowMode = "planned" | "review_only";
 
@@ -52,6 +54,12 @@ export type ReviewStep =
   | "review_finalizing";
 
 export type WorkflowProcessState = "running" | "waiting" | "completed" | "failed" | "cancelled" | "stale";
+
+export interface ReviewPhaseTiming {
+  startedAt: string;
+  endedAt?: string;
+  elapsedMs?: number;
+}
 
 export interface PlannerQuestion {
   id: string;
@@ -199,6 +207,7 @@ export interface WorkflowRecord {
   activeTurnId?: string;
   reviewAttempt?: number;
   reviewElapsedMs?: number;
+  reviewPhaseTimings?: Partial<Record<ReviewStep, ReviewPhaseTiming>>;
   lastProgressMessage?: string;
   processState?: WorkflowProcessState;
   /** Optional for records written by older versions; defaults to 0. */
@@ -299,6 +308,8 @@ export interface WorkflowConfig {
   reviewerModel: string;
   plannerEffort: ReasoningEffort;
   reviewerEffort: ReasoningEffort;
+  conversionTransport?: ConversionTransport;
+  conversionFallback?: ConversionFallback;
   maxReviewCycles: number;
   maxNoChangeReviewRounds: number;
   reviewDiffMaxBytes: number;

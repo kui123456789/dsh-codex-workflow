@@ -54,6 +54,7 @@ export async function apply(ctx: Context, raw: Config): Promise<void> {
       rpcTimeoutMs: config.rpcTimeoutMs,
       idleProcessMs: config.idleProcessMs,
     });
+    const disposeModelCatalogRoute = registerModelCatalogRoute(ctx, codex);
     const audit = new CodexCliAuditDispatcher({
       command: config.codexCommand,
       reviewSchemaFile: schemaFile,
@@ -125,6 +126,7 @@ export async function apply(ctx: Context, raw: Config): Promise<void> {
       // and its backoff, then cancels and awaits every Reviewer operation.
       await manager.stop();
       await callback.stop();
+      await disposeModelCatalogRoute?.();
       await audit.stop();
       await codex.stop();
       bridgeStore.close();
@@ -136,13 +138,24 @@ export async function apply(ctx: Context, raw: Config): Promise<void> {
 function resolveConfig(raw: Config): WorkflowConfig {
   const dshHome = process.env.DSH_HOME ? resolve(process.env.DSH_HOME) : join(homedir(), ".dsh");
   const turnTimeoutMs = Math.max(10_000, Math.trunc(raw.turnTimeoutMs));
+  // Settings-owned fields are Schemastery volatile references. Keep the
+  // references in the returned config and expose getters so a Web settings
+  // change applies to the next workflow turn without restarting DSH.
+  const plannerModel = raw.plannerModel;
+  const reviewerModel = raw.reviewerModel;
+  const plannerEffort = raw.plannerEffort;
+  const reviewerEffort = raw.reviewerEffort;
+  const conversionTransport = raw.conversionTransport;
+  const conversionFallback = raw.conversionFallback;
   return {
     codexCommand: raw.codexCommand || "codex",
     autoTriggerMode: raw.autoTriggerMode || "complex",
-    plannerModel: raw.plannerModel,
-    reviewerModel: raw.reviewerModel,
-    plannerEffort: raw.plannerEffort,
-    reviewerEffort: raw.reviewerEffort,
+    get plannerModel() { return readLiveConfigValue(plannerModel, ""); },
+    get reviewerModel() { return readLiveConfigValue(reviewerModel, ""); },
+    get plannerEffort() { return readLiveConfigValue(plannerEffort, "high"); },
+    get reviewerEffort() { return readLiveConfigValue(reviewerEffort, "high"); },
+    get conversionTransport() { return readLiveConfigValue(conversionTransport, "app-server"); },
+    get conversionFallback() { return readLiveConfigValue(conversionFallback, "cli"); },
     maxReviewCycles: Math.max(1, Math.min(10, Math.trunc(raw.maxReviewCycles))),
     maxNoChangeReviewRounds: Math.max(1, Math.min(10, Math.trunc(raw.maxNoChangeReviewRounds))),
     reviewDiffMaxBytes: Math.max(1024, Math.min(1024 * 1024, Math.trunc(raw.reviewDiffMaxBytes))),
@@ -175,6 +188,34 @@ function resolveConfig(raw: Config): WorkflowConfig {
     reviewerReleaseTimeoutMs: Math.max(250, Math.min(5 * 60 * 1000, Math.trunc(raw.reviewerReleaseTimeoutMs))),
     leaseTtlMs: Math.max(5_000, Math.min(60 * 60 * 1000, Math.trunc(raw.leaseTtlMs))),
   };
+}
+
+/** Authenticated browser route used by the settings page to display the
+ * current App Server model catalog. The route is read-only and carries no
+ * credentials or prompt content. */
+function registerModelCatalogRoute(ctx: Context, codex: CodexAppServerClient): (() => void) | undefined {
+  const connection = ctx.get("connection") as { fetch?: { register(route: {
+    path: string;
+    methods: readonly ["POST"];
+    requestBody: "buffered";
+    fetch(request: unknown): Promise<Response>;
+  }): () => void | Promise<void> } } | undefined;
+  return connection?.fetch?.register({
+    path: "/api/dsh-codex-workflow/models",
+    methods: ["POST"],
+    requestBody: "buffered",
+    fetch: async () => Response.json({ models: await codex.listModels() }, { headers: { "cache-control": "no-store" } }),
+  });
+}
+
+type LiveConfigValue<T> = T | { get(): T | undefined };
+
+function readLiveConfigValue<T>(value: LiveConfigValue<T>, fallback: T): T {
+  const candidate = value as T & { get?: unknown };
+  if (typeof candidate === "object" && candidate !== null && typeof candidate.get === "function") {
+    return (candidate.get as () => T | undefined)() ?? fallback;
+  }
+  return (value as T | undefined) ?? fallback;
 }
 
 export { CodexAppServerClient } from "./app-server.js";

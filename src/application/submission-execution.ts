@@ -232,6 +232,8 @@ export class SubmissionExecution {
                 at: new Date().toISOString(),
               };
               if (reconciled.aligned) {
+                await this.ctx.reviewObservation.mark(workflowId, "review_reconciliation",
+                  `已按权威层级改写（${alignment.conflicts.length} 条冲突已解决）`, null);
                 verdict = reconciled.result;
               } else {
                 contractFailed = true;

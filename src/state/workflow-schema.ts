@@ -17,7 +17,7 @@ export interface WorkflowRecordV2 {
 const GROUPS: Record<Exclude<keyof WorkflowRecordV2, "schemaVersion">, readonly string[]> = {
   identity: ["id", "revision", "dshSessionId", "cwd", "createdAt", "updatedAt", "mode", "origin"],
   planning: ["task", "plannerThreadId", "plannerTurnId", "plannerModel", "sourceThreadId", "planMarkdown", "assumptions", "questions", "pendingInput"],
-  execution: ["phase", "processState", "reviewStartedAt", "lastProgressAt", "activeTurnId", "reviewAttempt", "reviewElapsedMs", "lastProgressMessage", "error"],
+  execution: ["phase", "processState", "reviewStartedAt", "lastProgressAt", "activeTurnId", "reviewAttempt", "reviewElapsedMs", "reviewPhaseTimings", "lastProgressMessage", "error"],
   review: ["reviewerThreadId", "reviewerThreadOrigin", "reviewerTurnId", "reviewerModel", "reviewerEffort", "reviewCycles", "reviewStep", "noChangeReviewRounds", "reviewContractFailures", "latestReviewConflict", "latestReview", "latestReviewEvidence", "previousReviewFingerprint", "reviewDecision"],
   submission: ["pendingReviewRequest", "submissionId", "submissionState", "submissionAttempts", "submissionError", "submissionCallbackReason", "submissionRetryAt", "appliedVerdictRequestId", "appliedVerdictSubmissionId", "appliedVerdictEvidenceFingerprint", "stagedVerdict", "submissionNotice", "submissionLeaseToken", "submissionLeaseEpoch", "submissionLeaseUntil"],
   bridge: ["codexThreadId", "bridgeRequestId", "bridgeDeliveryState", "callbackState", "callbackAttempts", "callbackError"],

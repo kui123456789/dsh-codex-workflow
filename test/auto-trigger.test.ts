@@ -17,6 +17,14 @@ test("autoTriggerMode defaults to complex and validates the public modes", () =>
   assert.throws(() => Config({ autoTriggerMode: "sometimes" as never }));
 });
 
+test("model and effort settings are live volatile references", () => {
+  const config = Config({ plannerModel: "gpt-6-sol", plannerEffort: "medium" });
+  assert.equal(config.plannerModel.get(), "gpt-6-sol");
+  assert.equal(config.plannerEffort.get(), "medium");
+  assert.equal(config.reviewerModel.get(), "");
+  assert.equal(config.reviewerEffort.get(), "high");
+});
+
 test("plugin declares systemPrompt and session projections as required services", () => {
   assert.deepEqual(inject, ["tools", "agents", "systemPrompt", "sessionProjections", "subagents"]);
 });

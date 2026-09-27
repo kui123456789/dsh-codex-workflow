@@ -10,6 +10,11 @@ export interface CodexLiveEntry {
   itemId: string;
   text: string;
   replace?: boolean;
+  command?: string;
+  cwd?: string;
+  exitCode?: number;
+  status?: string;
+  files?: string[];
 }
 
 export interface CodexLiveEvent {
@@ -199,9 +204,15 @@ function appendLive(current: CodexLiveViewEntry[] | undefined, entries: CodexLiv
     const index = next.findIndex((item) => item.kind === entry.kind && item.itemId === entry.itemId);
     if (index < 0) {
       if (next.length >= 96) next.shift();
-      next.push({ kind: entry.kind, itemId: entry.itemId, text: entry.text.slice(0, 65_536) });
+      next.push({ kind: entry.kind, itemId: entry.itemId, text: entry.text.slice(0, 65_536),
+        ...(entry.command ? { command: entry.command } : {}), ...(entry.cwd ? { cwd: entry.cwd } : {}),
+        ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {}), ...(entry.status ? { status: entry.status } : {}),
+        ...(entry.files ? { files: entry.files } : {}) });
     } else {
-      next[index] = { ...next[index]!, text: (entry.replace ? entry.text : next[index]!.text + entry.text).slice(0, 65_536) };
+      next[index] = { ...next[index]!, text: (entry.replace ? entry.text : next[index]!.text + entry.text).slice(0, 65_536),
+        ...(entry.command ? { command: entry.command } : {}), ...(entry.cwd ? { cwd: entry.cwd } : {}),
+        ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {}), ...(entry.status ? { status: entry.status } : {}),
+        ...(entry.files ? { files: entry.files } : {}) };
     }
   }
   return next;

@@ -86,11 +86,11 @@ export class ReviewExecution {
       if (evidenceCommit.suppressed) return evidenceCommit.record;
       current = evidenceCommit.record;
 
-      // The visible review always runs on a fresh App Server ephemeral thread,
-      // even when a CLI audit is configured. The CLI keeps only the internal
-      // conversions (normalize/align), which also run in private ephemeral
-      // sessions. No new Planner/Reviewer id is persisted or made visible to
-      // Codex Desktop; legacy ids are diagnostic only.
+      // The visible review always runs on a fresh App Server ephemeral thread.
+      // Structured conversion is App Server by default; an explicit CLI mode
+      // or configured fallback still uses private `--ephemeral` audit calls.
+      // No new Planner/Reviewer id is persisted or made visible to Codex
+      // Desktop; legacy ids are diagnostic only.
       const reviewerModel = current.reviewerModel
         || this.ctx.config.reviewerModel
         || await this.ctx.turnGateway.resolveDefaultModel?.(exec.signal)
@@ -118,6 +118,10 @@ export class ReviewExecution {
             r.reviewStep = "review_native_turn";
             r.lastProgressAt = new Date().toISOString();
             r.lastProgressMessage = "Running Reviewer turn";
+            r.reviewPhaseTimings = {
+              ...(r.reviewPhaseTimings ?? {}),
+              review_native_turn: { startedAt: new Date().toISOString() },
+            };
             // The new Reviewer is an App Server ephemeral thread. Keep only
             // the origin marker for diagnostics; its id is process-local and
             // must never become a Desktop-visible durable binding.
@@ -163,6 +167,8 @@ export class ReviewExecution {
         threadId: reviewerThreadId!,
         cwd: current.cwd,
         detached: false,
+        model: reviewerModel,
+        effort: current.reviewerEffort ?? this.ctx.config.reviewerEffort,
         target: { type: "custom", instructions: reviewInstructions(current, input, evidence, git) },
         // The App Server reports the ACTUAL review task id through onStarted
         // (an inline review may return a different thread). Enforce the 1.0.8
@@ -270,25 +276,22 @@ export class ReviewExecution {
       // Since 1.0.7 the visible review turn (startReview) produces a readable
       // review; the structured verdict is derived by a private conversion turn
       // (in-place for this ephemeral Reviewer), never written into Desktop
-      // history. Durable compatibility callers may still use a fork; the fork
-      // passes the SAME effective reviewer model (persisted override, bundle
-      // config, or the resolved server default) so it never drifts to a
-      // different default. The authoritative text is the rewrite turn's final
-      // message when a display-rewrite ran, otherwise the native review text.
-      // 1.1.2: with a CLI audit configured, the STRUCTURED CONVERSION stays on
-      // the CLI. `--ephemeral` means it neither creates nor resumes a durable
-      // thread, so it cannot pollute the Codex task list the way the visible
-      // review turn used to. Only the visible turn moved to the App Server.
+      // history. App Server conversion is the default because it reuses the
+      // warm ephemeral process/thread. CLI remains an explicit option and a
+      // configurable fallback for compatibility with older App Server builds.
       let result: ReviewResult;
-      if (this.ctx.audit) {
-        result = applyReviewConsistency(await this.ctx.audit.normalize({
+      const normalizeWithCli = async (): Promise<ReviewResult> => {
+        if (!this.ctx.audit) throw new Error("CLI conversion requested but the CLI audit gateway is unavailable");
+        await this.ctx.reviewObservation.mark(workflowId, "review_conversion", "Converting Reviewer result (CLI)", null);
+        return applyReviewConsistency(await this.ctx.audit.normalize({
           visibleText: authoritativeText,
           cwd: current.cwd,
           workflowId,
           ...(reviewerModel ? { model: reviewerModel } : {}),
         }, exec.signal));
-      } else {
-        await this.ctx.reviewObservation.mark(workflowId, "review_conversion", "Converting Reviewer result", null);
+      };
+      const normalizeWithAppServer = async (): Promise<ReviewResult> => {
+        await this.ctx.reviewObservation.mark(workflowId, "review_conversion", "Converting Reviewer result (App Server)", null);
         let normalized: TurnWaitResult;
         try {
           normalized = await this.ctx.turnGateway.normalizeInFork({
@@ -306,14 +309,27 @@ export class ReviewExecution {
           this.ctx.runtime.activeTurns.delete(workflowId);
         }
         const afterNormalize = await this.ctx.store.load(workflowId);
-        if (!afterNormalize || afterNormalize.phase === "cancelled") return afterNormalize!;
+        if (!afterNormalize || afterNormalize.phase === "cancelled") throw new Error("workflow cancelled during review normalization");
         current = afterNormalize;
         if (normalized.kind !== "completed") throw new Error("review normalization unexpectedly requested user input");
         if (normalized.status !== "completed") {
           throw new Error(normalized.reason ?? `review normalization turn ${normalized.status}`);
         }
-
-        result = applyReviewConsistency(parseReview(normalized.text));
+        return applyReviewConsistency(parseReview(normalized.text));
+      };
+      if (this.ctx.config.conversionTransport === "cli") {
+        result = await normalizeWithCli();
+      } else {
+        try {
+          result = await normalizeWithAppServer();
+        } catch (error) {
+          if (exec.signal.aborted) throw error;
+          const fallback = this.ctx.config.conversionFallback ?? "cli";
+          if (fallback !== "cli" || !this.ctx.audit) throw error;
+          const detail = error instanceof Error ? error.message : String(error);
+          await this.ctx.reviewObservation.mark(workflowId, "review_conversion", `App Server conversion failed; using CLI fallback (${detail})`, null);
+          result = await normalizeWithCli();
+        }
       }
       // 1.0.10 REVIEW AUTHORITY ALIGNMENT: after the visible review is
       // normalized into the public ReviewResult, an INVISIBLE ephemeral fork
@@ -341,7 +357,11 @@ export class ReviewExecution {
           resolved: reconciled.aligned,
           at: new Date().toISOString(),
         };
-        if (reconciled.aligned) applied = reconciled.result;
+        if (reconciled.aligned) {
+          await this.ctx.reviewObservation.mark(workflowId, "review_reconciliation",
+            `已按权威层级改写（${alignment.conflicts.length} 条冲突已解决）`, null);
+          applied = reconciled.result;
+        }
       }
       if (!applied) {
         // Unresolved conflict: restore the pre-review phase (blocked after
@@ -416,6 +436,8 @@ export class ReviewExecution {
       // registered: clear the in-process active-turn mapping so a later cancel
       // can never interrupt a completed turn through a stale map entry.
       this.ctx.runtime.activeTurns.delete(workflowId);
+      const cancelled = await this.ctx.store.load(workflowId);
+      if (cancelled?.phase === "cancelled") return cancelled;
       const failed = await this.ctx.store.update(workflowId, (r) => {
         if (r.phase !== "reviewing") return;
         r.phase = priorPhase;

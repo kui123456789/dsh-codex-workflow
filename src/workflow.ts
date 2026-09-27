@@ -107,6 +107,8 @@ export interface CodexGateway {
     cwd: string;
     target: Record<string, unknown>;
     detached: boolean;
+    model?: string;
+    effort?: WorkflowConfig["reviewerEffort"];
     onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
     onProgress?: (entry: AppServerLiveEvent) => void;
   }, signal?: AbortSignal): Promise<{ threadId: string; result: TurnWaitResult }>;
@@ -1819,7 +1821,8 @@ export class WorkflowManager {
     signal?: AbortSignal,
     input?: ReviewInput,
   ): Promise<AlignmentOutcome> {
-    if (this.audit) {
+    const alignWithCli = async (): Promise<AlignmentOutcome> => {
+      if (!this.audit) throw new Error("CLI alignment requested but the CLI audit gateway is unavailable");
       return this.audit.align({
         result,
         task: record.task,
@@ -1838,8 +1841,10 @@ export class WorkflowManager {
           fixSummary: input?.implementationSummary,
         }),
       }, signal);
-    }
-    const model = record.reviewerModel
+    };
+    if (this.config.conversionTransport === "cli") return alignWithCli();
+    try {
+      const model = record.reviewerModel
       || this.config.reviewerModel
       || await this.turnGateway.resolveDefaultModel?.(signal)
       || undefined;
@@ -1875,7 +1880,14 @@ export class WorkflowManager {
     if (normalized.status !== "completed") {
       throw new Error(normalized.reason ?? `review authority alignment turn ${normalized.status}`);
     }
-    return parseAlignment(normalized.text, result);
+      return parseAlignment(normalized.text, result);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      if ((this.config.conversionFallback ?? "cli") !== "cli" || !this.audit) throw error;
+      const detail = error instanceof Error ? error.message : String(error);
+      await this.reviewObservation.mark(record.id, "review_alignment", `App Server alignment failed; using CLI fallback (${detail})`, null);
+      return alignWithCli();
+    }
   }
 
   /** 1.0.10 ONE visible reconciliation turn on the SAME durable workflow task
@@ -1896,7 +1908,10 @@ export class WorkflowManager {
     signal?: AbortSignal,
     input?: ReviewInput,
   ): Promise<{ aligned: true; result: ReviewResult } | { aligned: false }> {
-    if (this.audit) {
+    if (this.config.conversionTransport === "cli" && !this.audit) {
+      throw new Error("CLI reconciliation requested but the CLI audit gateway is unavailable");
+    }
+    if (this.config.conversionTransport === "cli" && this.audit) {
       // Reconciliation is an independent ephemeral CLI turn. It never resumes
       // a Desktop task or the external bridge origin task.
       const corrected = await this.audit.reconcile({
@@ -2521,6 +2536,7 @@ ITEM-BY-ITEM COVERAGE:
 - Every explicit requirement must be IMPLEMENTED in the observed changes; a missing implementation is a blocking finding.
 - Verification evidence follows the method the ORIGINAL TASK / APPROVED PLAN names: automated tests, STATIC CHECKS and REAL COMMAND verification are ALL formal evidence. Missing automated tests alone are blocking ONLY when the task/plan explicitly requires an automated test for the item or a concrete regression risk is demonstrated with reproducible code evidence; otherwise record them as non-blocking or accept the plan's own verification method.
 - Never demand changes that exceed the ORIGINAL TASK / APPROVED PLAN's explicit file count, test count, scope, dependency limits or manual acceptance method.
+- If the ORIGINAL TASK or APPROVED PLAN explicitly forbids an action (for example file writes, new tests, dependency changes or network access), do not report the absence of that forbidden action as a finding or test gap; treat the constraint as satisfied.
 - VERDICT: pass is allowed when every explicit requirement has implementation evidence (code) plus verification evidence of the kind the task/plan requires.`;
 }
 

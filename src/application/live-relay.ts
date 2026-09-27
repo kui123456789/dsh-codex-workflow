@@ -19,11 +19,14 @@ export class LiveRelay {
     if (this.closed || !entry.text) return;
     const remaining = 96 * 1024 - this.accepted;
     if (remaining <= 0) return;
-    const text = entry.text.slice(0, Math.min(remaining, entry.kind === "tool" ? 300 : 96 * 1024));
+    const text = entry.text.slice(0, Math.min(remaining, entry.kind === "tool" ? 8 * 1024 : 96 * 1024));
     this.accepted += text.length;
     for (let offset = 0; offset < text.length; offset += 2048) {
       this.pending.push({ kind: entry.kind, itemId: entry.itemId.slice(0, 128), text: text.slice(offset, offset + 2048),
-        ...(entry.replace && offset === 0 ? { replace: true } : {}) });
+        ...(entry.replace && offset === 0 ? { replace: true } : {}),
+        ...(entry.command ? { command: entry.command } : {}), ...(entry.cwd ? { cwd: entry.cwd } : {}),
+        ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {}), ...(entry.status ? { status: entry.status } : {}),
+        ...(entry.files ? { files: entry.files } : {}) });
       if (this.pending.reduce((size, item) => size + item.text.length, 0) >= 2048) this.flush();
     }
     if (this.pending.length > 0 && !this.timer) {

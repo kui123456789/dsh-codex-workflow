@@ -577,6 +577,7 @@ test("review observability heartbeats independently during a long Reviewer turn"
     const running = await new WorkflowStore(directory).load(record.id);
     assert.equal(running?.processState, "running");
     assert.equal(running?.reviewStep, "review_native_turn");
+    assert.ok(running?.reviewPhaseTimings?.review_native_turn?.startedAt, "review phase start is durable");
     const firstProgress = running?.lastProgressAt;
     await waitFor(async () => {
       const current = await new WorkflowStore(directory).load(record.id);
@@ -586,9 +587,12 @@ test("review observability heartbeats independently during a long Reviewer turn"
     assert.equal(heartbeat?.processState, "running");
     assert.ok((heartbeat?.reviewElapsedMs ?? 0) >= 0);
     assert.match(heartbeat?.lastProgressMessage ?? "", /Reviewer|Review/i);
+    assert.match(heartbeat?.lastProgressMessage ?? "", /已用时/);
     gateway.reviewGate.release();
     const completed = await run;
     assert.equal(completed.processState, "completed");
+    assert.ok(completed.reviewPhaseTimings?.review_native_turn?.endedAt, "review phase end is durable");
+    assert.ok((completed.reviewPhaseTimings?.review_native_turn?.elapsedMs ?? 0) >= 0);
   } finally {
     await rmClosed(directory);
   }
@@ -1902,6 +1906,38 @@ test("the reviewer model is explicit even when nothing is configured", async () 
       gateway.forkCalls.map((call) => call.model),
       ["fake-default-model", "fake-default-model", "fake-default-model", "fake-default-model"],
     );
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("review conversion defaults to the warm App Server path even when CLI audit is available", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-appserver-conversion-"));
+  try {
+    const gateway = new FakeGateway();
+    gateway.reviewResults = [{ verdict: "pass", findings: [], testGaps: [], summary: "OK" }];
+    const audit = new FakeCliAudit();
+    const instance = manager(directory, gateway, {}, undefined, undefined, audit);
+    const started = await instance.reviewOnly({ implementationSummary: "Changed", changedFiles: ["src/a.ts"] }, fakeExec("session-appserver-conversion", directory, []));
+    assert.equal(started.phase, "passed");
+    assert.equal(audit.normalizeCalls, 0, "the injected CLI gateway is only a fallback by default");
+    assert.ok(gateway.forkCalls.length >= 2, "App Server conversion and alignment both used ephemeral turns");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("conversionTransport=cli explicitly selects the CLI structured conversion", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-cli-conversion-"));
+  try {
+    const gateway = new FakeGateway();
+    gateway.reviewResults = [{ verdict: "pass", findings: [], testGaps: [], summary: "OK" }];
+    const audit = new FakeCliAudit();
+    const instance = manager(directory, gateway, { conversionTransport: "cli" }, undefined, undefined, audit);
+    const started = await instance.reviewOnly({ implementationSummary: "Changed", changedFiles: ["src/a.ts"] }, fakeExec("session-cli-conversion", directory, []));
+    assert.equal(started.phase, "passed");
+    assert.equal(audit.normalizeCalls, 1, "explicit CLI mode uses one CLI normalization");
+    assert.equal(gateway.forkCalls.length, 0, "explicit CLI mode does not start App Server conversion forks");
   } finally {
     await rmClosed(directory);
   }

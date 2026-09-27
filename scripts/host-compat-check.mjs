@@ -23,6 +23,7 @@ const hostPackage = process.env.DSH_CODEX_HOST_PACKAGE_JSON
   : profileRequire.resolve("@deepseek-ai/dsh/package.json");
 const hostRequire = createRequire(hostPackage);
 const loadHost = (name) => import(pathToFileURL(hostRequire.resolve(name)).href);
+const packageRoot = (name) => join(hostRequire.resolve(`${name}/package.json`), "..");
 const { Context } = await loadHost("@deepseek-ai/cordis");
 const { default: SystemPrompt } = await loadHost("@deepseek-ai/dsh-system-prompt");
 const { ToolRuntime } = await loadHost("@deepseek-ai/dsh-tools");
@@ -32,6 +33,22 @@ const ctx = new Context();
 const names = ["start", "continue", "review", "review_only", "submit", "decide", "status", "cancel"]
   .map((name) => `codex_workflow_${name}`);
 try {
+  // Static public-client contract guard. These checks do not load or mutate a
+  // browser surface; they fail the gate if a host upgrade removes the exact
+  // native subagent resource or public sidebar/session faces this client uses.
+  const subagentClient = await readFile(join(packageRoot("@deepseek-ai/dsh-client-ui-subagent"), "lib", "client.js"), "utf8");
+  const sidebarService = await readFile(join(packageRoot("@deepseek-ai/dsh-client-ui-sidebar-right"), "lib", "types", "client", "service.d.ts"), "utf8");
+  const sessionsContract = await readFile(join(packageRoot("@deepseek-ai/dsh-api-session-controller"), "lib", "types", "client", "contract", "sessions.d.ts"), "utf8");
+  const sessionContract = await readFile(join(packageRoot("@deepseek-ai/dsh-api-session-controller"), "lib", "types", "client", "contract", "session.d.ts"), "utf8");
+  assert.ok(subagentClient.includes("dsh-resource://subagentchat/session/"), "subagentchat resource address contract missing");
+  assert.match(subagentClient, /kind:\s*["']subagentchat["']/, "subagentchat tab kind contract missing");
+  assert.match(subagentClient, /mode\s*!==\s*["']one-shot["']/, "subagentchat one-shot mode parser contract missing");
+  assert.match(subagentClient, /searchParams\.get\(["']parent["']\)/, "subagentchat parent query parser contract missing");
+  assert.match(sidebarService, /openResource\(/, "ISidebarRight.openResource contract missing");
+  assert.match(sidebarService, /openTab</, "ISidebarRight.openTab contract missing");
+  assert.match(sessionsContract, /binding\(/, "ISessions.binding contract missing");
+  assert.match(sessionContract, /faceOf\(/, "ProjectionsFace.faceOf contract missing");
+
   await ctx.plugin(SystemPrompt, {});
   await ctx.plugin(ToolRuntime, {});
   // An empty registry keeps all bridge work local and prevents model calls.
@@ -41,6 +58,7 @@ try {
   // tool registration as well.
   ctx.provide("sessionProjections", { register: () => () => undefined });
   ctx.provide("subagents", { registerProvider: () => () => undefined });
+  ctx.provide("connection", { fetch: { register: () => () => undefined } });
   const fiber = ctx.plugin(plugin, { storageDir: directory });
   await fiber;
   for (const name of names) assert.ok(ctx.tools.get(name), `${name} missing after activation`);
@@ -63,7 +81,7 @@ try {
 
   console.log(JSON.stringify({ ok: true, hostVersion, pluginVersion: plugin.PLUGIN_VERSION,
     toolsRegistered: names.length, unloaded: true, storage: "isolated-temp",
-    peerCompatible: true, declaredPeers: peers }, null, 2));
+    peerCompatible: true, nativeSubagentSidebarContract: true, declaredPeers: peers }, null, 2));
 } finally {
   await ctx.fiber.dispose();
   await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });

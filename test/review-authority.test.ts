@@ -1079,6 +1079,7 @@ test("authority semantic matrix: contract text encodes M1-M5 rules", () => {
   const gate = reviewRequirementGate({ id: "w", task: "t", planMarkdown: "<proposed_plan>p</proposed_plan>" } as never, false);
   assert.match(gate, /REAL COMMAND verification are ALL formal evidence/);
   assert.match(gate, /Missing automated tests alone are blocking ONLY when/);
+  assert.match(gate, /explicitly forbids an action/);
   // M2: static checks / real command evidence satisfy file list + package.json
   // style requirements.
   assert.match(gate, /STATIC CHECKS/);

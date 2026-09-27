@@ -87,6 +87,10 @@ private ephemeral conversion --codex exec --ephemeral --output-schema--> normali
 
 **The visible review is contract-checked before it reaches DSH.** The readable Markdown is streamed into a native DSH child Session and the browser opens its `subagentchat` right-sidebar resource. The owning parent Session still receives namespaced `dsh-codex-workflow/*` workflow events for status and recovery. A structured ReviewResult envelope is never accepted as visible output; a display violation runs one corrective private turn. Nothing on the completion path calls the Desktop opener or any navigation/refresh API.
 
+The browser client retries a failed native-sidebar open for a bounded window and never falls back to the custom `Codex Review` tab while a child session exists. When no child session is available, it uses the public `sidebarRight.openTab` page API for the diagnostic fallback. Closing an already opened tab is treated as a user choice and does not repeatedly reopen that same child during the current page lifetime; a refresh or a later child session creates a new opening opportunity.
+
+Each review round has its own native child session, so multiple rounds may leave multiple subagent tabs in the right-sidebar history. The plugin does not close older tabs because the public sidebar API does not expose a reliable content-address lookup or the tab id returned by `openResource`.
+
 **Conflicts never cost the user a review cycle and never ask DSH to change code.** A conflict does not overwrite `latestReview`, increment `reviewCycles`, enter `fixing`, or send a fix instruction. One reconciliation turn may rewrite the complete verdict on the same ephemeral Reviewer; its prompt contains an explicit preservation manifest for every non-conflicting finding/test gap. Deterministic multiset checks reject deletion, field changes, duplicate-count drift and unrelated additions before re-alignment. A successful correction applies as one business cycle; two consecutive unresolved contract conflicts block without consuming a cycle.
 
 ### Reviewer writer-lock semantics
@@ -225,6 +229,10 @@ Defaults in `cordis.patch.yml`:
 - `autoTriggerMode`: `complex` (`off | complex | always`)
 - `plannerModel` / `reviewerModel`: empty means the current Codex default
 - `plannerEffort` / `reviewerEffort`: `high`
+- `conversionTransport`: `app-server` (default, warm ephemeral App Server conversion) or `cli` (explicit cold-start compatibility path)
+- `conversionFallback`: `cli` (default, visible fallback after an App Server conversion error) or `fail`
+- These four fields are live settings. Open Settings → Built-in Plugins → Codex 工作流 to select a model and reasoning level; the next workflow turn uses the accepted value without restarting DSH.
+- The Codex Review fallback sidebar groups tool progress into collapsible sections. Expanding a section shows the full retained progress text.
 - `maxReviewCycles`: `3` (1–10)
 - `maxNoChangeReviewRounds`: `1` (1–10)
 - `reviewDiffMaxBytes`: `65536` (1 KiB–1 MiB)

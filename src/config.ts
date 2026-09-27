@@ -9,6 +9,15 @@ const effort = z.union([
   z.const("ultra"),
 ]);
 
+// Keep the model field open for newer/custom Codex models while the Web
+// settings page offers the models known by the current App Server as choices.
+// `volatile()` makes the value live-editable through DSH Settings; the runtime
+// keeps the reference and reads its current snapshot for each new turn.
+const model = z.union([z.const(""), z.string()]);
+
+const conversionTransport = z.union([z.const("app-server"), z.const("cli")]);
+const conversionFallback = z.union([z.const("cli"), z.const("fail")]);
+
 const autoTriggerMode = z.union([
   z.const("off"),
   z.const("complex"),
@@ -18,10 +27,12 @@ const autoTriggerMode = z.union([
 export const Config = z.object({
   codexCommand: z.string().default("codex"),
   autoTriggerMode: autoTriggerMode.default("complex"),
-  plannerModel: z.string().default(""),
-  reviewerModel: z.string().default(""),
-  plannerEffort: effort.default("high"),
-  reviewerEffort: effort.default("high"),
+  plannerModel: model.default("").description("Planner 使用的 Codex 模型；留空跟随 App Server 默认模型").volatile(),
+  reviewerModel: model.default("").description("Reviewer 使用的 Codex 模型；留空跟随 App Server 默认模型").volatile(),
+  plannerEffort: effort.default("high").description("Planner 推理程度").volatile(),
+  reviewerEffort: effort.default("high").description("Reviewer 推理程度").volatile(),
+  conversionTransport: conversionTransport.default("app-server").description("结构化转换通道").volatile(),
+  conversionFallback: conversionFallback.default("cli").description("App Server 转换失败时的处理").volatile(),
   maxReviewCycles: z.number().default(3),
   maxNoChangeReviewRounds: z.number().default(1),
   reviewDiffMaxBytes: z.number().default(65536),

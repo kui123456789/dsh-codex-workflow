@@ -45,6 +45,12 @@ export interface AppServerLiveEvent {
   itemId: string;
   text: string;
   replace?: boolean;
+  /** Structured tool metadata retained for the native sidebar projection. */
+  command?: string;
+  cwd?: string;
+  exitCode?: number;
+  status?: string;
+  files?: string[];
 }
 
 export interface CodexAppServerOptions {
@@ -140,6 +146,8 @@ export interface ReviewStartOptions {
   cwd: string;
   target: JsonObject;
   detached: boolean;
+  model?: string;
+  effort?: ReasoningEffort;
   /** Called as soon as the reviewer thread and turn are known (and the thread
    * settings are applied), before waiting for the turn to finish. Lets the
    * caller persist the reviewer ids so cancellation can interrupt the run. */
@@ -606,6 +614,17 @@ export class CodexAppServerClient {
       await this.abandonTurn(reviewThreadId, turnId);
       throw error;
     }
+    // `review/start` creates the turn before the response arrives. The
+    // explicit model/effort must therefore be carried on the RPC target when
+    // supported, and on the follow-up turn settings for older servers.
+    if (options.model || options.effort) {
+      await this.request("turn/settings/update", {
+        threadId: reviewThreadId,
+        turnId,
+        ...(options.model ? { model: options.model } : {}),
+        ...(options.effort ? { reasoning_effort: options.effort } : {}),
+      }, signal).catch(() => undefined);
+    }
     this.attachProgress(this.state(reviewThreadId, turnId), options.onProgress);
     return { threadId: reviewThreadId, result: await this.waitForTurn(reviewThreadId, turnId, signal) };
   }
@@ -691,6 +710,16 @@ export class CodexAppServerClient {
       }
       await this.unsubscribeThread(forkThreadId).catch(() => undefined);
     }
+  }
+
+  /** Current visible App Server model catalog for the DSH settings surface. */
+  async listModels(signal?: AbortSignal): Promise<Array<{ id: string; name?: string; isDefault: boolean; defaultReasoningEffort?: string }>> {
+    return (await this.modelGateway.listVisibleModels(signal)).map((model) => ({
+      id: model.id,
+      ...(model.name ? { name: model.name } : {}),
+      isDefault: model.isDefault,
+      ...(model.defaultReasoningEffort ? { defaultReasoningEffort: model.defaultReasoningEffort } : {}),
+    }));
   }
 
   /** Convert directly on an ephemeral source thread. Ephemeral threads have
@@ -961,6 +990,7 @@ export class CodexAppServerClient {
       const label = liveToolLabel(item);
       if (label) this.emitProgress(this.state(params.threadId, params.turnId), {
         kind: "tool", itemId: typeof item.id === "string" ? item.id : "tool", text: label,
+        ...liveToolDetails(item),
       });
       return;
     }
@@ -982,7 +1012,9 @@ export class CodexAppServerClient {
         state.liveTexts.set(key, completedText);
       } else if (typeof item.id === "string" && liveToolLabel(item)) {
         this.emitProgress(state, { kind: "tool", itemId: item.id,
-          text: `${item.status === "failed" || (typeof item.exitCode === "number" && item.exitCode !== 0) ? " · 失败" : " · 完成"}${typeof item.exitCode === "number" ? ` (exit ${item.exitCode})` : ""}` });
+          text: `${item.status === "failed" || (typeof item.exitCode === "number" && item.exitCode !== 0) ? " · 失败" : " · 完成"}${typeof item.exitCode === "number" ? ` (exit ${item.exitCode})` : ""}`,
+          ...liveToolDetails(item),
+        });
       }
       return;
     }
@@ -1163,8 +1195,10 @@ export class CodexAppServerClient {
 
 function liveToolLabel(item: JsonObject): string | undefined {
   if (item.type === "commandExecution") {
-    const verb = typeof item.command === "string" ? item.command.trim().split(/\s+/)[0] : "";
-    return `命令 · ${verb ? verb.slice(0, 80) : "运行中"}`;
+    const command = typeof item.command === "string" ? item.command.trim() : "";
+    // Preserve quoted Windows paths and arguments so the sidebar does not
+    // turn `"C:\\Program Files\\..."` into the misleading `"C:\\Program`.
+    return `命令 · ${command ? command.slice(0, 8 * 1024) : "运行中"}`;
   }
   if (item.type === "mcpToolCall") {
     return `工具 · ${typeof item.server === "string" ? `${item.server}/` : ""}${typeof item.tool === "string" ? item.tool : "运行中"}`;
@@ -1173,6 +1207,24 @@ function liveToolLabel(item: JsonObject): string | undefined {
     return `工具 · ${typeof item.tool === "string" ? item.tool : "运行中"}`;
   }
   return undefined;
+}
+
+function liveToolDetails(item: JsonObject): Pick<AppServerLiveEvent, "command" | "cwd" | "exitCode" | "status" | "files"> {
+  const command = typeof item.command === "string" ? item.command.slice(0, 16 * 1024) : undefined;
+  const cwd = typeof item.cwd === "string" ? item.cwd.slice(0, 4096) : undefined;
+  const exitCode = typeof item.exitCode === "number" ? item.exitCode : undefined;
+  const status = typeof item.status === "string" ? item.status.slice(0, 128) : undefined;
+  const rawChanges = Array.isArray(item.changes) ? item.changes : Array.isArray(item.files) ? item.files : [];
+  const files = rawChanges.flatMap((entry) => {
+    if (typeof entry === "string") return [entry.slice(0, 4096)];
+    const value = object(entry);
+    return typeof value.path === "string" ? [value.path.slice(0, 4096)] : [];
+  }).slice(0, 256);
+  return {
+    ...(command ? { command } : {}), ...(cwd ? { cwd } : {}),
+    ...(exitCode !== undefined ? { exitCode } : {}), ...(status ? { status } : {}),
+    ...(files.length > 0 ? { files } : {}),
+  };
 }
 
 function turnResult(state: TurnState): TurnWaitResult | undefined {

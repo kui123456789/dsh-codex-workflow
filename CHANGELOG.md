@@ -2,6 +2,13 @@
 
 All notable changes to `dsh-codex-workflow`.
 
+## [1.1.13] - 2026-09-27
+
+- Added a DSH Built-in Plugins settings tab for Planner/Reviewer model and reasoning-effort selection.
+- Model and effort fields are live settings; new workflow turns pick up changes without restarting DSH.
+- Tool progress in the Codex Review fallback sidebar is grouped into collapsible sections, with full text retained inside each section.
+- Windows command activity keeps quoted paths and arguments visible instead of stopping at the first space.
+
 ## [1.1.12] - 2026-09-27
 
 - Planner and Reviewer runs now create native DSH child sessions with `origin: "subagent"`.

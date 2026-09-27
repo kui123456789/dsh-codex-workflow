@@ -657,7 +657,8 @@ test("visible Planner activity streams before the turn finishes", async () => {
     assert.equal(settled, false, "the model turn is still running");
     assert.ok(seen.some((entry) => entry.kind === "plan" && entry.text.includes("Implement")),
       "the readable plan must be visible before turn completion");
-    assert.ok(seen.some((entry) => entry.kind === "tool"), "a command activity is visible");
+    assert.ok(seen.some((entry) => entry.kind === "tool" && entry.text.includes("C:\\Program Files\\Codex")),
+      "the complete quoted Windows command is visible");
     await turn;
   } finally {
     await turn?.catch(() => undefined);

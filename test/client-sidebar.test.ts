@@ -7,7 +7,7 @@ import test from "node:test";
 test("planner projection opens Codex Review in the mounted DSH session", () => {
   let plugin: { apply(ctx: unknown): void } | undefined;
   const source = readFileSync(join(process.cwd(), "src/client.js"), "utf8");
-  runInNewContext(source, {
+  runInNewContext(source, { setTimeout, clearTimeout,
     window: { __ModuleLoader__: { load: (entry: { factory(require: (name: string) => unknown): { apply(ctx: unknown): void } }) => {
       plugin = entry.factory(() => ({ createElement: () => null }));
     } } },
@@ -23,7 +23,7 @@ test("planner projection opens Codex Review in the mounted DSH session", () => {
     slots: { inject: () => () => undefined },
     sidebarRight: {
       mounted: { getSnapshot: () => "session-1", subscribe: (listener: () => void) => { notifyMounted = listener; return () => undefined; } },
-      openTabIn: (sessionId: string, kind: string) => calls.push({ sessionId, kind }),
+      openTab: (kind: string) => calls.push({ sessionId: "session-1", kind }),
     },
     sessions: { binding: () => ({ session: { projections: { faceOf: () => face } } }) },
   };
@@ -37,7 +37,7 @@ test("planner projection opens Codex Review in the mounted DSH session", () => {
 test("planner child projection opens the native DSH subagent chat resource", () => {
   let plugin: { apply(ctx: unknown): void } | undefined;
   const source = readFileSync(join(process.cwd(), "src/client.js"), "utf8");
-  runInNewContext(source, {
+  runInNewContext(source, { setTimeout, clearTimeout,
     window: { __ModuleLoader__: { load: (entry: { factory(require: (name: string) => unknown): { apply(ctx: unknown): void } }) => {
       plugin = entry.factory(() => ({ createElement: () => null }));
     } } },
@@ -63,6 +63,99 @@ test("planner child projection opens the native DSH subagent chat resource", () 
   assert.equal(resources[0]!.options.kind, "subagentchat");
 });
 
+test("native open failure retries on the next projection notification without fallback", () => {
+  let plugin: { apply(ctx: unknown): void } | undefined;
+  const source = readFileSync(join(process.cwd(), "src/client.js"), "utf8");
+  runInNewContext(source, { setTimeout, clearTimeout,
+    window: { __ModuleLoader__: { load: (entry: { factory(require: (name: string) => unknown): { apply(ctx: unknown): void } }) => {
+      plugin = entry.factory(() => ({ createElement: () => null }));
+    } } },
+  });
+  assert.ok(plugin);
+  let attempts = 0;
+  let notifyProjection: (() => void) | undefined;
+  const projection = { currentWorkflowId: "workflow-1", plan: { workflowId: "workflow-1", childSessionId: "child-1", status: "planning", questions: [], assumptions: [] }, activeReview: null, reviews: [] };
+  const face = { getSnapshot: () => projection, subscribe: (listener: () => void) => { notifyProjection = listener; return () => undefined; } };
+  const ctx = {
+    sidebarRightTabs: { register: () => () => undefined }, slots: { inject: () => () => undefined },
+    sidebarRight: {
+      mounted: { getSnapshot: () => "parent-1", subscribe: () => () => undefined },
+      openResource: () => { attempts += 1; if (attempts === 1) throw new Error("seat not mounted"); },
+      openTab: () => { throw new Error("native failure must not fall back"); },
+    },
+    sessions: { binding: () => ({ session: { projections: { faceOf: () => face } } }) },
+  };
+  const dispose = plugin.apply(ctx) as unknown as (() => void) | undefined;
+  assert.equal(attempts, 1);
+  notifyProjection?.();
+  assert.equal(attempts, 2, "the next projection notification retries the native resource");
+  dispose?.();
+});
+
+test("late session binding is discovered and subscribed without stacking listeners", () => {
+  let plugin: { apply(ctx: unknown): void } | undefined;
+  const source = readFileSync(join(process.cwd(), "src/client.js"), "utf8");
+  runInNewContext(source, { setTimeout, clearTimeout,
+    window: { __ModuleLoader__: { load: (entry: { factory(require: (name: string) => unknown): { apply(ctx: unknown): void } }) => {
+      plugin = entry.factory(() => ({ createElement: () => null }));
+    } } },
+  });
+  assert.ok(plugin);
+  let bound = false;
+  let subscriptions = 0;
+  let openCount = 0;
+  let notifyMounted: (() => void) | undefined;
+  const projection = { currentWorkflowId: "workflow-1", plan: { workflowId: "workflow-1", childSessionId: "child-1", status: "planning", questions: [], assumptions: [] }, activeReview: null, reviews: [] };
+  const face = { getSnapshot: () => projection, subscribe: () => { subscriptions += 1; return () => undefined; } };
+  const ctx = {
+    sidebarRightTabs: { register: () => () => undefined }, slots: { inject: () => () => undefined },
+    sidebarRight: {
+      mounted: { getSnapshot: () => "parent-1", subscribe: (listener: () => void) => { notifyMounted = listener; return () => undefined; } },
+      openResource: () => { openCount += 1; }, openTab: () => { throw new Error("fallback must not be used"); },
+    },
+    sessions: { binding: () => bound ? ({ session: { projections: { faceOf: () => face } } }) : undefined },
+  };
+  const dispose = plugin.apply(ctx) as unknown as (() => void) | undefined;
+  bound = true;
+  notifyMounted?.();
+  notifyMounted?.();
+  assert.equal(openCount, 1);
+  assert.equal(subscriptions, 1, "the same projection face is subscribed only once");
+  dispose?.();
+});
+
+test("fallback open is retried after the mounted seat is replaced", () => {
+  let plugin: { apply(ctx: unknown): void } | undefined;
+  const source = readFileSync(join(process.cwd(), "src/client.js"), "utf8");
+  runInNewContext(source, { setTimeout, clearTimeout,
+    window: { __ModuleLoader__: { load: (entry: { factory(require: (name: string) => unknown): { apply(ctx: unknown): void } }) => {
+      plugin = entry.factory(() => ({ createElement: () => null }));
+    } } },
+  });
+  assert.ok(plugin);
+  let mounted: string | undefined = "session-1";
+  let notifyMounted: (() => void) | undefined;
+  let calls = 0;
+  const projection = { currentWorkflowId: "workflow-1", plan: { workflowId: "workflow-1", status: "planning", questions: [], assumptions: [] }, activeReview: null, reviews: [] };
+  const face = { getSnapshot: () => projection, subscribe: () => () => undefined };
+  const ctx = {
+    sidebarRightTabs: { register: () => () => undefined }, slots: { inject: () => () => undefined },
+    sidebarRight: {
+      mounted: { getSnapshot: () => mounted, subscribe: (listener: () => void) => { notifyMounted = listener; return () => undefined; } },
+      openTab: () => { calls += 1; if (calls === 1) throw new Error("seat replaced"); },
+    },
+    sessions: { binding: () => ({ session: { projections: { faceOf: () => face } } }) },
+  };
+  const dispose = plugin.apply(ctx) as unknown as (() => void) | undefined;
+  assert.equal(calls, 1);
+  mounted = undefined;
+  notifyMounted?.();
+  mounted = "session-1";
+  notifyMounted?.();
+  assert.equal(calls, 2, "fallback key remains retryable after a failed/unmounted open");
+  dispose?.();
+});
+
 test("sidebar body renders Planner and Reviewer activity while they are running", () => {
   let plugin: { apply(ctx: unknown): void } | undefined;
   const source = readFileSync(join(process.cwd(), "src/client.js"), "utf8");
@@ -70,9 +163,10 @@ test("sidebar body renders Planner and Reviewer activity while they are running"
     if (typeof type === "function") return type({ ...props, children });
     return { type, props, children };
   };
-  runInNewContext(source, { window: { __ModuleLoader__: { load: (entry: { factory(require: (name: string) => unknown): { apply(ctx: unknown): void } }) => {
+  runInNewContext(source, { setTimeout, clearTimeout, window: { __ModuleLoader__: { load: (entry: { factory(require: (name: string) => unknown): { apply(ctx: unknown): void } }) => {
     plugin = entry.factory(() => ({ createElement: h, useSyncExternalStore: (_subscribe: unknown, getSnapshot: () => unknown) => getSnapshot(),
-      useRef: (initial: unknown) => ({ current: initial }), useEffect: () => undefined }));
+      useRef: (initial: unknown) => ({ current: initial }), useEffect: () => undefined,
+      useState: (initial: unknown) => [initial, () => undefined], useMemo: (factory: () => unknown) => factory() }));
   } } } });
   assert.ok(plugin);
   let body: ((props: unknown) => unknown) | undefined;
@@ -86,11 +180,94 @@ test("sidebar body renders Planner and Reviewer activity while they are running"
   const ctx = { sidebarRightTabs: { register: () => () => undefined },
     slots: { inject: (_name: string, register: () => void) => { register(); return () => undefined; },
       register: (_definition: unknown, component: (props: unknown) => unknown) => { body ??= component; return () => undefined; } },
-    sidebarRight: { mounted: { getSnapshot: () => "session-1", subscribe: () => () => undefined }, openTabIn: () => undefined },
+    sidebarRight: { mounted: { getSnapshot: () => "session-1", subscribe: () => () => undefined }, openTab: () => undefined },
     sessions: { binding: () => ({ session: { projections: { faceOf: () => face } } }) } };
-  plugin.apply(ctx);
+  const dispose = plugin.apply(ctx) as unknown as (() => void) | undefined;
   assert.ok(body);
   const rendered = JSON.stringify(body({ projectionFace: face, useTabInfo: () => ({}) }));
   assert.match(rendered, /正在生成计划/);
   assert.match(rendered, /正在检查改动/);
+  dispose?.();
+});
+
+test("settings tab exposes model and reasoning-effort selectors", () => {
+  let plugin: { apply(ctx: unknown): void } | undefined;
+  let settingsBody: ((props: unknown) => unknown) | undefined;
+  const source = readFileSync(join(process.cwd(), "src/client.js"), "utf8");
+  const h = (type: unknown, props: Record<string, unknown> | null, ...children: unknown[]): unknown => {
+    if (typeof type === "function") return type({ ...props, children });
+    return { type, props, children };
+  };
+  runInNewContext(source, { setTimeout, clearTimeout, window: { __ModuleLoader__: { load: (entry: { factory(require: (name: string) => unknown): { apply(ctx: unknown): void } }) => {
+    plugin = entry.factory(() => ({ createElement: h,
+      useSyncExternalStore: (_subscribe: unknown, getSnapshot: () => unknown) => getSnapshot(),
+      useMemo: (factory: () => unknown) => factory(), useState: (initial: unknown) => [initial, () => undefined],
+      useRef: (initial: unknown) => ({ current: initial }), useEffect: () => undefined }));
+  } } } });
+  assert.ok(plugin);
+  const form = {
+    getSnapshot: () => ({ status: "ready", value: { plannerModel: "gpt-6-sol", plannerEffort: "medium", reviewerModel: "", reviewerEffort: "high" }, writable: true }),
+    subscribe: () => () => undefined,
+    set: async () => true,
+  };
+  const ctx = {
+    configForms: { get: () => form },
+    sidebarRightTabs: { register: () => () => undefined },
+    slots: {
+      inject: (_name: string, register: () => void) => { register(); return () => undefined; },
+      register: (definition: { name?: string }, component: (props: unknown) => unknown) => {
+        if (definition.name === "settings.plugins.tab") settingsBody = component;
+        return () => undefined;
+      },
+    },
+    sidebarRight: { mounted: { getSnapshot: () => undefined, subscribe: () => () => undefined } },
+    sessions: { binding: () => undefined },
+  };
+  const dispose = plugin.apply(ctx) as unknown as (() => void) | undefined;
+  assert.ok(settingsBody);
+  const rendered = JSON.stringify(settingsBody({ configForm: form }));
+  assert.match(rendered, /gpt-6-sol/);
+  assert.match(rendered, /Planner 推理程度/);
+  assert.match(rendered, /medium/);
+  dispose?.();
+});
+
+test("settings tab renders an explicit state when the Host form is not ready", () => {
+  let plugin: { apply(ctx: unknown): void } | undefined;
+  let settingsBody: ((props: unknown) => unknown) | undefined;
+  let settingsProps: unknown;
+  const source = readFileSync(join(process.cwd(), "src/client.js"), "utf8");
+  const h = (type: unknown, props: Record<string, unknown> | null, ...children: unknown[]): unknown => {
+    if (typeof type === "function") return type({ ...props, children });
+    return { type, props, children };
+  };
+  runInNewContext(source, { setTimeout, clearTimeout, window: { __ModuleLoader__: { load: (entry: { factory(require: (name: string) => unknown): { apply(ctx: unknown): void } }) => {
+    plugin = entry.factory(() => ({ createElement: h,
+      useSyncExternalStore: (_subscribe: unknown, getSnapshot: () => unknown) => getSnapshot(),
+      useMemo: (factory: () => unknown) => factory(), useState: (initial: unknown) => [initial, () => undefined],
+      useRef: (initial: unknown) => ({ current: initial }), useEffect: () => undefined }));
+  } } } });
+  assert.ok(plugin);
+  const ctx = {
+    configForms: { get: () => { throw new Error("settings form is still loading"); } },
+    sidebarRightTabs: { register: () => () => undefined },
+    slots: {
+      inject: (_name: string, register: () => void) => { register(); return () => undefined; },
+      register: (definition: { name?: string; inject?: () => unknown }, component: (props: unknown) => unknown) => {
+        if (definition.name === "settings.plugins.tab") {
+          settingsBody = component;
+          settingsProps = definition.inject?.();
+        }
+        return () => undefined;
+      },
+    },
+    sidebarRight: { mounted: { getSnapshot: () => undefined, subscribe: () => () => undefined } },
+    sessions: { binding: () => undefined },
+  };
+  const dispose = plugin.apply(ctx) as unknown as (() => void) | undefined;
+  assert.ok(settingsBody);
+  const rendered = JSON.stringify(settingsBody(settingsProps));
+  assert.match(rendered, /当前宿主没有开放可写的插件设置/);
+  assert.match(rendered, /Planner 模型/);
+  dispose?.();
 });

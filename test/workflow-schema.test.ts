@@ -36,11 +36,14 @@ test("workflow schema v1 -> v2 migration preserves grouped state and is idempote
 });
 
 test("workflow schema serializer round-trips v1 and accepts legacy flat JSON", () => {
-  const original = record({ desktopOpenState: "disabled", error: "retryable" });
+  const original = record({ desktopOpenState: "disabled", error: "retryable", reviewPhaseTimings: {
+    review_conversion: { startedAt: "2026-09-25T00:00:02.000Z", endedAt: "2026-09-25T00:00:03.000Z", elapsedMs: 1000 },
+  } });
   const encoded = serializeWorkflowRecord(original);
   const parsed = JSON.parse(encoded) as Record<string, unknown>;
   assert.equal(parsed.schemaVersion, 2);
   assert.equal((parsed.desktop as Record<string, unknown>).desktopOpenState, "disabled");
+  assert.deepEqual((parsed.execution as Record<string, unknown>).reviewPhaseTimings, original.reviewPhaseTimings);
   assert.deepEqual(deserializeWorkflowRecord(parsed), original);
   assert.deepEqual(deserializeWorkflowRecord(original), original);
 });

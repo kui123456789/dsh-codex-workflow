@@ -47,6 +47,7 @@ export const CONVERSION_DEVELOPER_INSTRUCTIONS = [
 export const SILENT_REVIEW_PROMPT_BLOCK =
   "Review SILENTLY: produce no commentary, progress, or intermediate messages and no sub-task or delegation; "
   + "do not create, fork, or delegate to any other task. Run only necessary read-only inspection. "
+  + "If the original task or approved plan explicitly forbids an action, never report the absence of that forbidden action as a finding or test gap. "
   + "Output exactly ONE final message: your complete readable review.";
 
 /** Deterministic CJK probe: a Chinese original task/plan requires the final
