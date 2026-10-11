@@ -46,6 +46,68 @@ dsh plugin --profile web add dsh-codex-workflow
 Restart the DSH web profile after installation. For source installs during
 development, pass the local project directory to the same command.
 
+## Existing Desktop hosts on macOS/Linux
+
+Install this package through the existing Desktop's plugin manager and restart
+that same host. Keep `DSH_HOME` set to that application's actual Harness data
+root, not a second CLI profile. The bridge talks to the running plugin's local
+SQLite queue; invoking the bridge CLI does not start a DSH host.
+
+For a plugin installed only inside a Desktop profile, invoke its shipped CLI
+with a configured profile name and your Node executable:
+
+```sh
+export DSH_HOME="<existing-desktop-harness-data-root>"
+export DSH_PROFILE="<profile-name>"
+node "$DSH_HOME/profiles/$DSH_PROFILE/node_modules/dsh-codex-workflow/lib/bridge-cli.js" \
+  sessions --cwd "$PWD" --json
+```
+
+Use this entrypoint for the entire Desktop lifecycle. With the existing Desktop
+running and the plugin loaded, create or resume a dedicated worker without UI:
+
+```sh
+printf '%s' '{"action":"ensure_session","preset":"codex-bridge"}' | \
+  dsh-codex-workflow control --cwd "$PWD" --codex-thread "$CODEX_THREAD_ID" --stdin --json
+```
+
+Poll `status --request <id> --json` and use `receipt.data.sessionId` as the explicit
+`dispatch --dsh-session` target. Identity is stable per genuine source Codex
+thread, canonical absolute cwd and exact preset; it does not adopt user sessions.
+Requires the public `agentPresets`, `agentDefaultModel` and `sessionQuery` services.
+Absolute POSIX paths support spaces and Unicode; case and literal backslashes
+remain significant on POSIX.
+
+Use `control` with stdin JSON and the same cwd/source for subsequent operations:
+
+- `{"action":"result","workflowId":"<id>"}` returns bounded assistant text,
+  last turn-end reason, live status, workflow phase and full review.
+- `{"action":"followup","workflowId":"<id>","message":"<bounded correction>"}`
+  sends a deduplicated followup only to that workflow's active owner.
+- `{"action":"cancel","workflowId":"<id>"}` requests cancellation; poll result
+  until phase is `cancelled` **and** status is `idle` before taking over.
+- `{"action":"read_session","preset":"codex-bridge"}` checks the dedicated worker.
+
+Result text excludes reasoning/tool output and unrelated later inputs; generated
+context and verified same-workflow review relays do not truncate the result.
+Receipt delivery or idle alone is not success: inspect turn completion, review,
+and actual files/checks. Routine session creation, input, result reads, corrections
+and cancellation must use this protocol, including on failure. UI is limited to
+app startup, plugin installation/loading/configuration and human login/approval.
+Protocol failures are blockers, never permission for GUI or headless fallback.
+
+The two workflow directions above intentionally keep Codex planning/review
+read-only while DSH implements. For a separate, general DSH-to-Codex task,
+install the official `@deepseek-ai/dsh-subagent-codex` bundle in the same host
+and expose its `subagent_codex` tool in a copied Agent Preset, following that
+bundle's documentation. Do not assume existing sessions acquire new tools.
+Its bundled native Codex version may have a different supported model catalogue
+from a newer standalone CLI; choose a supported model from the native
+`model/list` and configure the provider, `plannerModel`, and `reviewerModel`
+explicitly when needed. Preserve native authentication, sandbox and approval
+settings. Bound reverse calls to one self-contained task and prohibit recursive
+DSH/Codex delegation.
+
 ## Build and verify
 
 ```powershell
@@ -61,12 +123,12 @@ pnpm doctor
 From the Codex task that owns the plan, dispatch it to the live DSH session:
 
 ```powershell
-# 1. Find the live DSH session for this workspace
-dsh-codex-workflow sessions --cwd $PWD --json
+# 1. Ensure the dedicated session and collect its receipt.data.sessionId
+'{"action":"ensure_session","preset":"codex-bridge"}' | dsh-codex-workflow control --cwd $PWD --codex-thread $env:CODEX_THREAD_ID --stdin --json
 
 # 2. Dispatch the plan (payload enters through stdin, never arguments)
 $payload = '{"task":"实现搜索功能","planMarkdown":"<proposed_plan>…</proposed_plan>","assumptions":[]}'
-$payload | dsh-codex-workflow dispatch --cwd $PWD --codex-thread $env:CODEX_THREAD_ID --stdin
+$payload | dsh-codex-workflow dispatch --cwd $PWD --dsh-session <receipt-session-id> --codex-thread $env:CODEX_THREAD_ID --stdin
 ```
 
 The bridge resolves the exact session (explicit `--dsh-session` wins; otherwise the cwd must match exactly one live session, and ambiguity fails loudly). DSH receives the plan as a plugin relay message and implements it. When done, DSH calls `codex_workflow_submit`; the plugin validates the **exact stored Codex task id** read-only, then runs the readable audit on the workflow's **dedicated Reviewer task** — the originating task is never resumed and never written:
@@ -91,7 +153,15 @@ dedicated Reviewer task --codex exec --ephemeral --output-schema--> normalizatio
 
 ### Reviewer writer-lock semantics
 
-Before an App Server review turn, the plugin `thread/resume`s the dedicated Reviewer task (`reviewerThreadId` — always a dedicated, visible task since 1.1.2) and releases it again (`thread/unsubscribe`) when the operation settles; a legacy `exec` task is never resumed at all, it is only renamed with `thread/name/set`, which takes no writer lock. Idempotent cleanup only: the plugin does not re-subscribe for display, read/fork the task for rendering, or invoke the Desktop opener. The review remains on that Reviewer task; users open it manually when convenient. Legacy opener fields remain compatible but audit records keep `desktopOpenState: "disabled"`.
+A newly created Reviewer already owns the subscription returned by
+`thread/start`; its first callback turn runs directly, without `thread/resume`.
+Before that first turn there is no rollout to read. The empty `thread/start`
+history supplies the initial baseline only while this client still holds the
+fresh thread. Starting a turn, resuming, releasing, or stopping the process
+invalidates that baseline. Completed results and later baselines still require
+real persisted history; missing existing rollouts are never treated as empty.
+
+For a later App Server review turn, the plugin `thread/resume`s the dedicated Reviewer task (`reviewerThreadId` — always a dedicated, visible task since 1.1.2) and releases it again (`thread/unsubscribe`) when the operation settles; a legacy `exec` task is never resumed at all, it is only renamed with `thread/name/set`, which takes no writer lock. Idempotent cleanup only: the plugin does not re-subscribe for display, read/fork the task for rendering, or invoke the Desktop opener. The review remains on that Reviewer task; users open it manually when convenient. Legacy opener fields remain compatible but audit records keep `desktopOpenState: "disabled"`.
 
 **A visible Reviewer can be held by Codex Desktop — and that is retried (1.1.3).** Because the Reviewer task is now renderable, OPENING it in Desktop makes Desktop hold that task's writer lock, and the next round's `thread/resume` fails with `thread <id> already has an active writer` until the user closes it. The control RPCs (create, configure, resume, per-round settings refresh) therefore run under the same bounded transient policy as every visible turn: they back off and continue, a spent budget keeps the round RETRYABLE (no cycle, no `reviewContractFailures`; on the callback path `retryable_busy` plus the periodic recovery sweep), and cancel/teardown interrupts a pending backoff at once. The plugin never releases a lock it does not own: a FAILED `thread/resume` acquired nothing, and a successful resume whose settings refresh failed releases only the plugin's OWN subscription before backing off, so a retry can never be blocked by the plugin's own hold. Reviewer creation is retried on the SAME task id (`thread/start` runs once; a retry re-configures it), so a flaky settings/name call cannot leak one orphan task per attempt.
 

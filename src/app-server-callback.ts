@@ -195,8 +195,8 @@ export class AppServerCodexCallbackDispatcher {
     const key = `${request.workflowId}:${request.submissionId}`;
     let reviewerThreadId: string | undefined;
     // True only once THIS invocation owns an App Server subscription to the
-    // task carrying the review. The claim is acquired only after resume
-    // succeeds, so a pre-turn failure cannot release another review's hold.
+    // task carrying the review. thread/start already claims a new Reviewer;
+    // only an existing Reviewer needs resume. Failed resume acquires no hold.
     let claimed = false;
     try {
       reviewerThreadId = request.reviewerThreadId;
@@ -218,7 +218,7 @@ export class AppServerCodexCallbackDispatcher {
       // instead of becoming a terminal callback failure.
       try {
         if (!reviewerThreadId) reviewerThreadId = await this.createReviewer(request, signal);
-        await this.resumeReviewer(reviewerThreadId, request.cwd, signal);
+        else await this.resumeReviewer(reviewerThreadId, request.cwd, signal);
       } catch (error) {
         // A task THIS invocation just created is bound to nothing and owned by
         // nobody — release its hold instead of leaving an orphaned subscription
@@ -235,7 +235,7 @@ export class AppServerCodexCallbackDispatcher {
       this.trackThreadRef(reviewerThreadId, 1);
       claimed = true;
       if (created) {
-        // Persist the dedicated identity only after the resume succeeded. A
+        // Persist the dedicated identity only after creation succeeded. A
         // failed creation/resume leaves the record unbound and retryable
         // instead of storing a stale reviewer id.
         await request.onThread?.(reviewerThreadId);

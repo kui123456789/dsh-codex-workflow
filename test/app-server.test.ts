@@ -1167,3 +1167,37 @@ async function waitForProcessExit(pid: number): Promise<void> {
   }
   throw new Error(`timed out waiting for process ${pid} to exit`);
 }
+
+
+test("fresh Reviewer baseline precedes rollout creation; later baselines read persisted history", async () => {
+  const codex = new CodexAppServerClient({
+    command: process.execPath, args: [fixture], requestTimeoutMs: 5_000, idleProcessMs: 0,
+    env: { ...process.env, FAKE_CODEX_READ_REQUIRES_ROLLOUT: "1" },
+  });
+  try {
+    const id = await codex.startReviewerThreadShell({ cwd: process.cwd(), name: "Fresh baseline" });
+    await assert.rejects(codex.readThread(id, true), /missing source rollout/);
+    const baseline = await codex.captureTurnBaseline(id);
+    assert.deepEqual(baseline, { ids: [] });
+    const result = await codex.startTurn(id, { prompt: "Review it" });
+    assert.equal(result.kind, "completed");
+    const persisted = await codex.readAppendedTurnText(id, baseline);
+    assert.ok(persisted?.text, "final answer still requires actual persisted history");
+    const later = await codex.captureTurnBaseline(id);
+    assert.equal(later.ids.length, 1);
+    await assert.rejects(codex.captureTurnBaseline("unknown-thread"), /missing source rollout/);
+  } finally { await codex.stop(); }
+});
+
+test("releasing a fresh Reviewer invalidates its empty baseline", async () => {
+  const codex = new CodexAppServerClient({
+    command: process.execPath, args: [fixture], requestTimeoutMs: 5_000, idleProcessMs: 0,
+    env: { ...process.env, FAKE_CODEX_READ_REQUIRES_ROLLOUT: "1" },
+  });
+  try {
+    const id = await codex.startReviewerThreadShell({ cwd: process.cwd(), name: "Fresh baseline" });
+    assert.deepEqual(await codex.captureTurnBaseline(id), { ids: [] });
+    await codex.unsubscribeThread(id);
+    await assert.rejects(codex.captureTurnBaseline(id), /missing source rollout/);
+  } finally { await codex.stop(); }
+});

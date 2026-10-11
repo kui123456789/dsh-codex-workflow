@@ -187,6 +187,10 @@ function handleClientRequest(message) {
     { name: "Default", mode: "default", model: null, reasoning_effort: null },
   ] } });
   if (method === "thread/read") {
+    if (params.includeTurns === true && process.env.FAKE_CODEX_READ_REQUIRES_ROLLOUT === "1"
+      && (threadTurnHistory.get(params.threadId) ?? []).length === 0) {
+      return send({ id, error: { code: -32000, message: "invalid paginated history lineage: missing source rollout" } });
+    }
     if (process.env.FAKE_CODEX_MISSING_SOURCE === "1") {
       return send({ id, error: { code: -32000, message: `no rollout found for thread id ${params.threadId}` } });
     }
@@ -203,7 +207,7 @@ function handleClientRequest(message) {
     const threadId = `thread-${++threadCounter}`;
     subscribed.add(threadId);
     knownThreads.add(threadId);
-    return send({ id, result: { thread: { id: threadId, preview: "", modelProvider: "openai", createdAt: 1 } } });
+    return send({ id, result: { thread: { id: threadId, preview: "", modelProvider: "openai", createdAt: 1, turns: [] } } });
   }
   if (method === "thread/fork") {
     // Deterministic cancel-window seam: when FAKE_CODEX_FORK_GATE_FILE is

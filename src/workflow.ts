@@ -2072,7 +2072,10 @@ export class WorkflowManager {
    * cancel fall back to the persisted planner/reviewer pair.
    */
   async cancel(workflowId: string, exec: ToolRunContext): Promise<WorkflowRecord> {
-    const agent = requireAgent(exec);
+    return this.cancelForAgent(workflowId, requireAgent(exec), exec.signal);
+  }
+
+  async cancelForAgent(workflowId: string, agent: Agent, signal: AbortSignal): Promise<WorkflowRecord> {
     const active = this.activeTurns.get(workflowId);
     let target: { threadId: string; turnId: string } | undefined;
     const outcome = await this.store.update(workflowId, (r) => {
@@ -2116,7 +2119,7 @@ export class WorkflowManager {
     this.stopReviewHeartbeat(workflowId);
     if (active) target = { threadId: active.threadId, turnId: active.turnId };
     if (target) {
-      await this.codex.interrupt(target.threadId, target.turnId, exec.signal).catch(() => undefined);
+      await this.codex.interrupt(target.threadId, target.turnId, signal).catch(() => undefined);
     }
     // Cancel the active Reviewer operation, if any; cancelled is terminal for it too.
     if (outcome.record.submissionId) {

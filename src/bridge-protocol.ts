@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { posix } from "node:path";
 import type { ReviewResult } from "./types.js";
 
 export const BRIDGE_PROTOCOL_VERSION = 1;
 export const BRIDGE_MAX_PAYLOAD_BYTES = 1024 * 1024;
 
-export type BridgeCommand = DispatchPlanCommand | SubmitVerdictCommand | SubmissionNoticeCommand;
+export type BridgeCommand = DispatchPlanCommand | SubmitVerdictCommand | SubmissionNoticeCommand | DesktopControlCommand;
 
 export interface DispatchPlanCommand {
   version: 1;
@@ -46,6 +47,20 @@ export interface SubmissionNoticeCommand {
   dshSessionId: string;
   level: "error";
   message: string;
+}
+
+/** Lifecycle commands handled inside the existing Desktop, never a second host. */
+export interface DesktopControlCommand {
+  version: 1;
+  kind: "desktop_control";
+  requestId: string;
+  createdAt: string;
+  codexThreadId: string;
+  target: { cwd: string; dshSessionId?: string };
+  action: "ensure_session" | "read_session" | "followup" | "cancel" | "result";
+  preset?: string;
+  workflowId?: string;
+  message?: string;
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -91,7 +106,7 @@ function parseTarget(value: unknown): { dshSessionId?: string; cwd: string } {
   if (!isPlainObject(value)) fail("target must be an object");
   const cwd = requireString(value.cwd, "target.cwd", true);
   const cwdPath = cwd.replace(/\//g, "\\");
-  if (!/^[a-zA-Z]:\\/.test(cwdPath)) fail("target.cwd must be an absolute Windows path");
+  if (!posix.isAbsolute(cwd) && !/^[a-zA-Z]:\\/.test(cwdPath)) fail("target.cwd must be an absolute path");
   const result: { dshSessionId?: string; cwd: string } = { cwd };
   if (value.dshSessionId !== undefined) {
     result.dshSessionId = requireString(value.dshSessionId, "target.dshSessionId", true);
@@ -215,9 +230,38 @@ export function parseSubmissionNoticeCommand(value: unknown): SubmissionNoticeCo
   return command;
 }
 
+export function parseDesktopControlCommand(value: unknown): DesktopControlCommand {
+  if (!isPlainObject(value)) fail("desktop_control must be an object");
+  if (value.version !== 1 || value.kind !== "desktop_control") fail("invalid desktop_control envelope");
+  const action = value.action;
+  if (action !== "ensure_session" && action !== "read_session" && action !== "followup" && action !== "cancel" && action !== "result") fail("unknown desktop action");
+  const command: DesktopControlCommand = {
+    version: 1, kind: "desktop_control", action,
+    requestId: requireUuid(value.requestId, "requestId"),
+    createdAt: requireIsoDate(value.createdAt, "createdAt"),
+    codexThreadId: requireUuid(value.codexThreadId, "codexThreadId"),
+    target: parseTarget(value.target),
+  };
+  if (action === "ensure_session" || action === "read_session") {
+    command.preset = requireString(value.preset, "preset", true);
+    if (command.target.dshSessionId) fail("dedicated session identity is derived from source/cwd/preset");
+    if (value.workflowId !== undefined || value.message !== undefined) fail("unexpected session control payload");
+  } else {
+    command.workflowId = requireUuid(value.workflowId, "workflowId");
+    if (value.preset !== undefined) fail("unexpected workflow preset");
+    if (action === "followup") command.message = requireString(value.message, "message", true);
+    else if (value.message !== undefined) fail("unexpected workflow message");
+  }
+  for (const key of Object.keys(value)) {
+    if (!["version", "kind", "requestId", "createdAt", "codexThreadId", "target", "action", "preset", "workflowId", "message"].includes(key)) fail(`unknown desktop_control field ${key}`);
+  }
+  return command;
+}
+
 export function parseBridgeCommand(value: unknown): BridgeCommand {
   if (!isPlainObject(value)) fail("command must be an object");
   if (value.version !== BRIDGE_PROTOCOL_VERSION) fail("unsupported version");
+  if (value.kind === "desktop_control") return parseDesktopControlCommand(value);
   if (value.kind === "dispatch_plan") return parseDispatchPlanCommand(value);
   if (value.kind === "submit_verdict") return parseSubmitVerdictCommand(value);
   if (value.kind === "submission_notice") return parseSubmissionNoticeCommand(value);

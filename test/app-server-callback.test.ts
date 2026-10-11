@@ -107,7 +107,7 @@ test("a non-transient visible review turn failure stays terminal", async () => {
   }
 });
 
-test("a NEWLY created Reviewer whose resume fails is released; a pre-existing one never is", async () => {
+test("a fresh Reviewer runs before any rollout exists; failed existing resume owns no hold", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-app-server-callback-orphan-"));
   const marker = join(directory, "calls.jsonl");
   // `FAKE_CODEX_ROLLOUT_REQUIRED` makes `thread/resume` fail for any task that
@@ -117,25 +117,30 @@ test("a NEWLY created Reviewer whose resume fails is released; a pre-existing on
     args: [fixture],
     requestTimeoutMs: 5_000,
     idleProcessMs: 0,
-    env: { ...process.env, FAKE_CODEX_THREAD_PARAMS_MARKER: marker, FAKE_CODEX_ROLLOUT_REQUIRED: "1" },
+    env: { ...process.env, FAKE_CODEX_THREAD_PARAMS_MARKER: marker, FAKE_CODEX_ROLLOUT_REQUIRED: "1", FAKE_CODEX_READ_REQUIRES_ROLLOUT: "1", FAKE_CODEX_PLAIN_REVIEW_MARKDOWN: "1" },
   });
   const callback = new AppServerCodexCallbackDispatcher(codex);
   const readCalls = async () => (await readFile(marker, "utf8")).trim().split("\n").filter(Boolean)
     .map((line) => JSON.parse(line) as { method: string; params: Record<string, any> });
   try {
-    // (a) The task THIS invocation created could not be resumed: it is bound to
-    // nothing and owned by nobody, so its hold is released — no orphan.
-    await assert.rejects(callback.send({
+    // (a) thread/start already holds the new Reviewer; no resume or history
+    // RPC may require its nonexistent rollout before the first visible turn.
+    const freshOutcome = await callback.send({
       workflowId: "workflow-orphan",
       submissionId: "submission-orphan",
       codexThreadId: "origin-task-orphan",
       cwd: directory,
       prompt: "Review this implementation.",
-    }));
+    });
+    assert.equal(freshOutcome.kind, "verdict", JSON.stringify(freshOutcome));
     const created = await readCalls();
+    assert.equal(created.filter((call) => call.method === "thread/resume").length, 0);
     assert.equal(created.filter((call) => call.method === "thread/start").length, 1, "the review created its own Reviewer");
     const unsubs = created.filter((call) => call.method === "thread/unsubscribe");
-    assert.equal(unsubs.length, 1, "the orphaned created task is released exactly once");
+    const reviewerId = created.find((call) => call.method === "thread/start")!.params.threadId
+      ?? created.find((call) => call.method === "thread/name/set")!.params.threadId;
+    assert.equal(unsubs.filter((call) => call.params.threadId === reviewerId).length, 1,
+      "the completed new Reviewer is released exactly once");
     assert.ok(unsubs[0]!.params.threadId, "the released task is the one that was created");
 
     // (b) An ALREADY BOUND Reviewer that fails to resume belongs to a workflow
@@ -331,7 +336,7 @@ test("creates and reuses a dedicated Reviewer task for every background review, 
     assert.ok(forks.every((call) => call.params.threadId === reviewerThreadId), "forks are created from the dedicated Reviewer task");
     assert.ok(forks.every((call) => call.params.cwd === directory), "forks bind the workflow cwd");
 
-    assert.equal(resumes.length, 2, "each review resumes the dedicated Reviewer task before writing its visible turn");
+    assert.equal(resumes.length, 1, "only the later review resumes its existing Reviewer; creation already owns the first hold");
     assert.ok(resumes.every((call) => call.params.threadId === reviewerThreadId));
 
     // FOUR turns per two cycles: two VISIBLE review turns (no outputSchema,
@@ -625,11 +630,10 @@ test("a PERSISTED read-back that still violates after the rewrite is retryable i
     // The still-violating persisted rewrite is retryable: no conversion fork,
     // no pass verdict can ride a violating history.
     assert.equal(calls.filter((call) => call.method === "thread/fork").length, 0, "no conversion fork ran");
-    // Two BASELINE captures (before native and rewrite) + two APPENDED
-    // read-backs (native and rewrite): every visible turn is audited against
-    // the persisted history.
+    // The new thread/start supplies the first baseline; the rewrite baseline
+    // and both final results still come from actual persisted history.
     const readbacks = calls.filter((call) => call.method === "thread/read" && call.params.includeTurns === true);
-    assert.equal(readbacks.length, 4, "native + rewrite baselines and appended read-backs");
+    assert.equal(readbacks.length, 3, "fresh native baseline uses thread/start; rewrite baseline and both results read persisted history");
   } finally {
     await callback.stop();
     await codex.stop();

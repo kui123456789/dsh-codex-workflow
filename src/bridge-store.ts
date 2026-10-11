@@ -21,6 +21,8 @@ export interface BridgeReceipt {
   requestId: string;
   status: "delivered" | "duplicate" | "no_such_workflow" | "cancelled" | "failed" | "rejected";
   workflowId?: string;
+  /** Explicitly requested, bounded local worker output; never tool traces or reasoning. */
+  data?: Record<string, unknown>;
   deliveredAt?: string;
   error?: string;
   /** SHA-256 of the canonical command JSON, recorded so a later enqueue with
@@ -180,6 +182,7 @@ export class BridgeStore {
       status: result.status,
       commandHash: result.commandHash ?? commandHash(claim.command),
       ...(result.workflowId ? { workflowId: result.workflowId } : {}),
+      ...(result.data ? { data: result.data } : {}),
       deliveredAt: result.deliveredAt ?? new Date().toISOString(),
       ...(result.error ? { error: result.error } : {}),
     };

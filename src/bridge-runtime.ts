@@ -2,9 +2,11 @@ import { mkdir, rename, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import type { Agent } from "@deepseek-ai/dsh-agent";
+import type { SessionEvent } from "@deepseek-ai/dsh-session";
+import { dedicatedSessionId, workerOutput } from "./desktop-control.js";
 import { MessageId, createUserMessage, freezeMessage, type UserMessage } from "@deepseek-ai/dsh-llm";
 import { cwdKey } from "./coordination.js";
-import type { DispatchPlanCommand, SubmissionNoticeCommand, SubmitVerdictCommand, BridgeCommand } from "./bridge-protocol.js";
+import type { DesktopControlCommand, DispatchPlanCommand, SubmissionNoticeCommand, SubmitVerdictCommand, BridgeCommand } from "./bridge-protocol.js";
 import { relaySource } from "./message-source.js";
 import type { BridgeStore, ClaimedBridgeCommand } from "./bridge-store.js";
 import { WorkflowStore } from "./store.js";
@@ -18,6 +20,8 @@ export interface AgentRegistryLike {
 }
 
 export interface BridgeRuntimeOptions {
+  ensureSession?: (id: string, cwd: string, preset: string) => Promise<Agent>;
+  readSession?: (id: string) => Promise<readonly SessionEvent[]>;
   pollMs: number;
   /** Maximum time a terminal pass relay may keep the DSH agent running before
    * only that active turn is cancelled. Zero disables the guard. */
@@ -79,7 +83,7 @@ type ResolvedTarget =
   | { kind: "terminal"; reason: string };
 
 function sameCwd(left: string, right: string): boolean {
-  return resolve(left).toLowerCase() === resolve(right).toLowerCase();
+  return cwdKey(left) === cwdKey(right);
 }
 
 function errorMessage(error: unknown): string {
@@ -234,6 +238,18 @@ export class BridgeRuntime {
    * the runtime that OWNS it may claim.
    */
   private isClaimEligible(command: BridgeCommand): boolean {
+    if (command.kind === "desktop_control") {
+      if (command.action === "ensure_session") {
+        const owners = this.store.coordinationHandle.listLiveSessions();
+        const dedicated = owners.find((row) => row.sessionId === dedicatedSessionId(command.codexThreadId, command.target.cwd, command.preset!));
+        if (dedicated) return dedicated.runtimeOwner === this.claimOwner;
+        if (!owners.length) return true;
+        return [...owners].sort((a, b) => a.runtimeOwner.localeCompare(b.runtimeOwner))[0]!.runtimeOwner === this.claimOwner;
+      }
+      if (command.action === "read_session") return !!this.agents.get(dedicatedSessionId(command.codexThreadId, command.target.cwd, command.preset!));
+      const id = this.store.coordinationHandle.workflowSessionOf(command.workflowId!);
+      return !id || !!this.agents.get(id);
+    }
     if (command.kind === "dispatch_plan") {
       if (command.target.dshSessionId) {
         return this.agents.get(command.target.dshSessionId) !== undefined;
@@ -344,6 +360,13 @@ export class BridgeRuntime {
   }
 
   private async handle(claim: ClaimedBridgeCommand, isLost: () => boolean = () => false): Promise<void> {
+    if (claim.command.kind === "desktop_control") {
+      try { await this.handleControl(claim, claim.command, isLost); }
+      catch (error) {
+        if (!isLost()) await this.store.ack(claim, { requestId: claim.requestId, status: "rejected", error: errorMessage(error) });
+      }
+      return;
+    }
     if (claim.command.kind === "dispatch_plan") {
       await this.handleDispatch(claim, claim.command, isLost);
       return;
@@ -353,6 +376,70 @@ export class BridgeRuntime {
       return;
     }
     await this.handleVerdict(claim, isLost);
+  }
+
+  private async handleControl(claim: ClaimedBridgeCommand, command: DesktopControlCommand, isLost: () => boolean): Promise<void> {
+    const ack = async (data: Record<string, unknown>, workflowId?: string) => {
+      if (!isLost()) await this.store.ack(claim, { requestId: command.requestId, status: "delivered", data, ...(workflowId ? { workflowId } : {}) });
+    };
+    if (command.action === "ensure_session" || command.action === "read_session") {
+      const id = dedicatedSessionId(command.codexThreadId, command.target.cwd, command.preset!);
+      if (isLost()) return;
+      const agent = command.action === "ensure_session"
+        ? await this.options.ensureSession?.(id, command.target.cwd, command.preset!)
+        : this.agents.get(id);
+      if (!agent) throw new Error("dedicated session is unavailable; ensure_session service may be missing");
+      if (!sameCwd(agent.session.header.cwd ?? "", command.target.cwd) || agent.session.header.agentPreset !== command.preset) throw new Error("dedicated session cwd/preset mismatch");
+      await this.refreshSessions(true);
+      await ack({ sessionId: id, cwd: agent.session.header.cwd, preset: command.preset, status: agent.status });
+      return;
+    }
+    const record = await this.options.workflowStore.load(command.workflowId!);
+    if (!record || record.origin !== "codex_bridge" || record.codexThreadId !== command.codexThreadId
+      || !sameCwd(record.cwd, command.target.cwd)
+      || (command.target.dshSessionId && command.target.dshSessionId !== record.dshSessionId)) throw new Error("workflow source/cwd/session mismatch");
+    const agent = this.agents.get(record.dshSessionId);
+    if (!agent || !sameCwd(agent.session.header.cwd ?? "", record.cwd)) throw new Error("owning Desktop session is unavailable or changed cwd");
+    if (command.action === "result") {
+      if (!this.options.readSession) throw new Error("public sessionQuery service is unavailable");
+      const events = await this.options.readSession(agent.id);
+      const ownedRelays = new Set<string>();
+      for (const event of events) {
+        if (event.type !== "user/message") continue;
+        const match = /^dsh-codex-workflow:(verdict|submission-notice):(.+)$/.exec(event.data.id);
+        if (!match) continue;
+        const row = this.store.coordinationHandle.queueRow(match[2]!);
+        if (!row) continue;
+        const relay = JSON.parse(row.commandJson) as BridgeCommand;
+        if ((relay.kind === "submit_verdict" || relay.kind === "submission_notice")
+          && relay.workflowId === record.id && relay.codexThreadId === record.codexThreadId) ownedRelays.add(event.data.id);
+      }
+      await ack({ sessionId: agent.id, cwd: record.cwd, status: agent.status, phase: record.phase,
+        review: record.latestReview ?? null,
+        ...workerOutput(events, `dsh-codex-workflow:${record.bridgeRequestId}`, record.id, ownedRelays),
+      }, record.id);
+      return;
+    }
+    const active = await this.options.workflowStore.activeForSession(agent.id);
+    if (command.action === "cancel" && record.phase === "cancelled") {
+      await ack({ phase: "cancelled", sessionId: agent.id, status: agent.status }, record.id);
+      return;
+    }
+    if (!active || active.id !== record.id) throw new Error("workflow is no longer the session's active owner");
+    if (isLost()) return;
+    if (command.action === "cancel") {
+      agent.cancel({ kind: "hook", reason: `Codex bridge cancelled workflow ${record.id}` });
+      const cancelled = await this.options.manager.cancelForAgent(record.id, agent, new AbortController().signal);
+      // Cancellation requested is distinct from settled. Caller must read status
+      // until idle before taking over the checkout.
+      await ack({ phase: cancelled.phase, sessionId: agent.id, status: agent.status }, record.id);
+      return;
+    }
+    const messageId = MessageId(`dsh-codex-workflow:followup:${record.id}:${command.requestId}`);
+    if (!this.hasDeliveredMessage(agent, messageId)) {
+      agent.followup(freezeMessage({ ...createUserMessage({ content: [{ type: "text", text: command.message! }], source: relaySource() }), id: messageId }));
+    }
+    await ack({ sessionId: agent.id, status: agent.status }, record.id);
   }
 
   private async handleDispatch(

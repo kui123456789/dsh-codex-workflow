@@ -2,6 +2,15 @@
 
 All notable changes to `dsh-codex-workflow`.
 
+## Unreleased
+
+- Add source-scoped Desktop protocol controls for dedicated session bootstrap,
+  result retrieval, bounded followup and cancellation through public host services.
+- Keep generated context and verified workflow review relays inside result scope;
+  exclude unrelated turns, reasoning and tools. Report completion independently
+  from idle state and require cancelled + idle before takeover.
+- Support command help and document the full lifecycle without routine GUI use.
+
 ## [1.1.4] - 2026-09-25
 
 - **A review round now RELEASES the Reviewer claim it took, and the release no longer rides on the business signal.** A DSH-led round claims the Reviewer — the first round creates it (`thread/start` + settings/name), a later round claims the SAME task with `thread/resume` — and never gave that claim back, so a round used to leave its own hold behind for the next one to trip over; and because the release was passed the caller's `AbortSignal`, a cancelled or timed-out round could abort the very `thread/unsubscribe` that frees the lock. **Two different holders are involved and they used to stack** — this entry fixes only the plugin's own: the conflict measured on workflow `d9cfdedc` was held by **Codex Desktop's own app-server** (`docs/find-lock-holder.ps1` reported PID 39572 `codex.exe`, parent `ChatGPT.exe`; the same class of hold is documented in `docs/reviewer-thread-lock-2026-09-24.md`), and a foreign hold can only be released from Desktop — 1.1.3 backs off through it, and 1.1.4 removes the plugin's own contribution so a round can no longer leave a second, self-inflicted hold behind. That is why the retry then spent **25 attempts and the full ~20-minute budget** before returning a retryable failure.

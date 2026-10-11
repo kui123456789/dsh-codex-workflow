@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { encodeBridgeCommand, newRequestId, parseReviewResult, type DispatchPlanCommand, type SubmitVerdictCommand } from "./bridge-protocol.js";
+import { encodeBridgeCommand, newRequestId, parseReviewResult, parseDesktopControlCommand, type DispatchPlanCommand, type SubmitVerdictCommand } from "./bridge-protocol.js";
 import { BridgeStore } from "./bridge-store.js";
+import { cwdKey } from "./coordination.js";
 import { PLUGIN_VERSION } from "./version.js";
 
 const WORKFLOW_PHASES = new Set([
@@ -44,7 +45,7 @@ async function readLiveSessions(directory: string): Promise<Array<{ id: string; 
 }
 
 function sameCwd(left: string, right: string): boolean {
-  return resolve(left).toLowerCase() === resolve(right).toLowerCase();
+  return cwdKey(left) === cwdKey(right);
 }
 
 async function withStore<T>(directory: string, operation: (store: BridgeStore) => Promise<T>, maxPayloadBytes = resolveMaxPayloadBytes()): Promise<T> {
@@ -146,6 +147,21 @@ function effectiveThread(args: ParsedArgs): string {
   const fromEnv = process.env.CODEX_THREAD_ID;
   if (fromEnv) return fromEnv;
   fail("missing --codex-thread: set CODEX_THREAD_ID or pass --codex-thread <uuid>; the bridge never invents a thread id");
+}
+
+async function commandControl(args: ParsedArgs): Promise<void> {
+  if (!args.cwd) fail("control requires --cwd <absolute-path>");
+  if (!args.stdin) fail("control requires --stdin JSON { action, preset? | workflowId?, message? }");
+  const payload: unknown = JSON.parse(await readStdin());
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) fail("control stdin must be an object");
+  const command = parseDesktopControlCommand({
+    ...payload, version: 1, kind: "desktop_control", requestId: newRequestId(), createdAt: new Date().toISOString(),
+    codexThreadId: effectiveThread(args), target: { cwd: args.cwd, ...(args.dshSession ? { dshSessionId: args.dshSession } : {}) },
+  });
+  for (const key of Object.keys(payload)) if (!["action", "preset", "workflowId", "message"].includes(key)) fail(`unknown control field ${key}`);
+  encodeBridgeCommand(command, resolveMaxPayloadBytes());
+  const requestId = await withStore(args.storageDir, (store) => store.enqueue(command));
+  process.stdout.write(`${JSON.stringify({ requestId }, null, 2)}\n`);
 }
 
 async function commandDispatch(args: ParsedArgs): Promise<void> {
@@ -484,7 +500,7 @@ function commandHelp(): void {
 usage: dsh-codex-workflow <command> [options]
 
   sessions  --cwd <absolute-path>           list live DSH sessions for a cwd
-  dispatch  --cwd <path> --stdin [--dsh-session]  queue a plan for a session
+  control   --cwd <path> --stdin            session lifecycle / followup / cancel / result\n                                            JSON: {action: ensure_session|read_session, preset}\n                                            or {action: followup|cancel|result, workflowId, message?}\n  dispatch  --cwd <path> --stdin [--dsh-session]  queue a plan for a session
   respond   --workflow <uuid> --stdin [--codex-thread|CODEX_THREAD_ID]
                                             queue a manually-authored verdict
   status    --request <uuid>                receipt for one request
@@ -500,12 +516,15 @@ common: --storage-dir <dir>, --json
 }
 
 async function main(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  if (argv.includes("--help") || argv.includes("-h")) { commandHelp(); return; }
+  const args = parseArgs(argv);
   if (args.command === "help" || args.command === "--help" || args.command === "-h" || args.command === "") {
     commandHelp();
     return;
   }
   switch (args.command) {
+    case "control": await commandControl(args); break;
     case "sessions": await commandSessions(args); break;
     case "dispatch": await commandDispatch(args); break;
     case "respond": await commandRespond(args); break;

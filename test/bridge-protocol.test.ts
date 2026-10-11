@@ -118,7 +118,7 @@ test("rejects missing fields and non-plain objects", () => {
   assert.throws(() => parseBridgeCommand("text"), /must be an object/);
   assert.throws(() => parseBridgeCommand(dispatchPlan({ planMarkdown: "" })), /planMarkdown must not be empty/);
   assert.throws(() => parseBridgeCommand(dispatchPlan({ task: "" })), /task must not be empty/);
-  assert.throws(() => parseBridgeCommand(dispatchPlan({ target: { cwd: "relative/path" } })), /absolute Windows path/);
+  assert.throws(() => parseBridgeCommand(dispatchPlan({ target: { cwd: "relative/path" } })), /absolute path/);
   assert.throws(() => parseBridgeCommand(dispatchPlan({ target: {} })), /target\.cwd/);
   assert.throws(() => parseBridgeCommand(dispatchPlan({ requestId: "not-a-uuid" })), /must be a UUID/);
   assert.throws(() => parseBridgeCommand(dispatchPlan({ codexThreadId: "nope" })), /must be a UUID/);
@@ -170,4 +170,17 @@ test("encode and parse round-trip a plan and a verdict", () => {
   const notice = parseSubmissionNoticeCommand(submissionNotice());
   const noticeJson = encodeBridgeCommand(notice);
   assert.deepEqual(parseBridgeCommand(JSON.parse(noticeJson)), notice);
+});
+
+for (const cwd of ["/Users/test/中文 workspace", "/home/test/project", "/"]) {
+  test(`round-trips POSIX dispatch cwd: ${cwd}`, () => {
+    const command = parseDispatchPlanCommand(dispatchPlan({ target: { cwd } }));
+    assert.equal((parseBridgeCommand(JSON.parse(encodeBridgeCommand(command))) as DispatchPlanCommand).target.cwd, cwd);
+  });
+}
+
+test("rejects relative and drive-relative dispatch paths", () => {
+  for (const cwd of ["project", "./project", "../project", "C:project", "\\project"]) {
+    assert.throws(() => parseDispatchPlanCommand(dispatchPlan({ target: { cwd } })), /absolute path/);
+  }
 });

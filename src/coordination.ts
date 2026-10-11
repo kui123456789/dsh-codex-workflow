@@ -931,7 +931,10 @@ export function coordinationPath(directory: string): string {
 
 /** Windows/case/separator-insensitive key for a workspace path. */
 export function cwdKey(path: string): string {
-  return resolve(path).replace(/[\\/]+/g, "/").replace(/\/$/, "").toLowerCase();
+  const absolute = resolve(path);
+  return process.platform === "win32"
+    ? absolute.replace(/[\\/]+/g, "/").replace(/\/$/, "").toLowerCase()
+    : absolute;
 }
 
 /** One live DSH session as registered by its owning runtime. */

@@ -83,7 +83,7 @@ interface FakeAgent {
   agent: Agent;
 }
 
-function makeAgent(id: string, cwd: string, followupThrows = 0, hangAfterFollowup = false): FakeAgent {
+function makeAgent(id: string, cwd: string, followupThrows = 0, hangAfterFollowup = false, preset?: string): FakeAgent {
   const idleWaiters: Array<() => void> = [];
   const fake: FakeAgent = {
     id,
@@ -101,7 +101,7 @@ function makeAgent(id: string, cwd: string, followupThrows = 0, hangAfterFollowu
   // The durable session event log: inbox insertions persist as
   // agent/inbox/spliced events carrying the full message with its stable id.
   const emptySession = Session.create(SessionId(id));
-  const session = Session.create(SessionId(id), [], { ...emptySession.header, cwd });
+  const session = Session.create(SessionId(id), [], { ...emptySession.header, cwd, ...(preset ? { agentPreset: preset } : {}) });
   fake.agent = {
     id,
     session,
@@ -1964,3 +1964,67 @@ async function waitFor(predicate: () => Promise<boolean> | boolean, timeoutMs = 
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
+
+// POSIX lifecycle regression: no GUI/session-controller transport is involved.
+test("desktop control: source-scoped followup deduplicates and cancel stops only its owner", async () => {
+  const h = await harness();
+  try {
+    const cwd = await makeWorkspace(h.directory);
+    const fake = makeAgent("session-control-owner", cwd);
+    h.registry.register(fake);
+    const plan = dispatch({ target: { cwd, dshSessionId: fake.id } });
+    await h.store.enqueue(plan);
+    await h.runtime.pump();
+    const receipt = await waitForReceipt(h.store, plan.requestId);
+    assert.equal(receipt.status, "delivered");
+    const { parseDesktopControlCommand } = await import("../src/bridge-protocol.js");
+    const control = (action: string, extra: object = {}) => parseDesktopControlCommand({
+      version: 1, kind: "desktop_control", requestId: newRequestId(), createdAt: new Date().toISOString(),
+      codexThreadId: plan.codexThreadId, target: plan.target, workflowId: receipt.workflowId, action, ...extra,
+    });
+    const follow = control("followup", { message: "bounded clarification" });
+    await h.store.enqueue(follow); await h.runtime.pump();
+    assert.equal((await waitForReceipt(h.store, follow.requestId)).status, "delivered");
+    assert.equal(fake.followups.length, 2);
+    await h.store.enqueue(follow); await h.runtime.pump();
+    assert.equal(fake.followups.length, 2, "same request never sends twice");
+    const forged = control("cancel", { codexThreadId: newRequestId() });
+    await h.store.enqueue(forged); await h.runtime.pump();
+    assert.equal(fake.cancels.length, 0, "wrong source cannot cancel");
+    assert.equal((await waitForReceipt(h.store, forged.requestId)).status, "rejected");
+    fake.startActivity();
+    const cancel = control("cancel"); await h.store.enqueue(cancel); await h.runtime.pump();
+    assert.equal((await waitForReceipt(h.store, cancel.requestId)).data?.phase, "cancelled");
+    assert.equal(fake.cancels.length, 1); assert.equal(fake.status, "idle");
+    assert.equal((await h.workflowStore.load(receipt.workflowId!))?.phase, "cancelled");
+    const again = control("cancel"); await h.store.enqueue(again); await h.runtime.pump();
+    assert.equal(fake.cancels.length, 1, "terminal replay cannot stop a later turn");
+  } finally { await h.runtime.stop(); await h.manager.stop(); h.store.close(); h.workflowStore.close(); await rmClosed(h.directory); }
+});
+
+test("desktop control: ensure_session creates a dedicated worker without adopting cwd peers", async () => {
+  const h = await harness();
+  const { dedicatedSessionId } = await import("../src/desktop-control.js");
+  let creates = 0;
+  const runtime = new BridgeRuntime(h.store, h.registry, {
+    pollMs: 5, storageDir: h.directory, manager: h.manager, workflowStore: h.workflowStore,
+    ensureSession: async (id, cwd, preset) => {
+      const old = h.registry.get(id); if (old) return old;
+      creates++; const fake = makeAgent(id, cwd, 0, false, preset); h.registry.register(fake); return fake.agent;
+    },
+  });
+  try {
+    const cwd = await makeWorkspace(h.directory);
+    h.registry.register(makeAgent("session-user-conversation", cwd));
+    const source = newRequestId();
+    const { parseDesktopControlCommand } = await import("../src/bridge-protocol.js");
+    const ensure = () => parseDesktopControlCommand({ version: 1, kind: "desktop_control", requestId: newRequestId(), createdAt: new Date().toISOString(), codexThreadId: source, target: { cwd }, action: "ensure_session", preset: "codex-bridge" });
+    const first = ensure(); await h.store.enqueue(first); await runtime.pump();
+    const r = await waitForReceipt(h.store, first.requestId);
+    assert.equal(r.data?.sessionId, dedicatedSessionId(source, cwd, "codex-bridge"));
+    assert.notEqual(r.data?.sessionId, "session-user-conversation");
+    const second = ensure(); await h.store.enqueue(second); await runtime.pump();
+    assert.equal((await waitForReceipt(h.store, second.requestId)).data?.sessionId, r.data?.sessionId);
+    assert.equal(creates, 1);
+  } finally { await runtime.stop(); await h.runtime.stop(); await h.manager.stop(); h.store.close(); h.workflowStore.close(); await rmClosed(h.directory); }
+});

@@ -7,6 +7,9 @@ import { CodexAppServerClient } from "./app-server.js";
 import { AppServerCodexCallbackDispatcher } from "./app-server-callback.js";
 import { CodexCliAuditDispatcher } from "./codex-cli-audit.js";
 import { BridgeStore } from "./bridge-store.js";
+import { ensureDesktopSession } from "./desktop-control.js";
+import type { AgentHandle } from "@deepseek-ai/dsh-agent";
+import { SessionId } from "@deepseek-ai/dsh-session";
 import { BridgeRuntime } from "./bridge-runtime.js";
 import { Config as ConfigSchema, type Config as RawConfig } from "./config.js";
 import { SystemDesktopThreadOpener } from "./desktop-thread-opener.js";
@@ -18,7 +21,7 @@ import type { WorkflowConfig } from "./types.js";
 import { WorkflowManager } from "./workflow.js";
 
 export const name = "dsh-codex-workflow";
-export const inject = ["tools", "agents", "systemPrompt"];
+export const inject = ["tools", "agents", "systemPrompt", "agentPresets", "agentDefaultModel", "sessionQuery"];
 export const Config = ConfigSchema;
 export type Config = RawConfig;
 
@@ -80,7 +83,13 @@ export async function apply(ctx: Context, raw: Config): Promise<void> {
     });
     const manager = new WorkflowManager(store, codex, config, callback, bridgeStore, audit);
     const autoTriggerDisposer = registerAutoTriggerPrompt(ctx.systemPrompt, config.autoTriggerMode);
+    const ownedSessions = new Map<string, AgentHandle>();
     const runtime = new BridgeRuntime(bridgeStore, ctx.agents, {
+      ensureSession: (id, cwd, preset) => ensureDesktopSession(ctx, id, cwd, preset, ownedSessions),
+      readSession: async (id) => {
+        if (!ctx.sessionQuery) throw new Error("public sessionQuery service is unavailable");
+        return (await ctx.sessionQuery.readSession(SessionId(id))).events;
+      },
       pollMs: config.bridgePollMs,
       storageDir: config.storageDir,
       manager,
@@ -109,6 +118,8 @@ export async function apply(ctx: Context, raw: Config): Promise<void> {
       // Manager teardown blocks new callback sends, aborts in-flight recovery
       // and its backoff, then cancels and awaits every Reviewer operation.
       await manager.stop();
+      await Promise.allSettled([...ownedSessions.values()].map((handle) => handle.dispose()));
+      ownedSessions.clear();
       await callback.stop();
       await audit.stop();
       await codex.stop();

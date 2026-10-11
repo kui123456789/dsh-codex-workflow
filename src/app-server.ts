@@ -192,6 +192,9 @@ export class CodexAppServerClient {
   private readonly events = new EventEmitter();
   private readonly pending = new Map<number, PendingRequest>();
   private readonly turns = new Map<string, TurnState>();
+  // A newly-created, still-subscribed Reviewer has no rollout until its first
+  // turn. Its authoritative thread/start baseline is empty, not a history RPC.
+  private readonly freshReviewers = new Set<string>();
   /** Registered turn-waiter rejection callbacks so `stop()` (and an unexpected
    * process exit) can settle every in-flight waitForTurn immediately instead
    * of leaving them to time out against a closed process/store. */
@@ -274,6 +277,7 @@ export class CodexAppServerClient {
     const child = this.child;
     this.child = undefined;
     this.turns.clear();
+    this.freshReviewers.clear();
     // Every pending RPC and every active turn waiter must settle NOW: after
     // stop() returns, a late waitForTurn/request resolution could race the
     // closed stores. (The manager interrupts and awaits foreground turns
@@ -367,6 +371,9 @@ export class CodexAppServerClient {
    * `thread.turns[].id` (real App Server evidence: native review RPC turn ids
    * never appear in the persisted rollout history). */
   async captureTurnBaseline(threadId: string, signal?: AbortSignal): Promise<PersistedTurnBaseline> {
+    signal?.throwIfAborted();
+    if (this.stopped) throw new Error("Codex app-server stopped");
+    if (!this.idleStopping && this.child?.exitCode === null && this.freshReviewers.has(threadId)) return { ids: [] };
     const thread = await this.readThread(threadId, true, signal);
     const turns: JsonObject[] = Array.isArray(thread.turns) ? thread.turns.map(object) : [];
     return {
@@ -466,7 +473,9 @@ export class CodexAppServerClient {
     if (options.model) params.model = options.model;
     const response = await this.request<JsonObject>("thread/start", params, signal);
     const thread = object(response.thread);
-    return string(thread.id, "thread/start result.thread.id");
+    const threadId = string(thread.id, "thread/start result.thread.id");
+    if (this.child?.exitCode === null && Array.isArray(thread.turns) && thread.turns.length === 0) this.freshReviewers.add(threadId);
+    return threadId;
   }
 
   /** 1.1.3: settings + display name of an already created Reviewer task. Both
@@ -512,6 +521,7 @@ export class CodexAppServerClient {
   }
 
   async startTurn(threadId: string, options: StartTurnOptions, signal?: AbortSignal): Promise<TurnWaitResult> {
+    this.freshReviewers.delete(threadId);
     const params: JsonObject = {
       threadId,
       input: [{ type: "text", text: options.prompt, text_elements: [] }],
@@ -572,6 +582,7 @@ export class CodexAppServerClient {
   }
 
   async startReview(options: ReviewStartOptions, signal?: AbortSignal): Promise<{ threadId: string; result: TurnWaitResult }> {
+    this.freshReviewers.delete(options.threadId);
     const response = await this.request<JsonObject>("review/start", {
       threadId: options.threadId,
       delivery: options.detached ? "detached" : "inline",
@@ -718,7 +729,7 @@ export class CodexAppServerClient {
     child.once("error", (error) => this.failProcess(error));
     child.once("exit", (code, reason) => {
       const unexpected = this.child === child;
-      if (unexpected) this.child = undefined;
+      if (unexpected) { this.child = undefined; this.freshReviewers.clear(); }
       if (unexpected) this.failProcess(new Error(`codex app-server exited ${code ?? "unknown"} (${reason ?? "no signal"}): ${this.stderr.trim()}`));
     });
     const initialized = await this.requestRaw<JsonObject>("initialize", {
@@ -879,6 +890,8 @@ export class CodexAppServerClient {
   }
 
   private async request<T = JsonObject>(method: string, params: JsonObject, signal?: AbortSignal): Promise<T> {
+    if (["turn/start", "review/start", "thread/resume", "thread/unsubscribe"].includes(method)
+      && typeof params.threadId === "string") this.freshReviewers.delete(params.threadId);
     await this.start(signal);
     return this.requestRaw<T>(method, params, signal);
   }
@@ -1144,6 +1157,7 @@ export class CodexAppServerClient {
     // Completed turn state belongs to the old process session; a respawned
     // App Server has never seen those turns (mirrors final teardown).
     this.turns.clear();
+    this.freshReviewers.clear();
     if (!child || child.exitCode !== null) return;
     // GRACEFUL shutdown: EOF on stdin gives the app-server the chance to flush
     // and exit before we escalate. The client is idle by construction (no
