@@ -31,6 +31,16 @@ export interface ReviewInput {
   testResults?: string;
 }
 
+/** Independent-round intent is control data, never review material. */
+export interface ReviewRequestInput extends ReviewInput {
+  newReviewRound?: boolean;
+}
+
+/** Submission intent is control data, never part of the review material. */
+export interface SubmitInput extends ReviewInput {
+  newReviewRound?: boolean;
+}
+
 export type WorkflowPhase =
   | "planning"
   | "waiting_input"
@@ -54,6 +64,42 @@ export type ReviewStep =
   | "review_finalizing";
 
 export type WorkflowProcessState = "running" | "waiting" | "completed" | "failed" | "cancelled" | "stale";
+
+/** Captured process-instance evidence; numeric PIDs alone can be reused. */
+export interface ProcessInstanceIdentity {
+  readonly processId: number;
+  readonly birth: string;
+}
+
+/** An exact durable cleanup claim, without ephemeral thread or turn ids. */
+export interface WorkflowTerminalCleanupMarker {
+  token: string;
+  epoch: number;
+  sessionId: string;
+}
+
+/** A model/transport failure that can continue on the same in-process thread. */
+export interface WorkflowRetryState {
+  stage: "planning" | "reviewing";
+  reason: string;
+  attempts: number;
+  awaitingContinuation: boolean;
+  /** The submitted original start has no adopted authoritative receipt yet. */
+  awaitingStartReceipt?: boolean;
+  /** A rejected turn can only be cleaned up, never continued as model work. */
+  awaitingCleanup?: boolean;
+  terminalFailure?: string;
+  /** Historical receipts cannot authorize cleanup of a later original writer. */
+  terminalCleanup?: WorkflowTerminalCleanupMarker;
+  /** Safe original backend-process evidence, never an ephemeral thread id.
+   * An empty marker means interruption is pending but its process is unknown. */
+  interruption?: { processId?: number; processIds?: number[]; processIdentities?: readonly ProcessInstanceIdentity[];
+    target?: "planner" | "reviewer" | "auxiliary" };
+  /** Only the stage is durable; completed model artifacts stay process-local. */
+  reviewCheckpoint?: { nextStep: "conversion" | "alignment" | "reconciliation" | "finalizing" };
+  /** The original Planner owns completed artifacts; only its next step is stored. */
+  plannerCheckpoint?: { nextStep: "visible" | "conversion" | "completion" | "corrected_conversion" | "finalizing" };
+}
 
 export interface ReviewPhaseTiming {
   startedAt: string;
@@ -99,11 +145,13 @@ export interface ReviewResult {
  * `kind: "git"` evidence comes from `git status --porcelain=v1` plus the full
  * `git diff HEAD` stream; `kind: "files"` evidence hashes the files listed in
  * `changedFiles` without a git repository. `fingerprint` is a stable SHA-256
- * covering both the status summary and the full (untruncated) diff/content so
+ * covering the Git HEAD commit, status and full (untruncated) diff/content so
  * that staged, unstaged, deleted, renamed and untracked changes all move it.
  */
 export interface ReviewEvidence {
   kind: "git" | "files";
+  /** Actual Git HEAD commit, or "unborn" for a verified branch without commits. */
+  baseRevision?: string;
   changedFiles: string[];
   status: string;
   diff: string;
@@ -175,12 +223,14 @@ export interface WorkflowRecord {
   updatedAt: string;
   plannerThreadId?: string;
   plannerTurnId?: string;
-  /** The EFFECTIVE model the visible Planner turn actually ran with (explicit
-   * tool/config override, or the model selected by the Plan collaboration
-   * mode). Persisted so continue/restart and the ephemeral normalization fork
-   * all reuse the SAME model instead of falling back to a different default.
-   * Optional for records written by older versions. */
+  /** Model requested explicitly or resolved by the App Server client for the
+   * visible Planner turn. Retained for later turns and private conversion;
+   * this is not provider-side routing or billing telemetry. Older records
+   * may omit the choice. */
   plannerModel?: string;
+  /** Requested visible-turn effort retained across the planning flow.
+   * Private structured conversions keep their separate low-effort policy. */
+  plannerEffort?: ReasoningEffort;
   /** Legacy source thread id retained for diagnostics only. */
   sourceThreadId?: string;
   reviewerThreadId?: string;
@@ -210,6 +260,14 @@ export interface WorkflowRecord {
   reviewPhaseTimings?: Partial<Record<ReviewStep, ReviewPhaseTiming>>;
   lastProgressMessage?: string;
   processState?: WorkflowProcessState;
+  /** Recoverable model-run state. Ephemeral thread ids remain process-local in
+   * WorkflowRuntimeState and are intentionally never written here. */
+  retryState?: WorkflowRetryState;
+  /** A registered foreground Reviewer ended without an accepted verdict.
+   * Unchanged material requires an explicit independent business round. */
+  reviewFailureReason?: "original_reviewer_unavailable" | "review_contract_conflict";
+  /** Durable server-reported original-thread snapshots, not a complete bill. */
+  observedUsage?: import("./workflow-usage.js").WorkflowObservedUsage;
   /** Optional for records written by older versions; defaults to 0. */
   noChangeReviewRounds?: number;
   /** Consecutive review CALLS (DSH-led review rounds or bridge submissions)
@@ -250,10 +308,13 @@ export interface WorkflowRecord {
   submissionId?: string;
   submissionState?: SubmissionState;
   submissionAttempts?: number;
+  /** An upstream result exists only in the owning process; never restart it silently. */
+  submissionReviewPending?: boolean;
   submissionError?: string;
   /** Machine-readable reason for the last non-verdict callback outcome
    * (interrupted turn, turn timeout, rate limit, active writer, teardown/cancel
-   * abort, lease loss, ...). Persisted so a stuck submission is diagnosable
+   * abort, lease loss, original_reviewer_unavailable,
+   * original_review_result_unavailable, ...). Persisted so a stuck submission is diagnosable
    * and the persistent recovery loop can classify it instead of guessing. */
   submissionCallbackReason?: string;
   /** Earliest wall-clock time at which the persistent callback recovery loop
@@ -299,6 +360,25 @@ export interface WorkflowRecord {
   desktopOpenAttempts?: number;
   desktopOpenNextAt?: number;
   desktopOpenError?: string;
+}
+
+/** Read-only, process-local capability attached to status responses only. */
+export interface WorkflowContinuationStatus {
+  available: boolean;
+  reason?: "running" | "thread_unavailable" | "handle_unavailable" | "cancelled" | "not_waiting" | "stopped" | "workspace_changed" | "evidence_unavailable" | "identity_changed" | "interruption_unconfirmed" | "review_contract_conflict" | "start_receipt_pending" | "start_receipt_invalid";
+}
+
+export interface WorkflowStatus extends WorkflowRecord {
+  reviewerActive: boolean;
+  continuation: WorkflowContinuationStatus;
+  /** Safe process-local diagnostic when observed usage could not be saved. */
+  usagePersistenceError?: string;
+  /** Current original thread snapshot, excluding other threads and workflow-wide totals. */
+  tokenUsage?: Pick<import("./usage-accounting.js").TokenUsageSnapshot, "total" | "last" | "modelContextWindow"> & {
+    source: "app_server";
+    scope: "current_original_thread";
+    stage: "planning" | "reviewing";
+  };
 }
 
 export interface WorkflowConfig {

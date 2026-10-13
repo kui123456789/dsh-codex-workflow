@@ -6,6 +6,7 @@ let threadCounter = 0;
 let turnCounter = 0;
 let persistedTurnCounter = 0;
 const pendingQuestions = new Map();
+const heldStreamReviews = new Map();
 // Threads the plugin has subscribed to as its writer; mirrors the real server's
 // idempotent thread/unsubscribe semantics.
 const subscribed = new Set();
@@ -167,6 +168,13 @@ function handleClientRequest(message) {
     appendFileSync(process.env.FAKE_CODEX_THREAD_PARAMS_MARKER, `${JSON.stringify({ method, params })}\n`);
   }
   if (method === "initialized") return;
+  if (method === "fixture/releaseStreamReview" && process.env.FAKE_CODEX_HOLD_STREAM_REVIEW === "1") {
+    const finish = heldStreamReviews.get(params.threadId);
+    if (!finish) return send({ id, error: { code: -32602, message: "No original stream review is held" } });
+    heldStreamReviews.delete(params.threadId);
+    send({ id, result: {} });
+    return finish();
+  }
   if (method === "initialize") return send({ id, result: { userAgent: "fake", codexHome: "C:/fake", platformFamily: "windows", platformOs: "windows" } });
   if (method === "model/list") {
     // Optional default-model override: list a non-default first entry plus an
@@ -275,6 +283,9 @@ function handleClientRequest(message) {
       return setTimeout(() => send({ method: "item/tool/requestUserInput", id: requestId, params: { threadId: params.threadId, turnId, itemId: `item-${turnId}`, autoResolutionMs: null, questions: [{ id: "scope", header: "Scope", question: "Which scope?", isOther: false, isSecret: false, options: [{ label: "Focused", description: "Only requested files" }] }] } }), 0);
     }
     const reviewSchema = params.outputSchema?.properties?.verdict;
+    // Keep the cancellation-window control genuinely active until its ACK;
+    // a zero-delay completion may precede the caller's onStarted callback.
+    if (reviewSchema && process.env.FAKE_CODEX_HANG_CONVERSION === "1") return;
     const plannerSchema = params.outputSchema?.properties?.status;
     // 1.0.10 REVIEW AUTHORITY alignment fork: the INTERNAL align schema
     // (properties.aligned) is served its own deterministic JSON — never the
@@ -328,10 +339,18 @@ function handleClientRequest(message) {
       send({ method: "item/agentMessage/delta", params: { threadId: reviewThreadId, turnId, itemId: `item-${turnId}`, delta: "VERDICT: " } });
       send({ method: "item/agentMessage/delta", params: { threadId: reviewThreadId, turnId, itemId: `item-${turnId}`, delta: "pass" } });
     }
-    return setTimeout(() => complete(reviewThreadId, turnId,
+    // Settings-failure tests need a genuinely active turn, not a completion
+    // timer that can win the race on a loaded host.
+    if (process.env.FAKE_CODEX_HANG_REVIEW === "1") return;
+    const finish = () => setTimeout(() => complete(reviewThreadId, turnId,
       process.env.FAKE_CODEX_NATIVE_REVIEW_TEXT
         || (process.env.FAKE_CODEX_STREAM_VISIBLE === "1" ? "VERDICT: pass" : "No actionable findings.")),
     Number(process.env.FAKE_CODEX_TURN_DELAY_MS || 0));
+    if (process.env.FAKE_CODEX_HOLD_STREAM_REVIEW === "1") {
+      heldStreamReviews.set(reviewThreadId, finish);
+      return;
+    }
+    return finish();
   }
   send({ id, error: { code: -32601, message: `unknown ${method}` } });
 }

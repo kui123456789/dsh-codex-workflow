@@ -25,8 +25,8 @@ test("model and effort settings are live volatile references", () => {
   assert.equal(config.reviewerEffort.get(), "high");
 });
 
-test("plugin declares systemPrompt and session projections as required services", () => {
-  assert.deepEqual(inject, ["tools", "agents", "systemPrompt", "sessionProjections", "subagents"]);
+test("plugin declares systemPrompt, connection and session projections as required services", () => {
+  assert.deepEqual(inject, ["tools", "agents", "systemPrompt", "sessionProjections", "subagents", "connection"]);
 });
 
 test("off mode registers no prompt section and has a harmless disposer", () => {
@@ -84,3 +84,18 @@ test("always guidance covers every write-intent development task but keeps exclu
   assert.match(guidance, /explicit user instruction.*always overrides/);
   assert.match(guidance, /Never auto-trigger from plugin-generated/);
 });
+
+for (const mode of ["complex", "always"] as const) {
+  test(`${mode} recovery guidance requires a live continuation and forbids parent-authored substitutes`, () => {
+    const guidance = autoTriggerGuidance(mode);
+    assert.match(guidance, /codex_workflow_status without an id/);
+    assert.match(guidance, /only when status\.continuation\.available is true/);
+    assert.match(guidance, /waiting.*does not prove/i);
+    assert.match(guidance, /reason is running.*wait.*duplicate/i);
+    assert.match(guidance, /report continuation\.reason.*status lookup error/i);
+    assert.match(guidance, /Do not author a substitute plan\/review in the parent session or start a replacement workflow/);
+    assert.match(guidance, /not a permanent attempt quota/i);
+    assert.match(guidance, /interruption_unconfirmed.*already been submitted/);
+    assert.match(guidance, /retry only cleanup.*only after interruption is confirmed/);
+  });
+}

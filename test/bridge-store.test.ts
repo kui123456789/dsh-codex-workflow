@@ -172,6 +172,21 @@ test("retry keeps attempts and only becomes due after nextAttemptAt", async () =
   }
 });
 
+test("retry rejects an invalid deadline before touching the fenced queue row", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-bridge-store-invalid-deadline-"));
+  try {
+    const store = new BridgeStore(directory);
+    const command = plan();
+    await store.enqueue(command);
+    const claim = await store.claimNext("deadline-owner");
+    assert.ok(claim);
+    const before = store.coordinationHandle.queueRow(command.requestId);
+    await assert.rejects(store.retry(claim!, "bad deadline", "not-a-date"), /invalid bridge retry deadline/);
+    assert.deepEqual(store.coordinationHandle.queueRow(command.requestId), before,
+      "invalid retry input cannot mutate attempts, lease ownership or next_attempt_at");
+  } finally { await rmClosed(directory); }
+});
+
 test("dead letter records the terminal failure and frees the queue", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-bridge-store-dead-"));
   try {
@@ -364,7 +379,9 @@ test("A's fenced operations are no-ops after B takes over the claim", async () =
 
 /** Heartbeat: a live handler renewing its claim keeps ownership well past the
  * original TTL; recoverOrphans and claimNext cannot take it over. */
-test("heartbeat renews the claim lease past its original TTL", async () => {
+test("heartbeat renews the claim lease past its original TTL", async (t) => {
+  // Keep the 200 ms production lease behavior independent of disk scheduling.
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const directory = await mkdtemp(join(tmpdir(), "dsh-bridge-store-heartbeat-"));
   try {
     const store = new BridgeStore(directory, 1024 * 1024, 200); // 200ms TTL
@@ -374,13 +391,15 @@ test("heartbeat renews the claim lease past its original TTL", async () => {
     assert.ok(claim);
     // Renew past the original TTL multiple times.
     for (let i = 0; i < 5; i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 120));
+      t.mock.timers.tick(120);
       assert.equal(await store.renewClaim(claim!), true, "renew keeps ownership");
     }
     // The claim outlived its original TTL many times over: still not stealable.
     assert.equal(await store.recoverOrphans(), 0);
     assert.equal(await store.claimNext("intruder"), undefined);
     assert.equal(store.coordinationHandle.queueRow(command.requestId)?.status, "processing");
+    t.mock.timers.tick(200);
+    assert.equal(await store.recoverOrphans(), 1, "a claim expires once its unchanged TTL actually elapses");
   } finally {
     await rmClosed(directory);
   }

@@ -30,7 +30,7 @@ const { ToolRuntime } = await loadHost("@deepseek-ai/dsh-tools");
 const hostVersion = JSON.parse(await readFile(hostPackage, "utf8")).version;
 const directory = await mkdtemp(join(tmpdir(), "dsh-codex-host-compat-"));
 const ctx = new Context();
-const names = ["start", "continue", "review", "review_only", "submit", "decide", "status", "cancel"]
+const names = ["start", "continue", "resume", "review", "review_only", "submit", "decide", "status", "cancel"]
   .map((name) => `codex_workflow_${name}`);
 try {
   // Static public-client contract guard. These checks do not load or mutate a
@@ -58,7 +58,7 @@ try {
   // tool registration as well.
   ctx.provide("sessionProjections", { register: () => () => undefined });
   ctx.provide("subagents", { registerProvider: () => () => undefined });
-  ctx.provide("connection", { fetch: { register: () => () => undefined } });
+  ctx.provide("connection", { rpc: { handle: () => () => undefined } });
   const fiber = ctx.plugin(plugin, { storageDir: directory });
   await fiber;
   for (const name of names) assert.ok(ctx.tools.get(name), `${name} missing after activation`);

@@ -2,8 +2,274 @@
 
 All notable changes to `dsh-codex-workflow`.
 
+## Unreleased
+
+- Scope same-thread Reviewer continuation to failures raised by an actual model call. Progress, checkpoint and storage errors that only resemble a transient transport diagnostic now terminate the current round without issuing another model turn; explicit upstream model-failure markers remain recoverable.
+
+- Release a claimed ephemeral Reviewer when binding persistence fails after cancellation, lease loss, stop, or thread loss prevents retention. This keeps the exact subscription and App Server round from leaking while preserving same-thread retry when the operation is still eligible.
+
+- Retain an ephemeral Reviewer when its DSH binding callback fails with a transient-looking local error, and retry that binding callback before any later model turn. The same Reviewer and subscription are reused; non-ephemeral binding failures keep their existing terminal behavior.
+
+- Retain immutable startup census observations on the original native child and preserve them through lost-process cleanup or the existing PID-only startup-retirement barrier. Each cleanup reports the original startup prefix plus only its latest refresh attempt; late capture cannot backfill ownership or authorize a replacement.
+
+- Preserve sanitized process-census diagnostics on original cleanup errors. Record only fixed observation codes, elapsed duration, numeric exit data and whitelisted errno/signals; keep commands, environment, stdout, stderr and raw error text private. Diagnostics cannot authorize continuation or replace an original process.
+- Preserve the same sanitized diagnostics during lost-process descendant refresh, distinguishing missing identity evidence, unavailable capture, incompatible birth domains and conflicting original instances. Refreshed evidence still requires independent exit confirmation; uncertain cleanup retains the same original and blocks replacement.
+
+- Attach the same sanitized census observations to fork creation and conversion cleanup barriers, so a failed fork-tree retirement reports bounded diagnostic codes without exposing raw process-query output or weakening the no-replacement rule.
+
+- Preserve sanitized original retirement-census observations on cleanup errors: fixed failure codes, elapsed duration, numeric exit code and whitelisted errno/signals. Keep raw command, environment, stderr and output private; observer failures cannot change capture evidence, model retry or original-process cleanup barriers.
+
+- Measure original process-tree exit confirmation grace with the monotonic performance clock. Wall-clock rollback cannot extend an exhausted wait, and a forward adjustment cannot end a live wait early; preserve the original identity proof, one termination signal and independent exit confirmation.
+
+- Retry an unavailable retirement census once while the same original native child remains live and owned by the SDK. Capture before closing that child; repeated unavailability or owner retirement preserves the cleanup barrier and never authorizes a replacement backend.
+
+- Attempt every owned cleanup step in the multi-manager foreground recovery regression before reporting its first stop error. Join finally and after on one cleanup flight; a rejected stop keeps the native test failed without stranding the remaining original SDK or fixture storage.
+
+- Reject invalid Bridge retry deadlines before changing the fenced queue row, preserving its attempts, owner and lease instead of creating an unreachable NULL-deadline retry. Keep heartbeat regressions on the same 200ms TTL with a controlled Date clock.
+
+- Return detached model-catalog snapshots and keep the App Server cache immutable against caller mutations.
+- Share concurrent model-catalog reads within one App Server generation without sharing caller cancellation.
+- Fail closed when the pre-schema-v2 coordination backup cannot be written, preserving the original database for recovery.
+
+- Retain actual native ChildProcess instances in model-catalog lifecycle regressions; a reused numeric PID cannot fail historical cleanup checks or authorize model work.
+
+- Recognize both numeric and signal exits before stdin closure and termination escalation, preventing repeated EOF or kill attempts against an already completed original App Server child.
+
+- Validate persisted Planner/Reviewer retry checkpoints with strict JSON types on read, write and migration; reject corrupt continuation selectors before status or SQLite updates, while retaining legacy interruption-only records.
+- Make the owned launcher recovery regression and its cleanup compare captured process births so a reused numeric PID cannot fail the test or receive a stale termination request.
+
+- Preserve known terminal callback diagnostics when an SDK child closes by signal; unknown signal exits retain their existing retryable behavior.
+
+- Keep known terminal diagnostics terminal when a CLI child closes without a numeric exit code. Unknown signal exits retain their existing retryable behavior; preserve caller cancellation, original errors and single model admission.
+
+- Preserve terminal failure diagnostics during legacy failed-submission migration. Require the shared transient classifier before writer-hint recovery; keep exact legacy busy migration and explicit first-review retries available.
+
+- Connect shared Reviewer observation tests to native test cancellation, named fixture waits and idempotent after cleanup. Preserve failure reporting, original scenario deadlines and ownership assertions; stop only the case's owned fake backend after a timeout.
+
+- Apply the shared recoverable-error classifier to both callback continuation and retained-thread recovery. Terminal details override embedded timeout/rate-limit/writer hints; do not send another visible request, convert a failed result or park terminal failures. Preserve genuine one-time continuation, original Reviewer retention after repeated generic failures, cancellation and confirmed cleanup.
+
+- Correct Planner and shared Reviewer model instructions to identify the current DSH child Session and Codex Review sidebar as the readable output destination. Preserve read-only scope, task language, Markdown sections and separate structured conversion; validate the instructions delivered to foreground and Bridge flows without changing their thread lifecycle.
+
+- Apply App Server text/plan replacement snapshots by exact kind and full item id in the original native child segment, including tool-buffered text. Retire the superseded transient attempt before publishing the corrected snapshot on the same turn/step; preserve committed history, ordinary deltas and continuation identities. Ignore identical snapshots without another model request or display restart.
+
+- Preserve streamed partial output when a native Codex child turn fails, is cancelled or begins continuation. Append the original diagnostic after the current segment and buffered tool-following text instead of overwriting it; keep successful authoritative output, failure state, tool balancing and original-child identity unchanged.
+
+- Require original native test-event receipts for isolated verify/release gates. Preserve human reporters and actual exit codes, validate every test file and the final cumulative summary, and reject missing/duplicate/displaced receipts, premature zero-exit workers, skips/TODOs and async warnings. Create receipts exclusively and scope them to the original source directory so independent descendant launchers cannot claim the parent run.
+
+- Add `pnpm verify:isolated`: snapshot verification inputs, run the complete gate chain in an independent build directory, retain logs and verified artifact hashes, and check original source/build content and HMR metadata for drift. Keep canonical Git diff checks in the source repository.
+
+- Preserve exhausted sidebar retry allowances per original target and check the retry window before opening a native child or summary. Ordinary progress cannot restart exhausted retries; distinct targets and successful retries keep their normal paths.
+
+- Use one monotonic process clock for control, visible-turn and CLI retry budgets. System clock corrections cannot extend an expired budget or end a live budget early; explicit clock hooks, original outcomes and cancellation priorities remain available.
+
+- Retire the browser sidebar scanner before releasing its subscriptions. Ignore already captured Host notifications and retry callbacks after unload, release each projection observer once when switching sessions, and make plugin disposal idempotent. Preserve normal discovery and original-child selection.
+- Handle cold sidebar projection reads with one immutable loading snapshot shared by client/server getters. Render loading before data arrives, preserve the original face receiver and subscription updates, and distinguish loaded empty workflows from loading. Prevent undefined-projection crashes and fresh-object snapshot render loops without creating agents or model requests.
+
+- Publish Planner process state across original-thread pause, continuation, pending receipt and confirmed failure cleanup. Preserve this optional field in the display projection and show a paused planning heading without granting resume eligibility. Invalidate v1 projection checkpoints for full original-log replay; retain legacy logs without guessing their process state. Extend real receipt/abort/cleanup regressions and the installed-host recovery smoke.
+
+- Render review summary headings from the latest declared process state. Distinguish paused, failed, cancelled and stale progress from completion, retain running progress messages, and show Planner clarification/failure/readiness states. Label history cards as attempts so recovery is not presented as a new business review round; pause text does not grant continuation eligibility.
+
+- Keep waiting and completed Reviewer conversations in the native sidebar by selecting the latest review's original child after `activeReview` clears. Prevent the summary fallback or an older Planner from displacing that conversation; retain the fallback for legacy childless reviews and open the new child for a genuine new review round.
+
+- Strengthen the installed-host recovery smoke with native JSONL journals and independent reads after original-child disposal. Keep write handles across session publication and retirement, verify complete parent/child events and message replay, and preserve the original catalog identity across all eleven existing scenarios. This check remains isolated and scripted; it does not certify real-provider failures or browser behavior.
+
+- Contain storage exceptions raised by manager lease heartbeat renewal. Treat an unconfirmed renewal as loss of the original admission, stop its timer and notify its existing owner once; do not let a SQLite busy/error escape into the host. Keep explicit renew/release failures, successful renewal, peer leases and original-review cleanup behavior unchanged.
+
+- Make shared Reviewer test waits observe their TestContext signal and preserve the original cancellation reason. Register cleanup hooks for the six unavailable-review scenarios, join duplicate cleanup, and stop the owned manager before awaiting its background work. Keep existing 30-second case limits and cancelled-test verdicts; add isolated controls for held lease notices, background joins and a real native test timeout.
+
+- Add an optional `DSH_WORKFLOW_TEST_REPORTER=spec|tap` test-launcher setting inherited by verify and release checks. TAP provides ASCII summary counters for redirected Windows consoles. Explicit Node reporter flags take precedence; invalid settings fail before spawning, while test discovery, concurrency, filtering and failure exit codes remain unchanged.
+
+- Preserve the original CLI cancellation cause when an admitted operation hands its signal to a later stage after dispatcher stop. Match the still-owned signal and workflow/submission identity before applying the stopped admission gate; keep new stopped requests, displaced identities, callback errors and non-Error reason fallback unchanged.
+
+- Retain CLI cancellation for the complete public review/conversion call across readable-output capture and result callbacks. Wait for admitted callbacks during stop, reject pre-aborted cached requests before capture, and prevent downstream model stages or successful delivery after cancellation. Share operation ownership with the existing retry loop and preserve callback failures, peer isolation and future explicit reuse.
+
+- Retain CLI workflow/submission cancellation throughout each transient retry operation, including backoff between child processes. Use the same cancellation signal for admission, execution and waits, preserve the first cause, stop additional attempts after cancellation, and await owned retry completion during dispatcher stop. Make original-child termination idempotent when signal and direct cancellation overlap.
+
+- Include pending CLI admission calls in workflow/submission cancellation and stop. Combine per-call cancellation with the caller signal, preserve the first reason and peer/owner isolation, clean the pending registry after handoff or failure, and recheck cancellation during synchronous spawn setup before prompt delivery.
+
+- Reserve known CLI Reviewer thread admission before asynchronous waiting. Serialize same-thread callers through original process close and identity binding, retain cancelled tickets behind their predecessor, release on synchronous spawn failure, and keep different threads independent without adding a queue dependency.
+
+- Observe caller cancellation while waiting for an occupied CLI Reviewer thread. Reject the cancelled waiter promptly with its original cause, remove its listener and create no child, while preserving the admitted owner's process, identity binding and other waiters; retain existing execution retry and deadline policies.
+
+- Retain CLI caller cancellation observation through original thread identity binding after process close. Release the abort listener only when that admitted binding settles, preserve the first pending cause, and avoid normalization or another process after cancellation; keep original binding ownership and model timer bounds.
+
+- Consume CLI stdin/stdout stream errors and synchronous prompt-write failures through the original child cleanup path. Preserve the first cause and prior cancellation, await original close and admitted identity binding, discard output after pending failure, and consume retired errors without affecting a successor or starting a model retry.
+
+- Consume CLI stderr Readable errors without crashing the host or rejecting healthy stdout model results. Annotate only the owning process's failed exit with diagnostic loss, preserve original failure classification and cancellation, and consume retired stream errors without contaminating a successor.
+
+- Enforce CLI stderr retention in UTF-8 bytes across chunks and final decoder flush, keeping complete trailing code points instead of slicing UTF-16 units. Recheck stdout after its decoder flush so final replacement characters cannot bypass the existing output limit; preserve the first pending error and original process/thread ownership.
+
+- Enforce the configured retry delay ceiling after jitter and millisecond rounding. Positive jitter cannot exceed `transientRetryMaxMs` or prematurely exhaust a remaining budget that could admit a capped retry; preserve negative jitter, original-thread recovery and existing retry deadlines.
+
+- Recheck cancellation and the original retry deadline after backoff sleeps in control, visible-turn and CLI retry loops. Delayed or exact-deadline wake-ups cannot start extra attempts; preserve the original cancellation cause, last transient result and actual attempt count. Initial zero-budget calls and separate workflow continuation limits stay unchanged.
+
+- Enforce the shared diagnostic summary limit in actual UTF-8 bytes, including the omission marker. Preserve complete code points at both ends and report the exact number of removed source bytes; tiny limits return a complete prefix. CLI classification and retry behavior still use the full original diagnostic.
+
+- Preserve original stderr buffered after actual process exit through a bounded 100ms diagnostic drain. Invalidate the exited thread immediately, settle its failure before successor admission and stop cleanup, and explicitly mark an inherited pipe that misses the diagnostic deadline. Keep physical process-tree proof and existing RPC/turn timers.
+- Decode stderr with a UTF-8 StringDecoder owned by each original child, preserving characters split across real pipe chunks. Flush observed bytes when its diagnostic is finalized, keep the 16,384-unit tail bound, and discard a clipped leading low surrogate instead of publishing half an emoji. Retired bytes and diagnostic read errors retain their existing ownership rules.
+
+- Consume stderr Readable errors without crashing the SDK or invalidating healthy stdin/stdout JSON-RPC. Keep the original thread and active turn usable, annotate only the current process's eventual exit with a fixed diagnostic-unavailable marker, and prevent late retired pipe errors from contaminating a successor.
+
+- Handle spawn failures that return a ChildProcess without stdio. Register original lifecycle/error ownership before admitting RPCs, preserve the asynchronous native cause instead of a readline TypeError, and bound missing-stdio receipt waits with the existing control budget. Cancellation/stop consume late receipts; no-PID failures create no phantom retirement, while an actual incomplete child is retired normally.
+
+- Preserve the first original stdin/stdout failure in one transport guard. Reject startup if stdin fails after the handshake ACK but before readiness, preserve the exact cause through shared observers and cleanup, and block later RPCs on a broken ready process without replacing its thread or hiding the error behind a generic write failure.
+
+- Independently confirm missing original Windows processes when a kill-zero probe remains unknown or returns EPERM. Require complete saved birth identities and a successful, validated OS absence receipt; denied queries, partial replies and live matching instances keep their guards. Lost-process refresh shares this proof without signalling or borrowing reused PID descendants.
+
+- Invalidate RPC availability when the original stdout closes or errors while its backend remains alive. Settle pending observers with the first output failure, retain original model/receipt cleanup responsibility, block implicit bootstrap, and isolate retired stream errors; keep actual exit/stderr diagnostics through a bounded close-observation window.
+
+- Retain successful initialization's original backend identities after unexpected launcher exit. Refresh later descendants only through birth-matched surviving originals, keep failed cleanup guarded, and require cleanup before an explicit successor startup or permanent stop; unfinished identity collection prevents premature idle shutdown.
+
+- Confirm ordinary App Server backend instances have exited before permanent SDK stop returns, even when no fork was created. Share one retirement census and close with idle/initialization cleanup; failed proof retains the stopped latch and permits only cleanup of those original instances.
+
+- Retire a rejected initializer's captured original backend tree before admitting another startup, while preserving its primary handshake error. Keep lost-census cleanup unknown instead of respawning, and prevent later explicit requests from rejoining an already rejected initialization flight.
+
+- Confirm the captured original idle App Server process tree has exited before external CLI handoff or successor startup. Retain failed retirement for cleanup of the same instances, keep caller cancellation separate from shared cleanup, and preserve the permanent stop latch through cleanup-only retries.
+
+- Retain completed persistent-source conversion output separately from unconfirmed fork cleanup. Same-context retries release the original subscription and return the cached result without another model or fork; observer cancellation, original interruption proof, idle shutdown, source unsubscribe and external handoff preserve resource ownership until exact cleanup.
+
+- Validate the required `thread/unsubscribe` status before clearing local subscription ownership or usage. Missing, unknown and null responses keep abandoned-fork cleanup guarded until a valid original acknowledgement; they cannot authorize another fork or source model turn.
+
+- Confirm captured original fork backend instances have exited before reporting SDK teardown complete, including when the launcher exits first. Use birth-bound Windows handles or Linux pidfds, retain unconfirmed cleanup for stop-only retry, and never start a replacement backend or model during cleanup.
+
+- Preserve the original persistent-source conversion fork across caller abort/timeout before its creation reply, preventing duplicate forks and orphaned subscriptions. Bind retries to the original process, source owner and conversion input; retain abandoned public-fork cleanup until the real unsubscribe ACK, and stop already-cancelled callers before submission. Explicit healthy public fork calls remain independent.
+
+- Separate caller timeout/cancellation from the lifetime of a submitted model start, preserving its original late reply route and process-local recovery capability.
+- Keep Planner, foreground Reviewer and bridge callback stages in the same child/thread while a start reply is pending; foreground resume and the original Bridge submission's background retry adopt that reply without repeating the model request or resetting continuation budgets.
+- Persist safe pending-start markers and process guards, retain cancellation/stop cleanup until exact proof, and coordinate child/pin ownership across native input and concurrent recovery.
+- Preserve original private review seeds and completed stage output during recovery; fresh callbacks replace abandoned observers, and internal conversion JSON stays out of the sidebar.
+- Distinguish safe pending-receipt inspection and original-turn cleanup from a new model continuation in tool guidance and recovery documentation; Bridge recovery keeps its admitted background submission instead of using foreground resume or resubmitting unchanged material.
+- Retain scoped protocol errors received before the original turn/review start reply and reconcile them only against that request's authoritative writer pair, including detached reviews.
+- Preserve the earliest matching cause without letting foreign or ambiguous hints authorize cleanup or hide a later matching error; failed ACK recovery remains cleanup only, with no model replay.
+- Exclude stale Windows parent-PID links whose child predates the captured parent instance, preventing unrelated older processes from holding original-turn cleanup open; unknown creation metadata remains conservative.
+- Isolate parsed input/turn dispatch exceptions from the SDK host and latch the first protocol contract error to its uniquely registered original process, thread owner and turn.
+- Register original turn ownership before asynchronous callbacks and reject protocol faults before returning completed output or resending native answers.
+- Keep failed interruption ACKs in terminal cleanup waiting with the original child and cause; prevent Planner from treating cleanup-only protocol errors as ordinary model continuations.
+- Scope App Server stderr diagnostics to each original child, preventing real late pipe output from contaminating an independent successor's public exit error.
+- Preserve the current exit prefix, bounded text tail and failure policy while ignoring retired-child diagnostic events.
+- Capture immutable original process birth identities for unconfirmed interruption and carry them through Planner, Reviewer, auxiliary cleanup and persisted guards.
+- Distinguish exited originals from new instances at reused PIDs using Windows CIM or Linux boot/start ticks; preserve unknown identities and conservative legacy records without recreating threads.
+- Recheck cleanup guard owners and lease epochs after asynchronous identity queries, rejecting changed rows or failed conditional updates before admitting new work.
+- Unify control RPC settlement so timeouts and synchronous write failures release the original timer, pending entry and abort listener exactly once, preserving the primary cause.
+- Consume original stdin stream errors after shutdown or process replacement; preserve the stop rejection when a queued write reports EOF after its original child exits.
+- Isolate each caller's cancellation while sharing App Server initialization; preserve the original process for remaining observers and reject cancelled waits before the handshake completes.
+- Abandon initialization only after its last observer withdraws; serialize independent later bootstrap behind original-process cleanup and retain permanent-stop fencing.
+- Invalidate model directory/default caches when their original App Server process changes; preserve same-process cache hits and explicit model/effort overrides for independent new work.
+- Fence asynchronous catalog parsing, default derivation and named/fallback Plan-mode metadata by their captured cache generation, so late old results cannot repopulate a successor's namespace.
+- Prepare and recheck the actual process around public model metadata reads; admitted Planner/Reviewer settings remain frozen to their original thread owner.
+- Preserve failed or malformed initialization causes, clean only the failed original child, and require initialization again before accepting a later SDK request.
+- Make full-suite file concurrency configurable through `DSH_WORKFLOW_TEST_CONCURRENCY` (1–4, default 4), so memory-limited hosts can run the same complete suite with fewer workers.
+
+- Bind model requests, native answers, interruption and subscription cleanup to the original App Server ChildProcess and thread registration; reject a replacement process even when it reuses the same public IDs.
+- Carry opaque transport owners through Planner checkpoints, foreground/background Reviewer recovery and private alignment/reconciliation; preserve a successor's live writer, subscription and usage cache after old cleanup.
+- Bind current and historical metering to the admitted execution owner, rejecting stale bindings before and after asynchronous persistence so old callbacks cannot replace a successor's source or model attribution.
+- Document fixed vscode-jsonrpc and gRPC cancellation patterns and distinguish original-thread recovery from durable queue/result delivery after restart.
+- Scope successful terminal and auxiliary cleanup receipts to their original execution owner; reused workflow/thread/turn IDs or a historical confirmed tombstone cannot acknowledge a new run.
+- Require the exact session, token and lease epoch for persisted cleanup confirmation/release; preserve a successor's marker even when its scope and primary error match the old run.
+- Publish each new terminal run's guard before its waiting marker, keep failed ACK recovery model-free, and share concurrent confirmation only within the same original owner.
+- Preserve a newly registered auxiliary owner after an old ACK arrives, releasing only the old execution's process pin and retaining the new writer's subscription.
+- Clarify no-ID status/resume and late original creation receipts: caller abort does not imply process restart, and duplicate-start guidance is not a permanent failed-start quota.
+- Confirm original-turn cleanup after failed registration/settings callbacks and unexpected private user-input requests; retain failed ACKs with a cleanup-only marker, original cause and captured process tree.
+- Keep terminal Planner/Reviewer recovery strictly cleanup-only, preserving the original thread/child/pin and primary error until exact confirmation; no automatic model continuation or replacement is permitted.
+- Persist an independent terminal cleanup guard across Manager views, cancellation and scope changes; elapsed lease TTL does not prove writer termination, and confirmations never rewrite a successor's workflow.
+- Preserve rejected background Reviewer resources through persistent retry and cancellation, and reconcile remaining resources after the owned SDK actually exits during plugin shutdown.
+- Clear native input on terminal notifications while keeping terminal receipts, and retain specific returned conversion diagnostics instead of replacing permission/Schema failures with generic turn failure.
+- Preserve completed Planner stages and resume only failed conversion or controlled completion on the original thread/child; keep one automatic continuation budget across clarification and manual resumes.
+- Send short private-stage continuations without replaying the complete planning input; freeze effective model/effort choices and reject missing or changed checkpoints instead of reconstructing context.
+- Capture validated successful Planner receipts before caller-abort checks, prevent completed conversion/completion replay, and show the actual completion output in the native child conversation.
+- Collect admitted Planner creation responses within the original RPC deadline after caller abort; report pending startup, retain a returned original thread/child for continuation, and clean cancelled or stopped late resources once.
+- Expose only the current session's latest failed Planner startup for no-ID diagnostics when there is no active workflow; reject terminal recovery and earlier-task fallback, and check cancellation before initial creation admission.
+- Retain validated foreground review stages and resume only failed conversion, alignment or correction work, keeping the original Reviewer and child with one automatic continuation budget for the whole round.
+- Preserve exact private-turn cleanup receipts, original scope/settings/evidence and unavailable-result guards; temporary final evidence reads can finish from the cached verdict without another model call.
+- Reject default repeated registered terminal failures and unresolved contract rounds; require real original-scope changes or explicit independent-round intent, while retaining first-thread startup retry.
+- Save CLI correction output before normalization, keep the legacy two-argument API, and use non-persistent exec calls without resuming placeholder thread IDs.
+- Prioritize permission/authentication rejection over mixed stream/overload text in both retry layers, and preserve strictly classified raw generic CLI model failures through their process envelope.
+- Retain the foreground unknown-interruption barrier when its launcher exits during process-tree capture, and durably save confirmed cleanup before an aborted continuation startup restores its waiting handle.
+- Persist original backend-process evidence for unconfirmed foreground Reviewer interruption; an empty Manager runtime, unavailable SDK projection or explicit new-round flag cannot bypass an original live/unknown writer.
+- Admit new foreground business reviews on the existing workflow after verified changes in its original evidence scope, including process loss; require explicit independent-round intent for unchanged evidence and keep that control out of review material.
+- Confirm outstanding original Reviewer interruption before replacing its round, retain waiting resources on failed confirmation, and acquire the same review lease for direct original-thread resume.
+- Distinguish concurrent foreground new-round intent from identical original review material, rejecting conflicting requests before another Reviewer is created.
+- Align background status, turn-stop guidance and submission notices with original-thread or completed-result unavailability, preserving the primary failure and reporting distinct recovery reasons.
+- Reject default unchanged-material submissions after original resource loss; verify changes in the original file scope or require an explicit new independent review request, keeping admission controls out of saved review material.
+- Preserve first-review startup retry before thread registration, legacy callback behavior and unknown historical failures; add read-only interpretation of exact project-owned historical unavailable diagnostics.
+- Transfer active and retained background Reviewer consumers on their original thread and native child; old lease loss and late finalizers cannot cancel or dispose a valid successor's shared resources.
+- Route shared-model progress, display rewrites and metering hooks through the current admitted consumer; separate consumer wait cancellation from physical model cancellation and await owned cleanup before release.
+- Report retired or missing original ephemeral background resources explicitly, including fresh-process recovery, instead of rebuilding the same review; preserve legacy callback adapters and explicit workflow cancellation/plugin stop.
+- Retain exact review heartbeat registrations across asynchronous cleanup; old callback finalizers and ownership-error handlers cannot stop a still-running successor's timer.
+- Validate heartbeat startup before replacing a registration, reject obsolete stale probes without revision writes, and preserve explicit cancellation/plugin-stop timer cleanup.
+- Carry explicit Bridge progress guards through private alignment/reconciliation creation, turn registration, retry and conversion; revoked work cannot publish fallback progress or invoke another fallback model.
+- Fence callback display/continuation hooks and live-batch emission with a current SQLite snapshot and actual lease, retaining valid-owner progress and dropping pre-takeover buffered updates after supersession.
+- Preserve final observation authority for a terminal phase committed by the owning submission, without accepting arbitrary phase changes or weakening scope/lease checks.
+- Snapshot effective foreground Reviewer request settings, preserving automatic/manual continuation choices and an unresolved model omission across global configuration changes; missing original settings fail explicitly without replacement.
+- Use the captured model for foreground conversion, authority alignment and reconciliation; keep existing private effort policies and allow explicit new review rounds to select new unsaved settings.
+- Fence Bridge final observation and cleanup-note updates by original submission context and the current actual lease; a revoked callback cannot update successor revision/timestamps or emit its review-end event.
+- Capture immutable original Reviewer scope, settings and waiting attempt in process-local recovery handles; status, resume and explicit changed-workspace preparation share identity checks instead of retargeting a retained thread from changed records.
+- Recheck Reviewer identity after interruption cleanup and claimed startup; reject missing/drifted identities without model work or replacement-history writes, retain the original handle for cleanup, and permit legitimate same-thread attempt advancement.
+- Limit full-suite execution to four independent test-file processes while preserving all tests and scenario-level concurrency; avoid core-count-based worker bursts starving local transport and lifecycle fixtures.
+- Route parent turn-stop guidance by workflow action: waiting Planner/Reviewer requires status and same-thread resume, and review-only startup failure requests the existing review without inventing implementation work.
+- Check the current SQLite row revision, cancellation/teardown and active original operation before nudging; stale reads and already running continuations cannot prompt duplicate review work or consume a valid nudge key.
+- Persist review-only workflows in a retryable pre-admission phase and finalize owned startup aborts without false running progress, model handles or review cycles; preserve another manager's lease and record.
+- Serialize review-only creation with the session creation lease, recheck active workflows under that lease, and carry the original review scope through admission and child startup to reject displaced tasks before model work.
+- Treat a read-only recovery drill query that reaches its observation deadline as `observation_timeout`, retaining the last original workflow/child receipt without cancelling or repeating the admitted prompt; preserve API and mutating RPC errors.
+- Finalize foreground child/review-observation startup failures into the same retryable workflow without consuming a model turn or review cycle; return current cancellation and await late child cleanup on stop.
+- Guard foreground child adoption, review-start/heartbeat transactions and Reviewer binding against the original scope and attempt; displaced startup cannot run a model or change a replacement record.
+- Preserve a claimed waiting Reviewer when continuation startup aborts before observation; restore the exact recovery handle without changing the waiting record or releasing its original child/thread/pin.
+- Track admitted Bridge startup through child creation and background transfer; teardown awaits late creation, and cancelled submissions return their current owned state.
+- Recheck prepared ownership and the actual lease before and after child creation and inside review-start/progress transactions; reject late children without overwriting replacement handles.
+- Preserve startup after a caller-only abort following durable preparation, dispose teardown-late native handles before opening turns, and release leases even when child disposal fails.
+- Freeze Bridge submission input before asynchronous collection and recheck the original owner, route, phase and context inside admission transactions; rejected preparation cannot alter a displaced record during cleanup.
+- Verify original evidence before every background callback attempt, including legacy recovery; refuse missing/insufficient or changed snapshots without creating a replacement Reviewer.
+- Checkpoint a completed Bridge callback through authority-validation failures; retry only validation in the original DSH child without another readable Reviewer or metering source.
+- Bind result reuse to the original submission context and workspace evidence, recheck before staging, and refuse silent re-execution when a durable pending marker survives without its process-local result.
+- Repair pending markers during retry persistence, suppress unvalidated pass/result projections, and fence progress/heartbeats and lease cleanup against displaced owners.
+- Reject foreground reviews of Bridge workflows before creating resources; preserve the original submit/background entry and check session ownership first.
+- Release private alignment/reconciliation seeds after their full scope; retain unconfirmed original auxiliary turns for cancel/stop cleanup, without disguising them as visible Reviewer continuations or starting another review.
+- Pin each private seed throughout creation, retry backoff and nested rechecks, including Bridge work after the original callback releases its Reviewer; transfer that same pin to unconfirmed cleanup.
+- Clarify the interrupted-start tool contract: a missing returned id does not prove a missing record, and unconfirmed interruption permits cleanup-only resume before model continuation.
+- Await original-turn interruption before rejecting model waits; preserve unconfirmed pairs with a typed marker that blocks model backoff and automatic continuation. Planner, Reviewer and Bridge confirm cleanup before reusing the original thread.
+- Accept later terminal notifications as confirmation, prevent cleanup-driven process respawn after exit/stop, and scope transport callbacks to their current child process.
+- Expand installed-host recovery coverage to eleven scenarios, including ordinary Planner/Reviewer interruption failures and cleanup retries; keep real-client stdio fixture evidence separate from scripted-host acceptance.
+- Confirm interruption after a native Planner answer is submitted before offering another turn; retain unconfirmed original turns for cleanup-only resume retries, without replying twice or creating a replacement. Cancel/stop handle the retained original pair.
+- Validate public foreground return ownership against the calling DSH session, and check Planner scope before cancelled fast returns; keep usage refresh limited to the original business result and owner.
+- Capture the original Planner scope in waiting and clarification handles; fence late outcomes, conversion failures, automatic continuation and final mutations to that identity and legal phase. Changed identities report `identity_changed` without consuming the original handle or rebuilding a thread.
+- Clear terminal Planner cancellation targets after suppressed native-input commits, preventing repeated cancel/stop from interrupting an already released turn; retain confirmed interruption/restore for an answer aborted before its RPC.
+- Recheck foreground review evidence after every model stage before applying verdicts or contract failures; reject changed/unverifiable snapshots without consuming a cycle, emitting repair instructions or creating an automatic replacement Reviewer.
+- Bind Git evidence fingerprints to the actual HEAD commit, distinguish verified unborn branches from broken references, and fence final acceptance/observations to the original owner, review attempt and baseline evidence.
+- Confirm interruption of an unanswered native Planner turn before offering new-turn recovery; restore the original request when interruption is unconfirmed, and recheck cancellation/teardown after cleanup.
+- Expand the installed-host recovery smoke to eight scenarios, including native and completed-question clarification answers and cancellation; record separate formal DSH question/answer acceptance.
+- Preserve the original Planner child, thread and pin across native and completed-question clarification; reply or send short answers without starting a replacement or repeating the task.
+- Merge identical concurrent clarification answers, cancel their admitted execution and retain submitted answers for original-session recovery after failure or interruption; release native input resources once when cancellation wins a pending commit.
+- Retain Planner model and requested effort before startup, failure and interruption; reuse the client-resolved model across transient retries, continuation and visible completion without inheriting later config changes.
+- Permit an explicit new review after an interrupted Reviewer's original workspace evidence changes; end the old round once and keep status/resume restricted to original-thread recovery.
+- Diagnose changed or unreadable workspace evidence before offering a waiting Reviewer continuation; keep its original handle and recheck ownership and lifecycle after the read.
+- Route the legacy Planner `continue` failure-recovery branch through the shared `resume` admission, preventing it from bypassing concurrency, original-thread availability and cancellation checks.
+- Claim child disposal once across workflow cancellation and execution cleanup, including asynchronous teardown, without retaining completed child objects.
+- Project durable usage history to a concise default Native tool display while retaining full canonical values and saved source history; `codex_workflow_status` can explicitly display usage sources for diagnostics.
+- Validate actual complete-operation deadlines against the DSH host limit before registering tools or opening storage; preserve all supported combinations without shortening configured budgets.
+- Emit native assistant tool-call advertisements before invocation events and balance stream steps for V4 stored-sidebar replay across continuation; existing corrupt logs are not rewritten automatically.
+- Add a loopback-only native DSH smoke helper with private temporary authentication state, selected-session summaries and explicit child role/format diagnostics.
+- Persist server-reported original-thread usage as opaque, deduplicated source snapshots in workflow records; retain observations across completion, cancellation, cache cleanup and storage reopen while reporting missing/partial data explicitly.
+- Drain late usage before releasing foreground and callback subscriptions, and refresh successful foreground tool output after final metering writes.
+- Isolate usage persistence from business-phase/lease fences, preserve retryable metering faults without re-running models, and mark counter regressions, integer overflow and mixed-model sources.
+- Admit one foreground review per workflow/input, check review-cycle limits before model execution, and fence review writes to the live SQLite lease so competing or former owners cannot consume duplicate review rounds.
+- Preserve measured usage for waiting foreground Reviewers and background Bridge submissions; keep internal fork counters separate from their original Reviewer.
+- Continue local model turn timeouts once on their original thread; retain waiting handles after a second timeout, while control-RPC/terminal failures remain distinct.
+- Reserve per-operation retry budgets and separate CLI conversion/alignment deadlines in tool timeouts; saturate overflow and release waiting thread subscriptions during cancel/stop.
+- Capture actual App Server thread token notifications with bounded, deduplicated snapshots; expose measured original-thread input/cache/output counters in status without estimating total workflow cost.
+- Clarify interrupted-start recovery directly in tool descriptions, including manual workflows with auto-trigger disabled; unavailable original handles report failure without parent-authored replacements.
+- Add an isolated recovery smoke against the installed DSH ToolRuntime, SubagentRuntime and native session projections, separate from production UI/model acceptance.
+- Retain background submission Reviewer threads and native child conversations across scheduled retries; deduplicate identical sends, reject changed request identity, and retry validated result conversion without repeating a readable review.
+- Restore background running observations/heartbeats during continuation; release retained subscriptions and process pins on cancel/stop, including asynchronous cleanup and creation windows.
+- Expose `status.continuation` from process-local thread availability; probes do not spawn processes or send RPCs, and observed loss of an ephemeral Reviewer fails the original submission explicitly.
+- Merge concurrent same-workflow continuation requests after checking DSH session ownership; reject conflicting instructions and wait for admitted continuations during cancellation/teardown.
+- Keep interrupted Planner/Reviewer handles addressable without a returned workflow id, append continuation messages to the original child, and send short Reviewer continuation instructions on the original Codex thread.
+- Reject continued reviews whose workspace evidence changed; clear stale recovery/error state after success and balance interrupted tool calls before child conversation replay.
+- Record fixed-commit GitHub comparisons and the adopted mechanisms in `docs/research/` and `docs/iterations/`.
+
 ## [1.1.13] - 2026-09-27
 
+- Recoverable Planner and Reviewer model failures now continue once on the same App Server thread and native DSH child instead of replaying the task in a new subagent.
+- A second failure keeps the original in-process thread available through `codex_workflow_resume`; terminal protocol, permission, contract and cancellation errors keep their existing fail-closed behavior.
 - Added a DSH Built-in Plugins settings tab for Planner/Reviewer model and reasoning-effort selection.
 - Model and effort fields are live settings; new workflow turns pick up changes without restarting DSH.
 - Tool progress in the Codex Review fallback sidebar is grouped into collapsible sections, with full text retained inside each section.

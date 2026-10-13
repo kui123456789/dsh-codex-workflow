@@ -319,6 +319,22 @@ test("workflow store creates a pre-schema-v2 database backup before opening an e
   }
 });
 
+test("workflow store fails closed when the pre-schema-v2 backup cannot be written", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-schema-backup-failure-"));
+  try {
+    const first = new WorkflowStore(directory);
+    await first.init();
+    first.close();
+    const second = new WorkflowStore(directory, {
+      copyFile: async () => { throw new Error("backup destination is unavailable"); },
+    });
+    await assert.rejects(second.init(), /backup destination is unavailable/);
+    second.close();
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
 test("workflow store reports the workflow id when a persisted schema is corrupt", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-schema-corrupt-"));
   try {

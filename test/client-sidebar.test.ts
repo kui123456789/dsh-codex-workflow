@@ -271,3 +271,41 @@ test("settings tab renders an explicit state when the Host form is not ready", (
   assert.match(rendered, /Planner 模型/);
   dispose?.();
 });
+
+test("settings tab binds ConfigForm subscription and reads models over Connection RPC", async () => {
+  let plugin: { apply(ctx: unknown): void } | undefined;
+  let settingsBody: ((props: unknown) => unknown) | undefined;
+  const calls: Array<[string, string]> = [];
+  const source = readFileSync(join(process.cwd(), "src/client.js"), "utf8");
+  const h = (type: unknown, props: Record<string, unknown> | null, ...children: unknown[]): unknown => ({ type, props, children });
+  runInNewContext(source, { setTimeout, clearTimeout, window: { __ModuleLoader__: { load: (entry: { factory(require: (name: string) => unknown): { apply(ctx: unknown): void } }) => {
+    plugin = entry.factory(() => ({ createElement: h,
+      useSyncExternalStore: (subscribe: (listener: () => void) => () => void, getSnapshot: () => unknown) => { subscribe(() => undefined); return getSnapshot(); },
+      useMemo: (factory: () => unknown) => factory(), useState: (initial: unknown) => [initial, () => undefined],
+      useRef: (initial: unknown) => ({ current: initial }), useEffect: (effect: () => void) => effect() }));
+  } } } });
+  class HostForm {
+    subscribed = false;
+    getSnapshot() { return { status: "ready", value: {}, writable: true }; }
+    subscribe(_listener: () => void) { this.subscribed = true; return () => undefined; }
+  }
+  const form = new HostForm();
+  const connection = { rpc: { call: async (channel: string, endpoint: string) => {
+    calls.push([channel, endpoint]);
+    return { ok: true, value: { models: [{ id: "dynamic-test-model", name: "Dynamic test model" }] } };
+  } } };
+  plugin!.apply({ configForms: { get: () => form }, connection,
+    sidebarRightTabs: { register: () => () => undefined },
+    slots: { inject: (_name: string, register: () => void) => { register(); return () => undefined; },
+      register: (definition: { name?: string }, component: (props: unknown) => unknown) => {
+        if (definition.name === "settings.plugins.tab") settingsBody = component;
+        return () => undefined;
+      } },
+    sidebarRight: { mounted: { getSnapshot: () => undefined, subscribe: () => () => undefined } },
+    sessions: { binding: () => undefined } });
+  assert.ok(settingsBody);
+  assert.doesNotThrow(() => settingsBody!({ configForm: form, connection }));
+  assert.equal(form.subscribed, true);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(calls, [["/dsh-codex-workflow", "models"]]);
+});

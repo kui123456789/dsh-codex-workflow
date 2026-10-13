@@ -73,7 +73,7 @@ test("startTurn interrupts the turn when onStarted fails", async () => {
   try {
     const threadId = await codex.startThread({ cwd: process.cwd(), name: "Failing onStarted" });
     await assert.rejects(codex.startTurn(threadId, {
-      prompt: "Plan it",
+      prompt: "HANG",
       planMode: true,
       outputSchema: PLANNER_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
       onStarted: async () => { throw new Error("onStarted failed"); },
@@ -96,7 +96,7 @@ test("startReview interrupts the reviewer turn when onStarted fails", async () =
     args: [fixture],
     requestTimeoutMs: 5_000,
     idleProcessMs: 0,
-    env: { ...process.env, FAKE_CODEX_INTERRUPT_MARKER: marker },
+    env: { ...process.env, FAKE_CODEX_INTERRUPT_MARKER: marker, FAKE_CODEX_HANG_REVIEW: "1" },
   });
   try {
     const planner = await codex.startThread({ cwd: process.cwd(), name: "Review source" });
@@ -129,6 +129,7 @@ test("startReview interrupts the reviewer turn when thread settings fail", async
       ...process.env,
       FAKE_CODEX_FAIL_SETTINGS: "1",
       FAKE_CODEX_INTERRUPT_MARKER: marker,
+      FAKE_CODEX_HANG_REVIEW: "1",
     },
   });
   try {
@@ -364,7 +365,7 @@ test("normalizeInFork interrupts the fork and unsubscribes exactly once when onS
     await assert.rejects(codex.normalizeInFork({
       threadId: source,
       cwd: directory,
-      prompt: "Convert",
+      prompt: "HANG",
       outputSchema: REVIEW_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
       onStarted: async () => { throw new Error("onStarted failed"); },
     }), /onStarted failed/);
@@ -669,18 +670,29 @@ test("visible Planner activity streams before the turn finishes", async () => {
 test("visible Reviewer text streams before the turn finishes", async () => {
   const codex = new CodexAppServerClient({ command: process.execPath, args: [fixture],
     requestTimeoutMs: 5_000, idleProcessMs: 0,
-    env: { ...process.env, FAKE_CODEX_STREAM_VISIBLE: "1", FAKE_CODEX_TURN_DELAY_MS: "500" } });
+    env: { ...process.env, FAKE_CODEX_STREAM_VISIBLE: "1", FAKE_CODEX_TURN_DELAY_MS: "500",
+      FAKE_CODEX_RPC_DELAY_MS: "200", FAKE_CODEX_HOLD_STREAM_REVIEW: "1" } });
   let turn: Promise<unknown> | undefined;
   try {
     const threadId = await codex.startThread({ cwd: process.cwd(), ephemeral: true });
     const seen: Array<{ kind: string; text: string }> = [];
     let settled = false;
+    let observed!: () => void;
+    const visible = new Promise<void>((resolve) => { observed = resolve; });
     turn = codex.startReview({ threadId, cwd: process.cwd(), detached: false,
       target: { type: "custom", instructions: "Review" },
-      onProgress: (entry) => seen.push(entry) }).finally(() => { settled = true; });
-    await new Promise((resolve) => setTimeout(resolve, 150));
+      onProgress: (entry) => {
+        seen.push(entry);
+        if (seen.filter((item) => item.kind === "message").map((item) => item.text).join("") === "VERDICT: pass") observed();
+      } }).finally(() => { settled = true; });
+    // Observe the actual pipe before permitting its original completion. The
+    // existing turn timeout bounds missing progress and completion. Control
+    // RPC latency can delay admission while preserving this streaming order.
+    await Promise.race([visible, turn.then(() => { throw new Error("Reviewer completed before its visible text was observed"); })]);
     assert.equal(settled, false);
     assert.equal(seen.filter((entry) => entry.kind === "message").map((entry) => entry.text).join(""), "VERDICT: pass");
+    await (codex as unknown as { request(method: string, params: object): Promise<unknown> })
+      .request("fixture/releaseStreamReview", { threadId });
     await turn;
   } finally {
     await turn?.catch(() => undefined);
@@ -792,8 +804,11 @@ test("interrupts an active Codex turn when DSH cancels", async () => {
   try {
     const threadId = await codex.startThread({ cwd: process.cwd(), name: "Cancelled turn" });
     const controller = new AbortController();
-    const turn = codex.startTurn(threadId, { prompt: "HANG" }, controller.signal);
-    setTimeout(() => controller.abort(new Error("cancelled by DSH")), 50);
+    const turn = codex.startTurn(threadId, { prompt: "HANG",
+      // Cancel the actually registered hung turn. A wall-clock delay may fire
+      // while model preparation is still waiting and has no interrupt target.
+      onStarted: () => controller.abort(new Error("cancelled by DSH")),
+    }, controller.signal);
     await assert.rejects(turn, /cancelled by DSH/);
     await waitForFile(marker);
     assert.match(await readFile(marker, "utf8"), /^thread-\d+:turn-\d+$/);

@@ -14,7 +14,7 @@ import { SystemDesktopThreadOpener } from "./desktop-thread-opener.js";
 import { REVIEW_OUTPUT_SCHEMA } from "./schemas.js";
 import { ALIGN_OUTPUT_SCHEMA } from "./review-authority.js";
 import { WorkflowStore } from "./store.js";
-import { createWorkflowTools } from "./tools.js";
+import { createWorkflowTools, workflowToolTimeouts } from "./tools.js";
 import type { WorkflowConfig } from "./types.js";
 import { WorkflowManager } from "./workflow.js";
 import { codexWorkflowProjectionDefinition } from "./review-events.js";
@@ -25,18 +25,19 @@ export const name = "dsh-codex-workflow";
 // The projection must be registered before Session Controller replays history;
 // otherwise a refreshed DSH page rejects our namespaced workflow events as
 // unknown and the browser cannot open the Codex Review tab.
-export const inject = ["tools", "agents", "systemPrompt", "sessionProjections", "subagents"];
+export const inject = ["tools", "agents", "systemPrompt", "sessionProjections", "subagents", "connection"];
 export const Config = ConfigSchema;
 export type Config = RawConfig;
 
 export async function apply(ctx: Context, raw: Config): Promise<void> {
+  const config = resolveConfig(raw);
+  workflowToolTimeouts(config);
   const projections = ctx.get("sessionProjections") as { register(definition: typeof codexWorkflowProjectionDefinition): () => void } | undefined;
   // Register synchronously at plugin activation. Session Controller may replay
   // existing history before async host setup finishes; delaying this until the
   // effect body makes our namespaced events appear unknown after a page refresh.
   const disposeProjection = projections?.register(codexWorkflowProjectionDefinition) ?? (() => undefined);
   await ctx.effect(async () => {
-    const config = resolveConfig(raw);
     const store = new WorkflowStore(config.storageDir);
     await store.init();
     const bridgeStore = new BridgeStore(config.storageDir, config.bridgeMaxPayloadBytes);
@@ -129,6 +130,8 @@ export async function apply(ctx: Context, raw: Config): Promise<void> {
       await disposeModelCatalogRoute?.();
       await audit.stop();
       await codex.stop();
+      await callback.stop();
+      await manager.stop();
       bridgeStore.close();
       store.close();
     };
@@ -194,17 +197,15 @@ function resolveConfig(raw: Config): WorkflowConfig {
  * current App Server model catalog. The route is read-only and carries no
  * credentials or prompt content. */
 function registerModelCatalogRoute(ctx: Context, codex: CodexAppServerClient): (() => void) | undefined {
-  const connection = ctx.get("connection") as { fetch?: { register(route: {
-    path: string;
-    methods: readonly ["POST"];
-    requestBody: "buffered";
-    fetch(request: unknown): Promise<Response>;
-  }): () => void | Promise<void> } } | undefined;
-  return connection?.fetch?.register({
-    path: "/api/dsh-codex-workflow/models",
-    methods: ["POST"],
-    requestBody: "buffered",
-    fetch: async () => Response.json({ models: await codex.listModels() }, { headers: { "cache-control": "no-store" } }),
+  const connection = ctx.get("connection") as { rpc?: { handle(channel: "/dsh-codex-workflow", handler: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>): () => void | Promise<void> } };
+  return connection.rpc?.handle("/dsh-codex-workflow", async (endpoint, _payload, signal) => {
+    if (endpoint !== "models") return { ok: false, error: { code: "dsh-codex-workflow/not-found", message: "unknown workflow endpoint", details: {} } };
+    try {
+      const models = await codex.listModels(signal);
+      return { ok: true, value: { models } };
+    } catch (error) {
+      return { ok: false, error: { code: "dsh-codex-workflow/models", message: error instanceof Error ? error.message : String(error), details: {} } };
+    }
   });
 }
 

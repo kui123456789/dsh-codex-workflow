@@ -14,6 +14,11 @@ export interface UpdateOutcome<T> {
   result: T | undefined;
 }
 
+export interface WorkflowStoreOptions {
+  /** Injectable only for testing backup failure; production uses fs.copyFile. */
+  copyFile?: typeof copyFile;
+}
+
 /**
  * SQLite-backed workflow store. Every read-modify-write cycle runs as a
  * conditional revision CAS inside one `BEGIN IMMEDIATE` transaction, so
@@ -27,7 +32,7 @@ export class WorkflowStore {
   private closed = false;
   private migrationBackupDone = false;
 
-  constructor(readonly directory: string) {}
+  constructor(readonly directory: string, private readonly options: WorkflowStoreOptions = {}) {}
 
   /** The shared SQLite coordination handle (also hosts leases for workflow
    * submissions and the bridge queue). Throws once the store is closed. */
@@ -47,9 +52,13 @@ export class WorkflowStore {
     this.migrationBackupDone = true;
     const source = coordinationPath(this.directory);
     const backup = `${source}.pre-schema-v2.bak`;
-    try { await access(source); } catch { return; }
-    try { await access(backup); } catch {
-      await copyFile(source, backup).catch(() => undefined);
+    try { await access(source); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    try { await access(backup); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      await (this.options.copyFile ?? copyFile)(source, backup);
     }
   }
 
@@ -81,6 +90,13 @@ export class WorkflowStore {
     const row = this.coordination!.loadWorkflow(id);
     if (row) return parseWorkflowRow(row);
     return this.importLegacyFile(id);
+  }
+
+  /** Current SQLite snapshot for synchronous notification guards. The
+   * owning execution has already initialized/imported its workflow. */
+  snapshot(id: string): WorkflowRecord | undefined {
+    const row = this.ensure().loadWorkflow(id);
+    return row ? parseWorkflowRow(row) : undefined;
   }
 
   async list(): Promise<WorkflowRecord[]> {
@@ -147,8 +163,18 @@ export class WorkflowStore {
   async activeForSession(sessionId: string): Promise<WorkflowRecord | undefined> {
     const terminal = new Set<WorkflowPhase>(["passed", "blocked", "failed", "cancelled"]);
     return (await this.list()).find(
-      (record) => record.dshSessionId === sessionId && !terminal.has(record.phase),
+      (record) => record.dshSessionId === sessionId
+        && (!terminal.has(record.phase) || record.retryState?.awaitingStartReceipt === true),
     );
+  }
+
+  /** A failed first Planner startup stays addressable after its tool returned
+   * no id. Never skip a newer task to expose an older failure as current. */
+  async failedPlannerStartupForSession(sessionId: string): Promise<WorkflowRecord | undefined> {
+    const latest = (await this.list()).filter((record) => record.dshSessionId === sessionId)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+    return latest?.phase === "failed" && latest.mode === "planned" && !latest.planMarkdown?.trim()
+      ? latest : undefined;
   }
 
   /**

@@ -239,16 +239,21 @@ test("1.1.3: a writer conflict on the Reviewer is retried, and a spent budget st
     },
   });
   try {
+    let clock = 0;
     const callback = new AppServerCodexCallbackDispatcher(stuck, {
       policy: { budgetMs: 120_000 },
-      hooks: { sleep: async () => undefined, random: () => 0.5, now: (() => { let clock = 0; return () => (clock += 60_000); })() },
+      // Observing time must not spend the budget. Model delayed wake-ups while
+      // preserving one retry inside the original 120s window.
+      hooks: { sleep: async () => { clock += 60_000; }, random: () => 0.5, now: () => clock },
     });
     const outcome = await callback.send({ ...request, submissionId: "submission-writer-2" });
     assert.deepEqual(outcome, { kind: "retryable_busy", reason: "active writer" });
     const calls = await readCalls();
     assert.equal(calls.filter((call) => call.method === "thread/unsubscribe").length, 0,
       "a PRE-EXISTING Reviewer is never released by a failed resume");
-    assert.ok(calls.filter((call) => call.method === "thread/resume").length >= 2, "the conflict was retried");
+    assert.equal(calls.filter((call) => call.method === "thread/resume").length, 2,
+      "one retry is admitted inside the original budget; the deadline wake-up admits none");
+    assert.equal(clock, 120_000);
   } finally {
     await stuck.stop();
     await rm(directory, { recursive: true, force: true });
@@ -858,6 +863,7 @@ test("cancel latches the visible->fork window: a fork that starts after cancel i
       ...process.env,
       FAKE_CODEX_THREAD_PARAMS_MARKER: callsFile,
       FAKE_CODEX_FORK_GATE_FILE: gateFile,
+      FAKE_CODEX_HANG_CONVERSION: "1",
       FAKE_CODEX_INTERRUPT_MARKER: interruptFile,
       FAKE_CODEX_PLAIN_REVIEW_MARKDOWN: "1",
       FAKE_CODEX_REVIEW_VERDICT: JSON.stringify({ verdict: "pass", findings: [], testGaps: [], summary: "ok" }),

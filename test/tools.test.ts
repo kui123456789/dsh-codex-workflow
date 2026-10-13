@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createWorkflowTools, MAX_SERIAL_RPCS, PLANNER_MAX_TURNS, REVIEW_MAX_TURNS, reviewToolTimeout, startToolTimeout } from "../src/tools.js";
+import { createWorkflowTools, MAX_REVIEW_CLI_TURNS, MAX_SERIAL_RPCS, PLANNER_MAX_TURNS, REVIEW_MAX_TURNS, reviewToolTimeout, startToolTimeout } from "../src/tools.js";
 import { APPENDED_READBACK_TIMEOUT_MS } from "../src/app-server.js";
 import type { WorkflowConfig } from "../src/types.js";
 
@@ -83,15 +83,15 @@ test("submit concludes the DSH turn only after durable submission succeeds", asy
   assert.equal(concluded, 0);
 });
 
-test("review timeout covers the seven-turn worst path (review + rewrite + conversion + alignment + reconciliation + re-conversion + re-alignment)", () => {
+test("review timeout covers the eight-turn worst path (including same-thread continuation)", () => {
   const config = { ...base, turnTimeoutMs: 30 * 60 * 1000 };
   const toolTimeout = timeoutOf(config, "codex_workflow_review");
   assert.ok(toolTimeout >= REVIEW_MAX_TURNS * config.turnTimeoutMs, `review timeout ${toolTimeout} must cover ${REVIEW_MAX_TURNS} turns (${REVIEW_MAX_TURNS * config.turnTimeoutMs})`);
   const reviewOnly = timeoutOf(config, "codex_workflow_review_only");
-  assert.ok(reviewOnly >= REVIEW_MAX_TURNS * config.turnTimeoutMs, "review_only must also cover the seven-turn worst path");
+  assert.ok(reviewOnly >= REVIEW_MAX_TURNS * config.turnTimeoutMs, "review_only must also cover the eight-turn worst path");
 });
 
-test("start/continue timeouts cover the four-turn planner worst path", () => {
+test("start/continue timeouts cover the five-turn planner worst path", () => {
   const config = { ...base, turnTimeoutMs: 30 * 60 * 1000 };
   assert.ok(timeoutOf(config, "codex_workflow_start") >= PLANNER_MAX_TURNS * config.turnTimeoutMs);
   assert.ok(timeoutOf(config, "codex_workflow_continue") >= PLANNER_MAX_TURNS * config.turnTimeoutMs);
@@ -105,11 +105,24 @@ test("codex_workflow_review description reflects the ephemeral DSH sidebar path"
   const review = tools.find((tool) => tool.name === "codex_workflow_review")!;
   const description = review.description ?? "";
   assert.match(description, /fresh hidden ephemeral Reviewer thread/);
-  assert.match(description, /no Codex Desktop task is created or resumed/);
+  assert.match(description, /no Codex Desktop task is created or resumed/i);
   assert.match(description, /right sidebar/);
   const reviewOnly = tools.find((tool) => tool.name === "codex_workflow_review_only")!;
   assert.ok(!/(existing Planner task|to this workflow's existing Codex task)/i.test(reviewOnly.description ?? ""),
     "review_only must not claim a Planner task");
+});
+
+test("foreground review transmits independent-round intent as a separate control", async () => {
+  let received: unknown;
+  const record = { id: "workflow-round", phase: "executing", questions: [], assumptions: [], reviewCycles: 0 };
+  const manager = { review: async (_id: string, input: unknown) => { received = input; return record; } };
+  const review = createWorkflowTools(manager as never, base).find((tool) => tool.name === "codex_workflow_review")!;
+  await (review.execute as never as (args: unknown, exec: unknown) => Promise<unknown>)(
+    { workflowId: record.id, implementationSummary: "done", changedFiles: ["changed.txt"], newReviewRound: true }, {},
+  );
+  assert.deepEqual(received, { implementationSummary: "done", changedFiles: ["changed.txt"], newReviewRound: true });
+  assert.match(review.description ?? "", /user explicitly requests a new independent review/i);
+  assert.match(review.description ?? "", /interruption.*confirmed|confirm.*interruption/i);
 });
 
 test("codex_workflow_start description authorizes autonomous pre-change planning and forbids duplicate starts", () => {
@@ -119,6 +132,71 @@ test("codex_workflow_start description authorizes autonomous pre-change planning
   assert.match(description, /before making changes/i);
   assert.match(description, /at most once per task\/session/i);
   assert.match(description, /hidden ephemeral thread/);
+});
+
+test("explicit start describes same-session recovery even when auto-triggering is off", () => {
+  const tools = createWorkflowTools({} as never, { ...base, autoTriggerMode: "off" });
+  const start = tools.find((tool) => tool.name === "codex_workflow_start")!;
+  const description = start.description ?? "";
+  assert.match(description, /not a permanent attempt quota/i);
+  assert.match(description, /interrupted before returning workflowId/i);
+  assert.match(description, /codex_workflow_status without an id/);
+  assert.match(description, /codex_workflow_resume with workflowId omitted/);
+  assert.match(description, /Send a model continuation.*codex_workflow_resume with workflowId omitted only when status\.continuation\.available is true/);
+  assert.match(description, /interruption_unconfirmed.*retry cleanup.*original thread\/turn pair.*continuation\.available is false/);
+  assert.match(description, /no new model turn until interruption is confirmed/);
+  assert.match(description, /never repeats submitted native answers/);
+  assert.match(description, /running, wait for the existing operation/i);
+  assert.match(description, /report continuation\.reason.*status lookup error/i);
+  assert.match(description, /For other unavailable reasons, report continuation\.reason/);
+  assert.match(description, /do not create a replacement workflow or author a substitute plan\/review/i);
+});
+
+test("resume and status descriptions distinguish availability from a waiting record", () => {
+  const tools = createWorkflowTools({} as never, base);
+  const resume = tools.find((tool) => tool.name === "codex_workflow_resume")!;
+  const status = tools.find((tool) => tool.name === "codex_workflow_status")!;
+  assert.match(resume.description ?? "", /status\.continuation\.available is true/);
+  assert.match(resume.description ?? "", /running.*wait.*duplicate/i);
+  assert.match(resume.description ?? "", /report continuation\.reason/i);
+  assert.match(resume.description ?? "", /Do not replace the plan or review with a parent-authored result/);
+  assert.match(resume.description ?? "", /interruption_unconfirmed.*retry cleanup/);
+  assert.match(resume.description ?? "", /no new model turn.*until interruption is confirmed/);
+  assert.match(resume.description ?? "", /native answer is never repeated/);
+  assert.match(status.description ?? "", /continuation\.available.*original thread/i);
+  assert.match(status.description ?? "", /waiting.*does not prove/i);
+  assert.match(status.description ?? "", /running.*wait/i);
+});
+
+test("manual review-only and submit expose unavailable recovery boundaries with auto-triggering off", () => {
+  const tools = createWorkflowTools({} as never, { ...base, autoTriggerMode: "off" });
+  const reviewOnly = tools.find((tool) => tool.name === "codex_workflow_review_only")!;
+  assert.match(reviewOnly.description ?? "", /codex_workflow_status without an id/);
+  assert.match(reviewOnly.description ?? "", /codex_workflow_resume with workflowId omitted/);
+  assert.match(reviewOnly.description ?? "", /continuation\.available is true/);
+  assert.match(reviewOnly.description ?? "", /interruption_unconfirmed.*original turn cleanup/);
+  assert.match(reviewOnly.description ?? "", /without creating another review-only workflow or authoring a substitute plan\/review/);
+  const submit = tools.find((tool) => tool.name === "codex_workflow_submit")!;
+  assert.match(submit.description ?? "", /completed review result is unavailable/);
+  assert.match(submit.description ?? "", /do not automatically resubmit unchanged material/);
+  assert.match(submit.description ?? "", /user explicitly requests a new independent review round/);
+  assert.match(submit.description ?? "", /never use it to recover a failed original run/);
+});
+
+test("submit tool forwards explicit new-round intent separately from its implementation facts", async () => {
+  const inputs: unknown[] = [];
+  let concluded = 0;
+  const manager = { async submit(_id: string, input: unknown) { inputs.push(input); return { id: "tool-round" }; } };
+  const tool = createWorkflowTools(manager as never, base).find((entry) => entry.name === "codex_workflow_submit")!;
+  for (const value of [false, true]) {
+    await tool.execute!({ workflowId: "tool-round", implementationSummary: "Approved implementation", newReviewRound: value },
+      { concludeTurn() { concluded += 1; } } as never);
+  }
+  assert.deepEqual(inputs, [
+    { implementationSummary: "Approved implementation", newReviewRound: false },
+    { implementationSummary: "Approved implementation", newReviewRound: true },
+  ]);
+  assert.equal(concluded, 2);
 });
 
 test("long-running Codex tools keep extended timeouts while submit stays immediate", () => {
@@ -132,55 +210,57 @@ test("long-running Codex tools keep extended timeouts while submit stays immedia
 });
 
 /** Review finding: the budgets must cover the WORST-CASE serial paths — the
- * Planner can run FOUR turns (visible plan + conversion fork + completion turn
+ * Planner can run FIVE turns (visible plan + same-thread continuation + conversion fork + completion turn
  * + second conversion fork) when the first visible reply is not a complete
- * plan, and the reviewer can run SEVEN turns (native review + display rewrite
+ * plan, and the reviewer can run EIGHT turns (native review + same-thread continuation + display rewrite
  * + conversion fork + authority-alignment fork + reconciliation turn + second
  * conversion fork + second alignment fork) when the 1.0.10 authority path
  * finds a conflict. MAX_SERIAL_RPCS must also cover the extra control RPCs of
  * those paths (collaborationMode/list, turn/start, thread/read baselines and
  * read-backs, thread/fork, thread/unsubscribe per extra turn). */
-test("start budget provably covers the planner FOUR-turn worst path and its control RPCs", () => {
+test("start budget provably covers the planner FIVE-turn worst path and its control RPCs", () => {
   const turn = 30 * 60 * 1000;
   const rpc = 60_000;
   const margin = 15_000;
   const retry = base.transientRetryBudgetMs;
-  assert.equal(PLANNER_MAX_TURNS, 4, "visible + conversion + completion + conversion");
-  assert.equal(startToolTimeout(turn, rpc, retry), saturatedTotal(turn * PLANNER_MAX_TURNS, MAX_SERIAL_RPCS * rpc, 2 * retry, margin));
+  const retryOperations = PLANNER_MAX_TURNS + MAX_SERIAL_RPCS;
+  assert.equal(PLANNER_MAX_TURNS, 5, "visible + same-thread continuation + conversion + completion + conversion");
+  assert.equal(startToolTimeout(turn, rpc, retry), saturatedTotal(turn * PLANNER_MAX_TURNS, MAX_SERIAL_RPCS * rpc, retryOperations * retry, margin));
   // Host never pre-empts the completion/rewrite/cleanup paths either — and
   // since 1.1.1 the budget also covers the transient-retry allowance, so a
   // backing-off turn can never be cut off by the host.
-  assert.ok(startToolTimeout(turn, rpc, retry) >= PLANNER_MAX_TURNS * turn + MAX_SERIAL_RPCS * rpc + 2 * retry + margin);
+  assert.ok(startToolTimeout(turn, rpc, retry) >= PLANNER_MAX_TURNS * turn + MAX_SERIAL_RPCS * rpc + retryOperations * retry + margin);
   const config = { ...base, turnTimeoutMs: turn, rpcTimeoutMs: rpc };
   assert.equal(timeoutOf(config, "codex_workflow_start"), startToolTimeout(turn, rpc, retry));
   assert.equal(timeoutOf(config, "codex_workflow_continue"), startToolTimeout(turn, rpc, retry));
   // At the production-aligned 600 s turn ceiling with the 60 s rpc cap, the
-  // four-turn + RPC budget stays above 600 s and is never capped at 10 min.
+  // five-turn + RPC budget stays above 600 s and is never capped at 10 min.
   const prod = { ...base, turnTimeoutMs: 600_000, rpcTimeoutMs: 60_000 };
-  assert.ok(timeoutOf(prod, "codex_workflow_start") >= 4 * 600_000);
-  assert.ok(timeoutOf(prod, "codex_workflow_start") >= 2 * prod.transientRetryBudgetMs, "the retry allowance is inside the budget");
+  assert.ok(timeoutOf(prod, "codex_workflow_start") >= 5 * 600_000);
+  assert.ok(timeoutOf(prod, "codex_workflow_start") >= retryOperations * prod.transientRetryBudgetMs, "every serial retry allowance is inside the budget");
 });
 
-test("review budget provably covers the reviewer SEVEN-turn worst path and its control RPCs", () => {
+test("review budget provably covers the reviewer EIGHT-turn worst path and its control RPCs", () => {
   const turn = 30 * 60 * 1000;
   const rpc = 60_000;
   const margin = 15_000;
   const retry = base.transientRetryBudgetMs;
-  assert.equal(REVIEW_MAX_TURNS, 7, "native + rewrite + conversion + alignment + reconciliation + re-conversion + re-alignment");
+  const retryOperations = REVIEW_MAX_TURNS + MAX_SERIAL_RPCS;
+  assert.equal(REVIEW_MAX_TURNS, 8, "native + same-thread continuation + rewrite + conversion + alignment + reconciliation + re-conversion + re-alignment");
   // The review budget also reserves ONE bounded persisted-read-back window
   // per readable turn (the native review, the display rewrite and the
   // reconciliation turn) plus the 1.1.1 transient-retry allowance.
   assert.equal(
     reviewToolTimeout(turn, rpc, retry),
-    saturatedTotal(turn * REVIEW_MAX_TURNS, MAX_SERIAL_RPCS * rpc, 2 * retry, 3 * APPENDED_READBACK_TIMEOUT_MS, margin),
+    saturatedTotal(turn * REVIEW_MAX_TURNS, MAX_SERIAL_RPCS * rpc, retryOperations * retry, 3 * APPENDED_READBACK_TIMEOUT_MS, margin),
   );
-  assert.ok(reviewToolTimeout(turn, rpc, retry) >= REVIEW_MAX_TURNS * turn + MAX_SERIAL_RPCS * rpc + 2 * retry + 3 * APPENDED_READBACK_TIMEOUT_MS + margin);
+  assert.ok(reviewToolTimeout(turn, rpc, retry) >= REVIEW_MAX_TURNS * turn + MAX_SERIAL_RPCS * rpc + retryOperations * retry + 3 * APPENDED_READBACK_TIMEOUT_MS + margin);
   const config = { ...base, turnTimeoutMs: turn, rpcTimeoutMs: rpc };
-  assert.equal(timeoutOf(config, "codex_workflow_review"), reviewToolTimeout(turn, rpc, retry));
-  assert.equal(timeoutOf(config, "codex_workflow_review_only"), reviewToolTimeout(turn, rpc, retry));
+  assert.equal(timeoutOf(config, "codex_workflow_review"), reviewToolTimeout(turn, rpc, retry, config.callbackTimeoutMs));
+  assert.equal(timeoutOf(config, "codex_workflow_review_only"), reviewToolTimeout(turn, rpc, retry, config.callbackTimeoutMs));
   const prod = { ...base, turnTimeoutMs: 600_000, rpcTimeoutMs: 60_000 };
-  assert.ok(timeoutOf(prod, "codex_workflow_review") >= 7 * 600_000);
-  assert.ok(timeoutOf(prod, "codex_workflow_review") >= 2 * prod.transientRetryBudgetMs, "the retry allowance is inside the budget");
+  assert.ok(timeoutOf(prod, "codex_workflow_review") >= 8 * 600_000);
+  assert.ok(timeoutOf(prod, "codex_workflow_review") >= retryOperations * prod.transientRetryBudgetMs, "every serial retry allowance is inside the budget");
 });
 
 test("the derived rpc timeout (no explicit config) tightens the budgets the same way", () => {
@@ -189,7 +269,43 @@ test("the derived rpc timeout (no explicit config) tightens the budgets the same
   const retry = base.transientRetryBudgetMs;
   const config = { ...base, turnTimeoutMs: turn };
   assert.equal(timeoutOf(config, "codex_workflow_start"), startToolTimeout(turn, derived, retry));
-  assert.equal(timeoutOf(config, "codex_workflow_review"), reviewToolTimeout(turn, derived, retry));
+  assert.equal(timeoutOf(config, "codex_workflow_review"), reviewToolTimeout(turn, derived, retry, config.callbackTimeoutMs));
+});
+
+test("timeout arithmetic saturates overflow instead of dropping a required allowance", () => {
+  for (const timeout of [startToolTimeout, reviewToolTimeout]) {
+    assert.equal(timeout(Number.MAX_VALUE, 1, 1), Number.MAX_SAFE_INTEGER);
+    assert.equal(timeout(1, Number.MAX_VALUE, 1), Number.MAX_SAFE_INTEGER);
+    assert.equal(timeout(1, 1, Number.MAX_VALUE), Number.MAX_SAFE_INTEGER);
+    assert.equal(timeout(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER);
+  }
+  assert.equal(reviewToolTimeout(1, 1, 0, Number.MAX_VALUE), Number.MAX_SAFE_INTEGER);
+});
+
+test("review budgets add all CLI subprocess timeouts and retries to the App Server allowance", () => {
+  const turn = 10_000;
+  const rpc = 5000;
+  const retry = 1000;
+  const cli = 30 * 60 * 1000;
+  // CLI reconciliation includes a visible turn and an optional display repair,
+  // in addition to four normalization/alignment subprocesses across the round.
+  const cliTurns = 6;
+  assert.equal(MAX_REVIEW_CLI_TURNS, cliTurns);
+  assert.equal(reviewToolTimeout(turn, rpc, retry, cli),
+    reviewToolTimeout(turn, rpc, retry) + cliTurns * (cli + retry));
+  const config = { ...base, turnTimeoutMs: turn, rpcTimeoutMs: rpc, callbackTimeoutMs: cli };
+  assert.equal(timeoutOf(config, "codex_workflow_review"), reviewToolTimeout(turn, rpc, retry, cli));
+  assert.equal(timeoutOf(config, "codex_workflow_resume"), reviewToolTimeout(turn, rpc, retry, cli));
+});
+
+test("bounded production configuration stays within the host's standard timer range", () => {
+  const turn = 30 * 60 * 1000;
+  const rpc = 60_000;
+  const retry = 2 * 60 * 60 * 1000;
+  for (const value of [startToolTimeout(turn, rpc, retry), reviewToolTimeout(turn, rpc, retry, 30 * 60 * 1000)]) {
+    assert.ok(Number.isFinite(value) && value > 0);
+    assert.ok(value <= 2_147_483_647, "the supported large retry budget must not overflow a standard millisecond timer");
+  }
 });
 
 function saturatedTotal(...values: number[]): number {

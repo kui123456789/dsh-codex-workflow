@@ -17,6 +17,7 @@ import { SessionRouter } from "./application/bridge/session-router.js";
 import { TerminalRelayGuard } from "./application/bridge/terminal-relay-guard.js";
 import { BridgeQueueCoordinator, type BridgeQueuePort } from "./application/bridge/bridge-queue.js";
 import { LiveSessionRepositoryAdapter, WorkflowRepositoryAdapter } from "./application/coordination/repositories.js";
+import { bridgeReviewUnavailableReason, originalBridgeResourceUnavailable, unavailableReviewerInstruction } from "./application/submission-recovery-policy.js";
 
 export interface AgentRegistryLike {
   get(id: string): Agent | undefined;
@@ -594,7 +595,7 @@ export class BridgeRuntime {
     try {
       if (isLost()) return;
       if (!this.hasDeliveredMessage(agent, messageId)) {
-        agent.followup(this.submissionNoticeMessage(command, messageId));
+        agent.followup(this.submissionNoticeMessage(command, messageId, record));
       }
       if (this.options.afterFollowupHook) await this.options.afterFollowupHook();
     } catch (error) {
@@ -962,12 +963,13 @@ export class BridgeRuntime {
     });
   }
 
-  private submissionNoticeMessage(command: SubmissionNoticeCommand, messageId: MessageId): UserMessage {
+  private submissionNoticeMessage(command: SubmissionNoticeCommand, messageId: MessageId, record: WorkflowRecord): UserMessage {
     return freezeMessage({
       ...createUserMessage({
         content: [{
           type: "text",
-          text: `${command.message}\nWorkflow: ${command.workflowId}\nSubmission: ${command.submissionId}\n请检查 codex_workflow_status；修复环境或任务问题后重新提交。`,
+          text: `${command.message}\nWorkflow: ${command.workflowId}\nSubmission: ${command.submissionId}\n${originalBridgeResourceUnavailable(record)
+            ? unavailableReviewerInstruction(command.workflowId, bridgeReviewUnavailableReason(record)) : "请检查 codex_workflow_status；修复环境或任务问题后重新提交。"}`,
         }],
         source: relaySource(),
       }),

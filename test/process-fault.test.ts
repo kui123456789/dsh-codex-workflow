@@ -262,6 +262,12 @@ test("a staged verdict from a killed process is re-enqueued with exact identity,
     await waitForFile(meta);
     const stageRequestId = (await readFile(marker, "utf8")).trim();
     const metaJson = await readJson(meta);
+    const beforeStore = new WorkflowStore(directory);
+    try {
+      const beforeCrash = await beforeStore.load(String(metaJson.workflowId));
+      assert.equal(beforeCrash?.submissionState, "verdict_ready");
+      assert.equal(beforeCrash.stagedVerdict?.command.requestId, stageRequestId, "the marker names the already persisted staged verdict");
+    } finally { beforeStore.close(); }
     // The durable artifact: the workflow has a staged verdict but the enqueue
     // never committed (the child is still alive, blocked in enqueue). Kill it
     // to simulate the mid-enqueue crash.
@@ -269,11 +275,18 @@ test("a staged verdict from a killed process is re-enqueued with exact identity,
     // TerminateProcess can otherwise emit `close` between kill() and once(),
     // leaving the test hung until its outer timeout.
     await terminateChild(stagedChild);
+    assert.ok(stagedChild.exitCode !== null || stagedChild.signalCode !== null, "the owned producer exits before recovery starts");
 
     const outR = join(directory, "recover.jsonl");
     const recovery = await runActor(["recover-staged", directory, outR]);
     assert.equal(recovery.code, 0, recovery.stderr);
     const lines = await collectedLines(outR);
+    const committed = lines.find((line) => line.kind === "recovery-committed");
+    assert.ok(committed, "the recovery actor confirms completion before returning its queue snapshot");
+    assert.equal(committed.workflowId, metaJson.workflowId);
+    assert.equal(committed.requestId, stageRequestId);
+    assert.equal(committed.submissionState, "received");
+    assert.equal(committed.queueStatus, "inbox");
     const queueRows = lines.filter((line) => line.kind === "queue-row");
     assert.equal(queueRows.length, 1, "exactly one queue row after recovery");
     assert.equal(String(queueRows[0]!.requestId), stageRequestId, "recovery re-enqueued the EXACT staged request id");
@@ -287,6 +300,7 @@ test("a staged verdict from a killed process is re-enqueued with exact identity,
     const recovery2 = await runActor(["recover-staged", directory, outR2]);
     assert.equal(recovery2.code, 0, recovery2.stderr);
     const lines2 = await collectedLines(outR2);
+    assert.equal(lines2.find((line) => line.kind === "recovery-committed")?.requestId, stageRequestId);
     const queueRows2 = lines2.filter((line) => line.kind === "queue-row");
     assert.equal(queueRows2.length, 1, "idempotent recovery keeps a single queue row");
     assert.equal(String(queueRows2[0]!.requestId), stageRequestId);

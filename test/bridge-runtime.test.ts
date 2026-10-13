@@ -6,7 +6,7 @@ import test from "node:test";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import { Session, SessionId } from "@deepseek-ai/dsh-session";
 import type { UserMessage } from "@deepseek-ai/dsh-llm";
-import { closeCoordinationStoresForDirectory } from "../src/coordination.js";
+import { closeCoordinationStoresForDirectory, cwdKey } from "../src/coordination.js";
 import { newRequestId, type DispatchPlanCommand, type SubmissionNoticeCommand, type SubmitVerdictCommand } from "../src/bridge-protocol.js";
 import { BridgeStore } from "../src/bridge-store.js";
 import { BridgeRuntime, BridgeCrashSimulationError, type AgentRegistryLike } from "../src/bridge-runtime.js";
@@ -15,6 +15,13 @@ import { WorkflowStore } from "../src/store.js";
 import type { WorkflowConfig, WorkflowRecord } from "../src/types.js";
 import { WorkflowManager, type CodexGateway } from "../src/workflow.js";
 import type { DesktopThreadOpener } from "../src/desktop-thread-opener.js";
+
+const originalClock = { Date: globalThis.Date, setInterval: globalThis.setInterval, clearInterval: globalThis.clearInterval };
+function assertOriginalClock(): void {
+  assert.equal(globalThis.Date, originalClock.Date, "Date was restored after the preceding test");
+  assert.equal(globalThis.setInterval, originalClock.setInterval, "setInterval was restored after the preceding test");
+  assert.equal(globalThis.clearInterval, originalClock.clearInterval, "clearInterval was restored after the preceding test");
+}
 
 async function rmClosed(path: string): Promise<void> {
   // Close only this tree's coordination connections first (Windows locks an
@@ -1442,12 +1449,13 @@ test("a cancel between relay and commit never marks the verdict delivered", asyn
  * producing EVERY external side effect — no apply, no relay, no receipt. */
 test("a claim owner that lost its lease produces no apply or relay side effects", async () => {
   const h = await harness(5, 10, 5, 300); // leaseMs 300 -> heartbeat period 100ms
+  let runtimeA: BridgeRuntime | undefined;
   try {
     const workspace = await makeWorkspace(h.directory);
     const target = makeAgent("session-lost", "C:\\work");
     h.registry.register(target);
     let lostObserved = false;
-    const runtimeA = new BridgeRuntime(h.store, h.registry, {
+    runtimeA = new BridgeRuntime(h.store, h.registry, {
       pollMs: 5,
       storageDir: join(h.directory, "storage"),
       manager: h.manager,
@@ -1467,6 +1475,9 @@ test("a claim owner that lost its lease produces no apply or relay side effects"
         ).run(command.requestId);
         const takeover = await h.store.claimNext("owner-B");
         assert.ok(takeover, "owner-B takes the claim over");
+        assert.equal(h.store.coordinationHandle.renewClaim(
+          takeover.requestId, takeover.claimEpoch, takeover.claimOwner, Date.now() + 60_000,
+        ), true, "keep B's real takeover valid while A's original short lease is lost");
         const deadline = Date.now() + 3000;
         while (!lostObserved && Date.now() < deadline) {
           await new Promise((resolve) => setTimeout(resolve, 10));
@@ -1474,7 +1485,6 @@ test("a claim owner that lost its lease produces no apply or relay side effects"
         assert.equal(lostObserved, true, "the lease loss was observed before apply");
       },
     });
-    runtimeA.start();
     const bridge = await makeBridgeWorkflow(h, "session-lost", workspace);
     const command = verdict({
       workflowId: bridge.workflowId,
@@ -1482,8 +1492,11 @@ test("a claim owner that lost its lease produces no apply or relay side effects"
       submissionId: bridge.submissionId,
     });
     await h.store.enqueue(command);
-    await waitFor(async () => lostObserved);
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    await runtimeA.refreshSessions(true);
+    // Await the actual pump while A remains running: lease fencing alone
+    // must prevent side effects, with no stop gate or arbitrary delay.
+    await runtimeA.pump();
+    assert.equal(lostObserved, true, "the original handler observed lease loss before settling");
     const record = await h.workflowStore.load(bridge.workflowId);
     assert.notEqual(record?.submissionState, "applied", "a stale owner never applies");
     assert.equal(record?.appliedVerdictRequestId, undefined, "no false apply identity");
@@ -1513,6 +1526,8 @@ test("a claim owner that lost its lease produces no apply or relay side effects"
       await runtimeB.stop();
     }
   } finally {
+    // Failed assertions must still drain A before shared SQLite is closed.
+    await runtimeA?.stop();
     await rmClosed(h.directory);
   }
 });
@@ -1553,7 +1568,10 @@ test("two runtimes route dispatch+verdict to their owning session; no HOL blocki
       // The queue head is A's command; B's OWN command is enqueued afterwards.
       const commandForB = dispatch({ target: { dshSessionId: "session-route-b", cwd: "C:\\work" } });
       await storeB.enqueue(commandForB);
-      await new Promise((resolve) => setTimeout(resolve, 350));
+      // A processing claim can still await workflow persistence and relay.
+      // Observe B's actual receipt before asserting that delivery completed.
+      const receiptB = await waitForReceipt(storeB, commandForB.requestId);
+      assert.equal(receiptB.status, "delivered");
       const rowA = storeA.coordinationHandle.queueRow(commandForA.requestId);
       assert.equal(rowA?.status, "inbox", "B never claimed A's command");
       assert.equal(rowA?.attempts, 0, "B did not consume attempts");
@@ -1563,8 +1581,6 @@ test("two runtimes route dispatch+verdict to their owning session; no HOL blocki
       const rowB = storeA.coordinationHandle.queueRow(commandForB.requestId);
       assert.ok(rowB && (rowB.status === "processing" || rowB.status === "done"), "B claimed its own command past A's head");
       assert.equal(sessionB.followups.length, 1, "B delivered its own command");
-      const receiptB = await waitForReceipt(storeB, commandForB.requestId);
-      assert.equal(receiptB.status, "delivered");
 
       // A handles its own dispatch (explicit pump without starting its timer).
       await rtA.pump();
@@ -1722,21 +1738,14 @@ test("live session registry merges, teardown/expiry/takeover semantics", async (
 
 /** Session heartbeat is independent of the pump: a long-running handler that
  * outlasts the session TTL must still keep the runtime's sessions alive. */
-test("session heartbeat keeps sessions live across a long handler", async () => {
+test("session heartbeat keeps sessions live across a long handler", { timeout: 10_000 }, async (t) => {
   const h = await harness(10, 10, 5, 300); // TTL 300, heartbeat period 100
+  const gate = deferredGate();
+  let runtime: BridgeRuntime | undefined;
   try {
     const workspace = await makeWorkspace(h.directory);
     const target = makeAgent("session-hb", "C:\\work");
     h.registry.register(target);
-    const gate = deferredGate();
-    const runtime = new BridgeRuntime(h.store, h.registry, {
-      pollMs: 10,
-      storageDir: join(h.directory, "storage"),
-      manager: h.manager,
-      workflowStore: h.workflowStore,
-      afterFollowupHook: () => gate.promise,
-    });
-    runtime.start();
     const bridge = await makeBridgeWorkflow(h, "session-hb", workspace);
     const command = verdict({
       workflowId: bridge.workflowId,
@@ -1744,16 +1753,84 @@ test("session heartbeat keeps sessions live across a long handler", async () => 
       submissionId: bridge.submissionId,
     });
     await h.store.enqueue(command);
-    // Let the handler run long enough to outlast the 300ms session TTL several
-    // times (the followup hook holds the pump busy), then verify the session is
-    // still live thanks to the independent heartbeat.
-    await new Promise((resolve) => setTimeout(resolve, 1200));
-    const live = h.store.coordinationHandle.sessionsForOwner(runtime["claimOwner"]);
-    assert.equal(live.some((row) => row.sessionId === "session-hb"), true, "session stayed live during a long handler");
+    // Mock only intervals and Date: real filesystem/SQLite async work can settle
+    // normally, while lease expiry is independent of host scheduling delays.
+    t.mock.timers.enable({ apis: ["setInterval", "Date"], now: Date.now() });
+    // Some supported Node mock implementations return numeric timer IDs. Keep
+    // the real mock scheduler/callbacks, adapting only the host's unref handle.
+    const scheduledInterval = globalThis.setInterval;
+    const clearScheduledInterval = globalThis.clearInterval;
+    const intervalIds = new Map<NodeJS.Timeout, ReturnType<typeof scheduledInterval>>();
+    t.mock.method(globalThis, "setInterval", ((...args: Parameters<typeof scheduledInterval>) => {
+      const id = scheduledInterval(...args);
+      if (typeof id?.unref === "function") return id;
+      const handle = { unref: () => handle } as unknown as NodeJS.Timeout;
+      intervalIds.set(handle, id);
+      return handle;
+    }) as typeof scheduledInterval);
+    t.mock.method(globalThis, "clearInterval", (id: Parameters<typeof clearScheduledInterval>[0]) => {
+      clearScheduledInterval(intervalIds.get(id as NodeJS.Timeout) ?? id);
+      intervalIds.delete(id as NodeJS.Timeout);
+    });
+    const entered = deferredGate();
+    let handlerHeld = false;
+    runtime = new BridgeRuntime(h.store, h.registry, {
+      pollMs: 10,
+      storageDir: join(h.directory, "storage"),
+      manager: h.manager,
+      workflowStore: h.workflowStore,
+      afterFollowupHook: async () => {
+        handlerHeld = true;
+        entered.release();
+        await gate.promise;
+        handlerHeld = false;
+      },
+    });
+    const coordination = h.store.coordinationHandle;
+    const refresh = coordination.refreshOwnerSessions.bind(coordination);
+    const owner = runtime["claimOwner"];
+    const refreshes: number[] = [];
+    t.mock.method(coordination, "refreshOwnerSessions", (...args: Parameters<typeof refresh>) => {
+      refresh(...args); // Observe the real committed SQLite write; never synthesize a refresh.
+      if (args[0] === owner) refreshes.push(args[3] ?? Date.now());
+    });
+    runtime.start();
+    await entered.promise;
+    await runtime["sessionsChain"];
+    assert.equal(handlerHeld, true, "the real followup handler has entered and holds the pump");
+    const initial = coordination.sessionsForOwner(owner).find((row) => row.sessionId === target.id);
+    assert.ok(initial, "initial session publication reached SQLite before advancing time");
+    const baseline = refreshes.length;
+    t.mock.timers.tick(400); // Cross the unchanged 300 ms TTL while the pump is held.
+    await runtime["sessionsChain"];
+    const live = coordination.sessionsForOwner(owner).find((row) => row.sessionId === target.id);
+    assert.ok(live, "the independent heartbeat kept the session live beyond its original TTL");
+    assert.ok(refreshes.length > baseline, "the actual interval triggered independent SQLite session refreshes");
+    assert.ok(live.leaseUntil > initial.leaseUntil);
+    assert.equal(live.updatedAt, Date.now());
+    assert.equal(handlerHeld, true);
+
+    // Negative control: with only the session heartbeat removed, the same held
+    // pump and clock advance must now expire this owner's actual session row.
+    clearInterval(runtime["sessionHeartbeat"]);
+    const refreshed = refreshes.length;
+    t.mock.timers.tick(400);
+    await runtime["sessionsChain"];
+    assert.equal(refreshes.length, refreshed, "a held pump cannot substitute for its independent heartbeat");
+    assert.equal(coordination.sessionsForOwner(owner).some((row) => row.sessionId === target.id), false);
+    assert.equal(handlerHeld, true);
     gate.release();
     await waitForReceipt(h.store, command.requestId);
     await runtime.stop();
   } finally {
+    gate.release();
+    await runtime?.stop();
+    // Disassociate method mocks before resetting timer globals. Individual
+    // restore() leaves tracker records that automatic cleanup can replay later.
+    t.mock.reset();
+    t.mock.timers.reset();
+    assertOriginalClock();
+    await h.manager.stop();
     await rmClosed(h.directory);
   }
 });
@@ -1768,6 +1845,7 @@ function deferredGate(): DeferredGate {
 /** Same-cwd multi-session dispatch is a deterministic terminal ambiguity to a
  * single owner — never delivered to an arbitrary session, never stolen. */
 test("same-cwd multi-session dispatch is a terminal ambiguity for a deterministic owner", async () => {
+  assertOriginalClock();
   const directory = await mkdtemp(join(tmpdir(), "dsh-bridge-runtime-ambig-"));
   try {
     const storageDir = join(directory, "storage");
@@ -1785,10 +1863,16 @@ test("same-cwd multi-session dispatch is a terminal ambiguity for a deterministi
     reg2.register(s2);
     const rt1 = new BridgeRuntime(store1, reg1, { pollMs: 2, storageDir, manager: m1, workflowStore: wf1 });
     const rt2 = new BridgeRuntime(store2, reg2, { pollMs: 2, storageDir, manager: m2, workflowStore: wf2 });
+    await Promise.all([store1.init(), store2.init()]);
     rt1.start();
     rt2.start();
     try {
       const command = dispatch({ target: { cwd: "C:\\work" } }); // no explicit session id
+      // start() schedules publication; ambiguity requires both actual SQLite
+      // registrations, not just two entries in separate in-memory registries.
+      await Promise.all([rt1.refreshSessions(true), rt2.refreshSessions(true)]);
+      assert.deepEqual(store1.coordinationHandle.liveSessionsForCwd(cwdKey(command.target.cwd))
+        .map((row) => row.sessionId).sort(), [s1.id, s2.id].sort());
       await store1.enqueue(command);
       const receipt = await waitForReceipt(store1, command.requestId);
       assert.equal(receipt.status, "failed", "ambiguity is terminal");
@@ -1821,6 +1905,7 @@ test("session cwd matching is Windows case/separator insensitive", async () => {
 
 /** Finding 6: concurrent BridgeRuntime.stop() share one settle promise. */
 test("concurrent BridgeRuntime.stop() share one settle promise", async () => {
+  assertOriginalClock();
   const h = await harness(10);
   try {
     const workspace = await makeWorkspace(h.directory);
@@ -1918,6 +2003,7 @@ const nonBlockingFinding = {
  * void it — relay VOID, phase back to executing, latestReview cleared, and
  * the submission still delivers. */
 test("voiding a waiting_review_decision verdict returns to executing and delivers VOID", async () => {
+  assertOriginalClock();
   const h = await harness(5);
   try {
     const workspace = await makeWorkspace(h.directory);

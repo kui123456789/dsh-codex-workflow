@@ -58,6 +58,14 @@ function reviewStepLabel(step: ReviewStep): string {
  * state machine outside WorkflowManager makes cancellation, stale detection
  * and teardown share one implementation across DSH-led and bridge reviews.
  */
+class ReviewProgressOwnershipError extends Error {}
+
+class ReviewStaleObservationChangedError extends Error {
+  constructor(readonly record: WorkflowRecord) {
+    super("review changed before stale observation");
+  }
+}
+
 export class ReviewObservation {
   private readonly store: WorkflowStore;
   private readonly runtime: WorkflowRuntimeState;
@@ -77,13 +85,16 @@ export class ReviewObservation {
 
   async begin(
     workflowId: string,
-    options: { enterReviewing?: boolean; step?: ReviewStep; message?: string; childSessionId?: string } = {},
+    options: { enterReviewing?: boolean; step?: ReviewStep; message?: string; childSessionId?: string;
+      guard?: (record: WorkflowRecord) => boolean } = {},
   ) {
-    this.runtime.cleanupNotes.delete(workflowId);
     const now = new Date().toISOString();
     const outcome = await this.store.update(workflowId, (record) => {
+      if (options.guard && !options.guard(record)) throw new ReviewProgressOwnershipError("review startup no longer owns this scope");
       if (options.enterReviewing !== false) record.phase = "reviewing";
       record.processState = "running";
+      record.retryState = undefined;
+      record.error = undefined;
       record.reviewStep = options.step ?? "reviewing";
       record.reviewStartedAt = now;
       record.lastProgressAt = now;
@@ -94,7 +105,7 @@ export class ReviewObservation {
       record.lastProgressMessage = options.message ?? "Review started";
     }, { ignoreCancelled: false });
     if (!outcome.suppressed) {
-      this.startHeartbeat(workflowId);
+      this.runtime.cleanupNotes.delete(workflowId);
       const reviewId = `${workflowId}:${outcome.record.reviewAttempt ?? 1}`;
       this.emit?.(outcome.record, {
         type: "dsh-codex-workflow/review-start",
@@ -108,19 +119,34 @@ export class ReviewObservation {
     return outcome;
   }
 
-  startHeartbeat(workflowId: string): void {
-    this.stopHeartbeat(workflowId);
+  startHeartbeat(workflowId: string, guard?: (record: WorkflowRecord) => boolean): NodeJS.Timeout {
+    const record = this.store.snapshot(workflowId);
+    if (this.runtime.stopped || !record || record.processState !== "running" || (guard && !guard(record))) {
+      throw new ReviewProgressOwnershipError("review heartbeat admission no longer owns this scope");
+    }
+    this.stopCurrentHeartbeat(workflowId);
     const timer = setInterval(() => {
-      void this.mark(workflowId).catch(() => undefined);
+      if (this.runtime.reviewHeartbeats.get(workflowId) !== timer) return;
+      void this.mark(workflowId, undefined, undefined, undefined, guard)
+        .catch((error) => { if (error instanceof ReviewProgressOwnershipError) this.stopHeartbeat(workflowId, timer); });
     }, this.heartbeatMs);
     timer.unref();
     this.runtime.reviewHeartbeats.set(workflowId, timer);
+    return timer;
   }
 
-  stopHeartbeat(workflowId: string): void {
-    const timer = this.runtime.reviewHeartbeats.get(workflowId);
-    if (timer) clearInterval(timer);
-    this.runtime.reviewHeartbeats.delete(workflowId);
+  stopHeartbeat(workflowId: string, timer: NodeJS.Timeout | undefined): void {
+    if (!timer) return;
+    clearInterval(timer);
+    if (this.runtime.reviewHeartbeats.get(workflowId) === timer) this.runtime.reviewHeartbeats.delete(workflowId);
+  }
+
+  stopCurrentHeartbeat(workflowId: string): void {
+    this.stopHeartbeat(workflowId, this.runtime.reviewHeartbeats.get(workflowId));
+  }
+
+  stopAllHeartbeats(): void {
+    for (const [workflowId, timer] of this.runtime.reviewHeartbeats) this.stopHeartbeat(workflowId, timer);
   }
 
   async mark(
@@ -128,10 +154,12 @@ export class ReviewObservation {
     step?: ReviewStep,
     message?: string,
     activeTurnId?: string | null,
+    guard?: (record: WorkflowRecord) => boolean,
   ): Promise<WorkflowRecord | undefined> {
     const now = new Date();
     const iso = now.toISOString();
     const outcome = await this.store.update(workflowId, (record) => {
+      if (guard && !guard(record)) throw new ReviewProgressOwnershipError("review progress no longer owns this scope");
       if (record.processState !== "running") return;
       const nextStep = step ?? record.reviewStep;
       if (step && record.reviewStep !== step) {
@@ -160,12 +188,21 @@ export class ReviewObservation {
     return outcome.record;
   }
 
-  async finish(workflowId: string, fallbackState?: WorkflowProcessState, detail?: Pick<CodexReviewEndEvent, "verdict" | "result" | "visibleText" | "summary" | "error">): Promise<void> {
-    this.stopHeartbeat(workflowId);
+  async finish(workflowId: string, fallbackState?: WorkflowProcessState,
+    detail?: Pick<CodexReviewEndEvent, "verdict" | "result" | "visibleText" | "summary" | "error">,
+    expected?: { dshSessionId: string; reviewAttempt?: number; cwd: string; evidenceFingerprint?: string },
+    guard?: (record: WorkflowRecord) => boolean, timer?: NodeJS.Timeout): Promise<void> {
+    this.stopHeartbeat(workflowId, timer);
     const now = new Date();
     const iso = now.toISOString();
     const outcome = await this.store.update(workflowId, (record) => {
-      if (record.processState !== "running") return;
+      if (guard && !guard(record)) throw new ReviewProgressOwnershipError("review finalization no longer owns this scope");
+      if (expected && (record.dshSessionId !== expected.dshSessionId || record.reviewAttempt !== expected.reviewAttempt
+        || record.cwd !== expected.cwd || (expected.evidenceFingerprint !== undefined
+          && record.latestReviewEvidence?.fingerprint !== expected.evidenceFingerprint))) {
+        throw new Error("review ownership changed before final observation");
+      }
+      if (record.processState !== "running") return true;
       const terminalState: WorkflowProcessState = record.phase === "cancelled"
         ? "cancelled"
         : fallbackState
@@ -191,8 +228,9 @@ export class ReviewObservation {
             : terminalState === "stale"
               ? "Review heartbeat became stale"
               : "Review failed; retry is available";
+      return true;
     }, { ignoreCancelled: true }).catch(() => undefined);
-    if (outcome && !outcome.suppressed) {
+    if (outcome && !outcome.suppressed && outcome.result !== false) {
       const reviewId = `${workflowId}:${outcome.record.reviewAttempt ?? 1}`;
       this.emit?.(outcome.record, {
         type: "dsh-codex-workflow/review-end",
@@ -205,13 +243,23 @@ export class ReviewObservation {
     if (record.processState !== "running" || !record.lastProgressAt) return record;
     const age = Date.now() - Date.parse(record.lastProgressAt);
     if (!Number.isFinite(age) || age <= this.staleMs) return record;
-    const outcome = await this.store.update(record.id, (current) => {
-      if (current.processState !== "running" || current.lastProgressAt !== record.lastProgressAt) return;
-      current.processState = "stale";
-      current.activeTurnId = undefined;
-      current.lastProgressMessage = `No Review heartbeat for ${Math.floor(age / 1000)} seconds`;
-    }, { ignoreCancelled: true });
-    this.stopHeartbeat(record.id);
-    return outcome.record;
+    const timer = this.runtime.reviewHeartbeats.get(record.id);
+    try {
+      const outcome = await this.store.update(record.id, (current) => {
+        if (current.revision !== record.revision || current.processState !== "running"
+          || current.lastProgressAt !== record.lastProgressAt || this.runtime.reviewHeartbeats.get(record.id) !== timer) {
+          throw new ReviewStaleObservationChangedError(current);
+        }
+        current.processState = "stale";
+        current.activeTurnId = undefined;
+        current.lastProgressMessage = `No Review heartbeat for ${Math.floor(age / 1000)} seconds`;
+        return true;
+      }, { ignoreCancelled: true });
+      if (!outcome.suppressed && outcome.result === true) this.stopHeartbeat(record.id, timer);
+      return outcome.record;
+    } catch (error) {
+      if (error instanceof ReviewStaleObservationChangedError) return error.record;
+      throw error;
+    }
   }
 }

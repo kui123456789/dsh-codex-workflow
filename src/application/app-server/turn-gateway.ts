@@ -1,10 +1,13 @@
 import type { CodexGateway } from "../../workflow.js";
 
-export type TurnGatewayPort = Pick<CodexGateway, "startTurn" | "continueTurn" | "startReview" | "interrupt" | "normalizeInFork" | "normalizeInThread" | "captureTurnBaseline" | "readAppendedTurnText" | "resolveDefaultModel" | "beginRound" | "endRound">;
+export type TurnGatewayPort = Pick<CodexGateway, "captureThreadOwner" | "isThreadAvailable" | "getThreadTokenUsage" | "startTurn" | "continueTurn" | "startReview" | "interrupt" | "normalizeInFork" | "normalizeInThread" | "captureTurnBaseline" | "readAppendedTurnText" | "resolveDefaultModel" | "beginRound" | "endRound">;
 
 /** Turn-only App Server seam; thread identity and child transport stay out. */
 export class TurnGateway {
   constructor(private readonly port: TurnGatewayPort) {}
+  captureThreadOwner(threadId: string): object | undefined { return this.port.captureThreadOwner?.(threadId); }
+  isThreadAvailable(threadId: string, expectedOwner?: object): boolean { return this.port.isThreadAvailable?.(threadId, expectedOwner) ?? true; }
+  getThreadTokenUsage(threadId: string) { return this.port.getThreadTokenUsage?.(threadId); }
 
   startTurn(...args: Parameters<TurnGatewayPort["startTurn"]>): ReturnType<TurnGatewayPort["startTurn"]> { return this.port.startTurn(...args); }
   continueTurn(...args: Parameters<TurnGatewayPort["continueTurn"]>): ReturnType<TurnGatewayPort["continueTurn"]> { return this.port.continueTurn(...args); }

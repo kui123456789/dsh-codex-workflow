@@ -9,11 +9,208 @@ import { CodexCallbackProcessError, CodexInvalidThreadError, CodexNoVerdictError
 const PASS_REVIEW = { verdict: "pass" as const, findings: [], testGaps: [], summary: "ok" };
 const VISIBLE_REVIEW = "VERDICT: pass\nFINDINGS: none\nTEST GAPS: none\nSUMMARY: ok";
 
+type CliRunEntry = {
+  run(workflowId: string, submissionId: string | undefined, args: string[], prompt: string, signal?: AbortSignal): Promise<{ code: number | null; stdout: string; stderr: string }>;
+};
+
+for (const maxOutputBytes of [64, 65]) {
+  test(`CLI stderr byte bound ${maxOutputBytes} retains complete emoji within its byte budget`, async () => {
+    const fake = spawned([{ stdout: "ok", stderr: "😀".repeat(100) }]);
+    const audit = dispatcher(fake.spawn, { maxOutputBytes });
+    try {
+      const result = await (audit as unknown as CliRunEntry).run("unicode-stderr-bound", undefined, [], "Local probe");
+      assert.equal(result.code, 0);
+      assert.equal(result.stdout, "ok");
+      assert.ok(Buffer.byteLength(result.stderr, "utf8") <= maxOutputBytes);
+      assert.equal(result.stderr, "😀".repeat(16));
+      assert.equal(Buffer.from(result.stderr).toString("utf8"), result.stderr);
+      assert.equal(fake.calls.length, 1);
+    } finally { await audit.stop(); }
+  });
+}
+
+test("CLI stderr byte bound retains its newest complete suffix when the preceding code point cannot fit", async () => {
+  const fake = spawned([{ stdout: "", stderr: "头".repeat(100) + "尾😀" }]);
+  const audit = dispatcher(fake.spawn, { maxOutputBytes: 5 });
+  try {
+    const result = await (audit as unknown as CliRunEntry).run("unicode-stderr-suffix", undefined, [], "Local probe");
+    assert.equal(result.stderr, "😀");
+    assert.equal(Buffer.byteLength(result.stderr), 4);
+    assert.equal(fake.calls.length, 1);
+  } finally { await audit.stop(); }
+});
+
+test("CLI stderr byte bound handles UTF-8 characters split across separate data events", async () => {
+  const original = Buffer.from("开始".repeat(100) + "尾😀");
+  const fake = spawned([{ stdout: "", stderrChunks: Array.from(original, byte => Buffer.from([byte])) }]);
+  const audit = dispatcher(fake.spawn, { maxOutputBytes: 7 });
+  try {
+    const result = await (audit as unknown as CliRunEntry).run("unicode-stderr-chunks", undefined, [], "Local probe");
+    assert.equal(result.stderr, "尾😀");
+    assert.equal(Buffer.byteLength(result.stderr), 7);
+    assert.equal(fake.calls.length, 1);
+  } finally { await audit.stop(); }
+});
+
+test("CLI stderr byte bound applies after decoder finalization of incomplete source bytes", async () => {
+  const fake = spawned([{ stdout: "", stderrChunks: [Buffer.from("ABC"), Buffer.from([0xe4])] }]);
+  const audit = dispatcher(fake.spawn, { maxOutputBytes: 4 });
+  try {
+    const result = await (audit as unknown as CliRunEntry).run("unicode-stderr-finalize", undefined, [], "Local probe");
+    assert.equal(result.stderr, "C�");
+    assert.equal(Buffer.byteLength(result.stderr), 4);
+    assert.equal(fake.calls.length, 1);
+  } finally { await audit.stop(); }
+});
+
+test("CLI stderr byte bound zero discards diagnostic bytes without aborting a silent successful process", async () => {
+  const fake = spawned([{ stdout: "", stderr: "检查😀".repeat(100) }]);
+  const audit = dispatcher(fake.spawn, { maxOutputBytes: 0 });
+  try {
+    const result = await (audit as unknown as CliRunEntry).run("unicode-stderr-zero", undefined, [], "Local probe");
+    assert.equal(result.stderr, "");
+    assert.equal(result.code, 0);
+    assert.equal(fake.calls.length, 1);
+  } finally { await audit.stop(); }
+});
+
+test("CLI stderr byte bound preserves the existing exact ASCII tail", async () => {
+  const fake = spawned([{ stdout: "ok", stderr: "older-ASCII-ENDTAIL" }]);
+  const audit = dispatcher(fake.spawn, { maxOutputBytes: 7 });
+  try {
+    const result = await (audit as unknown as CliRunEntry).run("ascii-stderr-tail", undefined, [], "Local probe");
+    assert.equal(result.stderr, "ENDTAIL");
+    assert.equal(result.stdout, "ok");
+  } finally { await audit.stop(); }
+});
+
+test("CLI stderr byte bound preserves the retained terminal diagnostic through the public review path", async () => {
+  const fake = spawned([{ stdout: "", stderr: "😀".repeat(100) + "permission denied", code: 1 }]);
+  const audit = dispatcher(fake.spawn, { maxOutputBytes: 64, retry: { budgetMs: 0 } });
+  try {
+    await assert.rejects(audit.review({ workflowId: "unicode-terminal-bound", submissionId: "original-submission", codexThreadId: "original-reviewer",
+      cwd: "C:\\repo", prompt: "Original review" }), error => {
+      assert.ok(error instanceof CodexCallbackProcessError);
+      const prefix = "codex CLI audit exited with code 1: ";
+      assert.ok(error.message.startsWith(prefix));
+      const diagnostic = error.message.slice(prefix.length);
+      assert.ok(Buffer.byteLength(diagnostic) <= 64);
+      assert.ok(diagnostic.endsWith("permission denied"));
+      assert.equal(Buffer.from(diagnostic).toString("utf8"), diagnostic);
+      return true;
+    });
+    assert.equal(fake.calls.length, 1);
+    assert.deepEqual(fake.calls[0]!.args.slice(-3), ["resume", "original-reviewer", "-"]);
+  } finally { await audit.stop(); }
+});
+
+test("CLI stdout byte bound rejects overflow introduced only by final decoder flush", async () => {
+  const fake = spawned([{ stdout: "", stdoutChunks: ["ABC", Buffer.from([0xe4])] }]);
+  const audit = dispatcher(fake.spawn, { maxOutputBytes: 4 });
+  try {
+    await assert.rejects((audit as unknown as CliRunEntry).run("unicode-stdout-finalize", undefined, [], "Local probe"),
+      error => error instanceof CodexNoVerdictError && /output exceeded retention bound/.test(error.message));
+    assert.equal(fake.calls.length, 1);
+  } finally { await audit.stop(); }
+});
+
+test("CLI stdout byte bound finalization preserves a prior original cancellation cause", async () => {
+  const controller = new AbortController(), cause = new Error("original CLI caller cancelled");
+  const fake = spawned([{ stdout: "", stdoutChunks: ["ABC", Buffer.from([0xe4])] }]);
+  const audit = dispatcher((command, args) => {
+    const child = fake.spawn(command, args);
+    child.stdin!.once("finish", () => controller.abort(cause));
+    return child;
+  }, { maxOutputBytes: 4 });
+  try {
+    await assert.rejects((audit as unknown as CliRunEntry).run("unicode-stdout-cancel", undefined, [], "Local probe", controller.signal),
+      error => error === cause);
+    assert.equal(fake.calls.length, 1);
+  } finally { await audit.stop(); }
+});
+
+test("CLI positive jitter honors its delay ceiling and recovers the original Reviewer within budget", async () => {
+  let clock = 0;
+  const sleeps: number[] = [];
+  const fake = spawned([
+    { stdout: "", stderr: "503 Service Unavailable", code: 1 },
+    { stdout: agentMessage(VISIBLE_REVIEW) },
+    { stdout: agentMessage(JSON.stringify(PASS_REVIEW)) },
+  ]);
+  const audit = dispatcher(fake.spawn, { retry: { baseMs: 60_000, maxMs: 60_000, budgetMs: 65_000, jitterRatio: 0.25 },
+    now: () => clock, random: () => 0.999999, sleep: async ms => { sleeps.push(ms); clock += ms; } });
+  try {
+    const result = await audit.review({ workflowId: "retry-delay-ceiling", submissionId: "original-submission",
+      codexThreadId: "original-reviewer", cwd: "C:\\repo", prompt: "Original review" });
+    assert.equal(result.kind, "verdict");
+    assert.equal(result.threadId, "original-reviewer");
+    assert.deepEqual(sleeps, [60_000]);
+    assert.equal(fake.calls.length, 3, "Two original Reviewer calls followed by its existing normalization stage");
+    for (const call of fake.calls.slice(0, 2)) assert.deepEqual(call.args.slice(-3), ["resume", "original-reviewer", "-"]);
+  } finally { await audit.stop(); }
+});
+
+for (const wakeAt of [50, 210]) {
+  test(`CLI retry wake-up at ${wakeAt}ms returns the last original transient failure without spawning another turn`, async () => {
+    let clock = 0;
+    const fake = spawned([
+      { stdout: "", stderr: "503 Service Unavailable", code: 1 },
+      { stdout: agentMessage(VISIBLE_REVIEW) },
+      { stdout: agentMessage(JSON.stringify(PASS_REVIEW)) },
+    ]);
+    const audit = dispatcher(fake.spawn, { retry: { baseMs: 10, maxMs: 10, budgetMs: 50, jitterRatio: 0 },
+      now: () => clock, sleep: async () => { clock = wakeAt; } });
+    try {
+      await assert.rejects(audit.review({ workflowId: "retry-wake-up", submissionId: "original-submission",
+        codexThreadId: "original-reviewer", cwd: "C:\\repo", prompt: "Original review" }), error => {
+        assert.ok(error instanceof Error);
+        assert.ok(!(error instanceof CodexCallbackProcessError), "Exhausted transient failure stays retryable");
+        assert.match(error.message, /503 Service Unavailable/);
+        return true;
+      });
+      assert.equal(fake.calls.length, 1, "No replacement or another model stage starts after the original retry deadline");
+    } finally { await audit.stop(); }
+  });
+}
+
+test("CLI wake-up preserves caller cancellation before returning a spent transient result", async () => {
+  let clock = 0;
+  const controller = new AbortController(), cause = new Error("original CLI caller cancelled");
+  const fake = spawned([{ stdout: "", stderr: "503 Service Unavailable", code: 1 }]);
+  const audit = dispatcher(fake.spawn, { retry: { baseMs: 10, maxMs: 10, budgetMs: 50, jitterRatio: 0 },
+    now: () => clock, sleep: async () => { clock = 210; controller.abort(cause); } });
+  try {
+    await assert.rejects(audit.review({ workflowId: "retry-cancelled-wake-up", submissionId: "original-submission",
+      codexThreadId: "original-reviewer", cwd: "C:\\repo", prompt: "Original review" }, controller.signal), error => error === cause);
+    assert.equal(fake.calls.length, 1);
+  } finally { await audit.stop(); }
+});
+
+test("CLI terminal Unicode diagnostics retain original ends within the shared byte bound", async () => {
+  const original = "permission denied: " + "检查😀".repeat(1000) + "原错误尾部🔥";
+  const fake = spawned([{ stdout: "", stderr: original, code: 2 }]);
+  const audit = dispatcher(fake.spawn, { retry: { budgetMs: 0 } });
+  try {
+    await assert.rejects(audit.normalize({ visibleText: VISIBLE_REVIEW, cwd: "C:\\repo", workflowId: "wf-unicode-diagnostic" }), (error: unknown) => {
+      assert.ok(error instanceof CodexCallbackProcessError);
+      const prefix = "codex CLI audit exited with code 2: ";
+      assert.ok(error.message.startsWith(prefix));
+      const diagnostic = error.message.slice(prefix.length);
+      assert.ok(Buffer.byteLength(diagnostic, "utf8") <= 2048);
+      assert.ok(diagnostic.startsWith("permission denied:"));
+      assert.ok(diagnostic.endsWith("原错误尾部🔥"));
+      assert.equal(Buffer.from(diagnostic).toString("utf8"), diagnostic);
+      return true;
+    });
+    assert.equal(fake.calls.length, 1, "Terminal classification still occurs on the original full diagnostic");
+  } finally { await audit.stop(); }
+});
+
 function agentMessage(text: string): string {
   return `${JSON.stringify({ type: "item.completed", item: { type: "agent_message", text } })}\n`;
 }
 
-function spawned(responses: Array<{ stdout: string; stdoutChunks?: string[]; stderr?: string; code?: number }>) {
+function spawned(responses: Array<{ stdout: string; stdoutChunks?: Array<string | Buffer>; stderr?: string; stderrChunks?: Array<string | Buffer>; code?: number }>) {
   const calls: Array<{ command: string; args: string[]; prompt: string }> = [];
   const spawn = (command: string, args: string[]): ChildProcess => {
     const response = responses.shift();
@@ -36,7 +233,10 @@ function spawned(responses: Array<{ stdout: string; stdoutChunks?: string[]; std
         for (const chunk of response.stdoutChunks) stdout.write(chunk);
         stdout.end();
       } else stdout.end(response.stdout);
-      stderr.end(response.stderr ?? "");
+      if (response.stderrChunks) {
+        for (const chunk of response.stderrChunks) stderr.write(chunk);
+        stderr.end();
+      } else stderr.end(response.stderr ?? "");
       close(response.code ?? 0);
     });
     Object.assign(emitter, {

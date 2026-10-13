@@ -9,3 +9,7 @@ docs/superpowers/
 
 # DSH runtime memory (volatile, never part of review evidence)
 .mnemon/
+
+# Local browser acceptance artifacts (may contain workspace/session metadata).
+/.playwright-cli/
+/output/playwright/

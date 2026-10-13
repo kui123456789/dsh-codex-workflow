@@ -11,7 +11,7 @@ import * as plugin from "../src/index.js";
 test("DSH plugin activation waits for all workflow tools and unload removes them", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-plugin-load-"));
   const ctx = new Context();
-  const names = ["start", "continue", "review", "review_only", "submit", "decide", "status", "cancel"]
+  const names = ["start", "continue", "resume", "review", "review_only", "submit", "decide", "status", "cancel"]
     .map((name) => `codex_workflow_${name}`);
   try {
     await ctx.plugin(SystemPrompt, {});
@@ -19,6 +19,7 @@ test("DSH plugin activation waits for all workflow tools and unload removes them
     ctx.provide("agents", { list: () => [], get: () => undefined });
     ctx.provide("sessionProjections", { register: () => () => undefined });
     ctx.provide("subagents", { registerProvider: () => () => undefined });
+    ctx.provide("connection", { rpc: { handle: () => () => undefined } });
     const fiber = ctx.plugin(plugin, { storageDir: directory });
     await fiber;
     for (const name of names) assert.ok(ctx.tools.get(name), `${name} must exist when activation resolves`);
@@ -44,6 +45,7 @@ test("DSH receives asynchronous plugin initialization failures", async () => {
     ctx.provide("agents", { list: () => [], get: () => undefined });
     ctx.provide("sessionProjections", { register: () => () => undefined });
     ctx.provide("subagents", { registerProvider: () => () => undefined });
+    ctx.provide("connection", { rpc: { handle: () => () => undefined } });
     const fiber = ctx.plugin(plugin, { storageDir: occupied });
     await assert.rejects(fiber.await(), /EEXIST|ENOTDIR/);
     assert.equal(ctx.tools.get("codex_workflow_start"), undefined);

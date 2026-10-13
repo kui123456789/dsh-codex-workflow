@@ -7,14 +7,20 @@ import { ReviewerGateway } from "./app-server/reviewer-gateway.js";
 import { ReviewObservation } from "./review-observation.js";
 import type { WorkflowRuntimeState } from "./workflow-runtime-state.js";
 import { transientReason } from "../transient-retry.js";
-import type { ReviewConflictInfo, ReviewInput, ReviewResult, SubmissionState, WorkflowConfig, WorkflowPhase, WorkflowRecord } from "../types.js";
+import type { ReviewConflictInfo, ReviewInput, ReviewResult, ReviewStep, SubmissionState, WorkflowConfig, WorkflowPhase, WorkflowRecord } from "../types.js";
 import { applyReviewConsistency, abortError, callbackRecoveryDelay, delay, errorMessage, submissionTerminal } from "../workflow.js";
 import type { CodexReviewEndEvent } from "../review-events.js";
 import type { LiveRelay } from "./live-relay.js";
+import { collectEvidence } from "../evidence.js";
+import { submissionReviewIdentity, SubmissionReviewContextError, SubmissionReviewResultUnavailableError, type SubmissionReviewCheckpoint } from "./submission-review-checkpoint.js";
+import { SubmissionReviewConsumers, SubmissionReviewUnavailableError, type SubmissionReviewConsumer } from "./submission-review-consumer.js";
+import { ORIGINAL_REVIEWER_UNAVAILABLE, ORIGINAL_REVIEW_RESULT_UNAVAILABLE } from "./submission-recovery-policy.js";
 
 type AnyFn = (...args: any[]) => any;
 
 export interface SubmissionExecutionContext {
+  retainCallbackCleanup?(workflowId: string, record: WorkflowRecord): Promise<void>;
+  releaseCallbackCleanup?(workflowId: string, record?: WorkflowRecord): Promise<void>;
   store: WorkflowStore;
   config: WorkflowConfig;
   runtime: WorkflowRuntimeState;
@@ -31,14 +37,19 @@ export interface SubmissionExecutionContext {
   flushCleanupNotes: AnyFn;
   alignReview: AnyFn;
   reconcileReview: AnyFn;
+  assertAuxiliaryTurnsEnded?(workflowId: string): void;
+  isSubmissionLeaseOwner?(workflowId: string, submissionId: string, lease: ManagerLease): boolean;
   errorMessage: (error: unknown) => string;
-  createLiveRelay(record: WorkflowRecord, stage: "reviewing", reviewId: string): LiveRelay;
+  createLiveRelay(record: WorkflowRecord, stage: "reviewing", reviewId: string, canPublish?: () => boolean): LiveRelay;
   disposeChildSession(workflowId: string, child: import("../codex-child-session.js").CodexChildSessionHandle | undefined): Promise<void>;
+  bindUsage?(workflowId: string, threadId: string, stage: "reviewing", model?: string, expectedOwner?: object): Promise<void>;
+  releaseUsage?(workflowId: string, threadId: string, expectedOwner?: object): Promise<void>;
 }
 
 /** Owns one durable bridge callback state machine, including lease fencing,
  * authority alignment and exact staged-verdict delivery. */
 export class SubmissionExecution {
+  private readonly consumers = new SubmissionReviewConsumers();
   constructor(private readonly ctx: SubmissionExecutionContext) {}
   async run(
     workflowId: string,
@@ -49,11 +60,29 @@ export class SubmissionExecution {
     lease?: ManagerLease,
   ): Promise<WorkflowRecord> {
     let current = seed;
+    const identity = submissionReviewIdentity(seed, prompt);
+    let ownedFinalPhase = seed.phase;
+    let checkpoint = this.ctx.runtime.submissionReviewResults.get(workflowId);
+    let contextRejected = false;
     const child = this.ctx.runtime.codexChildSessions.get(workflowId);
     const liveRecord = await this.ctx.store.load(workflowId) ?? seed;
-    const live = this.ctx.createLiveRelay(liveRecord, "reviewing", `${workflowId}:${liveRecord.reviewAttempt ?? 1}`);
+    const live = this.ctx.createLiveRelay(liveRecord, "reviewing", `${workflowId}:${liveRecord.reviewAttempt ?? 1}`, () => canPublish());
     const roundStartAttempt = current.submissionAttempts ?? 0;
     let leaseLost = false;
+    let reviewHeartbeat: NodeJS.Timeout | undefined;
+    let consumer: SubmissionReviewConsumer | undefined;
+    let retireOriginal: ReturnType<SubmissionReviewConsumers["captureRetirement"]> | undefined;
+    const callbackModel = seed.reviewerModel || this.ctx.config.reviewerModel || undefined;
+    const callbackEffort = seed.reviewerEffort ?? this.ctx.config.reviewerEffort;
+    const originalReviewerRequired = this.ctx.callback?.supportsConsumerOwnership === true
+      && seed.reviewerThreadOrigin === "app-server-ephemeral" && (seed.submissionAttempts ?? 0) > 0;
+    let originalRegistered = false;
+    const failureReason = (error: unknown) => error instanceof SubmissionReviewResultUnavailableError ? ORIGINAL_REVIEW_RESULT_UNAVAILABLE
+      : error instanceof SubmissionReviewUnavailableError
+      || (this.ctx.callback?.supportsConsumerOwnership === true && !checkpoint
+        && (originalRegistered || originalReviewerRequired)
+        && (error instanceof CodexInvalidThreadError || error instanceof CodexNoVerdictError
+          || error instanceof CodexCallbackProcessError)) ? ORIGINAL_REVIEWER_UNAVAILABLE : undefined;
     let reviewEndDetail: Pick<CodexReviewEndEvent, "verdict" | "result" | "visibleText" | "summary" | "error"> | undefined;
     // Every state write must stay fenced to THIS lease (submissionId + token +
     // epoch): a stale owner can never rewrite a submission the lease moved on.
@@ -61,12 +90,37 @@ export class SubmissionExecution {
       record.submissionId === submissionId
       && !submissionTerminal(record.submissionState)
       && (!lease || (record.submissionLeaseToken === lease.owner && record.submissionLeaseEpoch === lease.epoch));
+    const ownsProgress = (record: WorkflowRecord) => !this.ctx.runtime.stopped && !signal?.aborted && !leaseLost && isCurrent(record)
+      && submissionReviewIdentity(record, prompt) === identity
+      && (!lease || this.ctx.isSubmissionLeaseOwner?.(workflowId, submissionId, lease) !== false);
+    const canPublish = () => {
+      try {
+        const latest = this.ctx.store.snapshot(workflowId);
+        return Boolean(latest && ownsProgress(latest));
+      } catch { return false; }
+    };
+    // Final cleanup may follow our own cancellation or failure, but cannot
+    // acquire a successor's progress authority after the submission lease moves.
+    const ownsFinalProgress = (record: WorkflowRecord) => !leaseLost && record.submissionId === submissionId
+      && (!lease || (record.submissionLeaseToken === lease.owner && record.submissionLeaseEpoch === lease.epoch))
+      && submissionReviewIdentity(record.phase === "cancelled" || record.phase === ownedFinalPhase
+        ? { ...record, phase: seed.phase } : record, prompt) === identity
+      && (!lease || this.ctx.isSubmissionLeaseOwner?.(workflowId, submissionId, lease) !== false);
+    const markReview = (step: ReviewStep, message: string, turnId?: string | null) =>
+      this.ctx.reviewObservation.mark(workflowId, step, message, turnId, ownsProgress);
     const updateCurrent = async (fn: (record: WorkflowRecord) => void): Promise<WorkflowRecord> => {
       const outcome = await this.ctx.store.update(workflowId, (r) => {
-        if (!isCurrent(r)) return;
+        if (lease && this.ctx.isSubmissionLeaseOwner?.(workflowId, submissionId, lease) === false) {
+          throw new SubmissionReviewContextError("submission review lease was lost");
+        }
+        if (!isCurrent(r)) throw new SubmissionReviewContextError("submission no longer owns this progress");
+        if (submissionReviewIdentity(r, prompt) !== identity) {
+          throw new SubmissionReviewContextError("submission review context changed");
+        }
         fn(r);
       }, { ignoreCancelled: false });
       current = outcome.record;
+      if (!outcome.suppressed) ownedFinalPhase = current.phase;
       return current;
     };
     lease?.heartbeat(this.ctx.leaseTtlMs / 3, () => {
@@ -75,20 +129,83 @@ export class SubmissionExecution {
       // callback must never enqueue a verdict or regress the new owner's
       // received/applied/delivered back to sending/retrying/failed.
       leaseLost = true;
-      this.ctx.callback?.cancelSubmission(workflowId, submissionId);
+      consumer?.cancelWait(new Error("submission review lease was lost"));
+      if (consumer?.isCurrent()) {
+        this.ctx.callback?.cancelSubmission(workflowId, submissionId,
+          this.ctx.callback.supportsConsumerOwnership ? consumer : undefined);
+      }
     });
+    const verifyCheckpoint = async (saved: SubmissionReviewCheckpoint): Promise<void> => {
+      if (saved.submissionId !== submissionId || saved.identity !== identity) {
+        throw new SubmissionReviewContextError("completed review checkpoint belongs to a different submission context; refusing to repeat the Reviewer");
+      }
+      const evidence = await collectEvidence({ cwd: saved.cwd, maxDiffBytes: this.ctx.config.reviewDiffMaxBytes,
+        changedFiles: saved.changedFiles });
+      if (evidence.insufficient || !evidence.fingerprint || evidence.kind !== saved.evidenceKind
+        || evidence.fingerprint !== saved.fingerprint) {
+        throw new Error("workspace changed or evidence is unavailable since the completed review; submit a new review round");
+      }
+      const latest = await this.ctx.store.load(workflowId);
+      if (!latest || !isCurrent(latest) || submissionReviewIdentity(latest, prompt) !== identity
+        || (lease && this.ctx.isSubmissionLeaseOwner?.(workflowId, submissionId, lease) === false)) {
+        throw new SubmissionReviewContextError("submission review context or lease changed before reusing the completed result");
+      }
+      if (signal?.aborted || this.ctx.runtime.stopped) throw abortError(signal ?? this.ctx.runtime.lifecycleController.signal);
+      current = latest;
+    };
+    const verifyOriginalEvidence = async (): Promise<void> => {
+      const original = seed.latestReviewEvidence;
+      if (!original || original.insufficient || !original.fingerprint) {
+        throw new Error("original review evidence is unavailable for this submission; provide observable changedFiles and submit a new review round");
+      }
+      const evidence = await collectEvidence({ cwd: seed.cwd, maxDiffBytes: this.ctx.config.reviewDiffMaxBytes,
+        changedFiles: seed.pendingReviewRequest?.changedFiles });
+      if (evidence.insufficient || !evidence.fingerprint || evidence.kind !== original.kind
+        || evidence.fingerprint !== original.fingerprint) {
+        throw new Error("workspace changed or review evidence is unavailable since submission; submit a new review round");
+      }
+      const latest = await this.ctx.store.load(workflowId);
+      if (!latest || !isCurrent(latest) || submissionReviewIdentity(latest, prompt) !== identity
+        || (lease && this.ctx.isSubmissionLeaseOwner?.(workflowId, submissionId, lease) === false)) {
+        throw new SubmissionReviewContextError("submission context or lease changed during evidence admission");
+      }
+      if (signal?.aborted || this.ctx.runtime.stopped) throw abortError(signal ?? this.ctx.runtime.lifecycleController.signal);
+      current = latest;
+    };
     try {
+      const consumerOptions = { workflowId, submissionId,
+        owner: lease?.owner ?? `legacy:${submissionId}`, epoch: lease?.epoch ?? 0,
+        requireOriginal: this.ctx.callback?.supportsConsumerOwnership === true,
+        identity: JSON.stringify([identity, callbackModel, callbackEffort]), child, signal, canAdopt: canPublish,
+        canRetire: () => {
+          const record = this.ctx.store.snapshot(workflowId);
+          return Boolean(record && ownsFinalProgress(record));
+        } };
+      retireOriginal = this.consumers.captureRetirement(consumerOptions);
+      if (current.submissionReviewPending && !checkpoint) {
+        throw new SubmissionReviewResultUnavailableError("completed Reviewer result is unavailable in this process; refusing to repeat the original review");
+      }
+      if (checkpoint) await verifyCheckpoint(checkpoint);
+      if (originalReviewerRequired) this.consumers.assertOriginalAvailable(workflowId, submissionId);
+      consumer = this.consumers.prepare(consumerOptions);
       for (let attempt = (current.submissionAttempts ?? 0) + 1; ; attempt += 1) {
         if (this.ctx.runtime.stopped || signal?.aborted || leaseLost) return current;
+        if (!checkpoint) await verifyOriginalEvidence();
         const sending = await updateCurrent((r) => {
           r.submissionState = "sending";
           r.submissionAttempts = attempt;
           r.submissionRetryAt = undefined;
+          r.processState = "running";
+          r.activeTurnId = undefined;
+          r.lastProgressAt = new Date().toISOString();
+          r.lastProgressMessage = "Continuing the current background review";
         });
-        if (sending.submissionId !== submissionId || submissionTerminal(sending.submissionState)) {
+        if (!isCurrent(sending)) {
           return sending; // cancelled or re-claimed by another restarter
         }
-        await this.ctx.reviewObservation.mark(workflowId, "review_native_turn", "Running Reviewer turn");
+        reviewHeartbeat = this.ctx.reviewObservation.startHeartbeat(workflowId, ownsProgress);
+        await markReview(checkpoint ? "review_alignment" : "review_native_turn",
+          checkpoint ? "Continuing validation of the completed review" : "Running Reviewer turn");
         let outcome:
           | { kind: "verdict"; verdict: ReviewResult }
           | { kind: "retryable_busy"; reason?: string };
@@ -115,49 +232,86 @@ export class SubmissionExecution {
             ));
             this.ctx.reportCleanupNote(workflowId, handoffNote);
           }
-          outcome = await this.ctx.callback!.send({
-            workflowId,
-            submissionId,
-            codexThreadId: current.codexThreadId!,
-            cwd: current.cwd,
-            prompt,
-            // The original task/plan context lets the background dispatcher
-            // enforce the SAME visible-review display contract as the
-            // DSH-led path (task language + four readable sections).
-            task: current.task,
-            ...(current.planMarkdown ? { planMarkdown: current.planMarkdown } : {}),
-            // A legacy shared alias is handed over as UNBOUND so the
-            // dispatcher creates the dedicated Reviewer instead of resuming
-            // the Planner/origin task.
-            reviewerThreadId: boundReviewer,
-            reviewerName: `DSH Reviewer: ${workflowId}`,
-            ephemeral: true,
-            ...(current.reviewerModel || this.ctx.config.reviewerModel
-              ? { model: current.reviewerModel || this.ctx.config.reviewerModel }
-              : {}),
-            effort: current.reviewerEffort ?? this.ctx.config.reviewerEffort,
-            onThread: async (threadId) => {
-              const registered = await updateCurrent((r) => {
-                // Ephemeral Reviewer ids are process-local and must never be
-                // persisted as Desktop-visible durable bindings.
-                r.reviewerThreadOrigin = "app-server-ephemeral";
-              });
-              void threadId;
-              if (registered.submissionId !== submissionId) throw new Error("submission no longer owns the reviewer thread");
-            },
-            onStarted: async ({ threadId, turnId }) => {
-              const registered = await updateCurrent((r) => {
-                r.reviewerTurnId = turnId;
-                r.activeTurnId = turnId;
-                r.lastProgressAt = new Date().toISOString();
-                r.lastProgressMessage = "Reviewer turn is running";
-              });
-              if (registered.submissionId !== submissionId || registered.reviewerTurnId !== turnId) {
-                throw new Error("submission no longer owns the active reviewer turn");
+          this.ctx.assertAuxiliaryTurnsEnded?.(workflowId);
+          if (checkpoint) {
+            await verifyCheckpoint(checkpoint);
+            consumer.adopt();
+            child?.beginContinuation("沿用已完成的原审查结果，仅继续权威校验；不重新运行可读审查。");
+            reviewEndDetail = { visibleText: checkpoint.visibleText };
+            outcome = { kind: "verdict", verdict: structuredClone(checkpoint.verdict) };
+          } else {
+            // Legacy adapters have independent sends and do not implement
+            // consumer adoption. The manager validates their handoff here.
+            if (!this.ctx.callback!.supportsConsumerOwnership) consumer.adopt();
+            outcome = await this.ctx.callback!.send({
+              workflowId,
+              submissionId,
+              consumer,
+              originalReviewerRequired,
+              codexThreadId: current.codexThreadId!,
+              cwd: current.cwd,
+              prompt,
+              // The original task/plan context lets the background dispatcher
+              // enforce the SAME visible-review display contract as the
+              // DSH-led path (task language + four readable sections).
+              task: current.task,
+              ...(current.planMarkdown ? { planMarkdown: current.planMarkdown } : {}),
+              // A legacy shared alias is handed over as UNBOUND so the
+              // dispatcher creates the dedicated Reviewer instead of resuming
+              // the Planner/origin task.
+              reviewerThreadId: boundReviewer,
+              reviewerName: `DSH Reviewer: ${workflowId}`,
+              ephemeral: true,
+              ...(callbackModel ? { model: callbackModel } : {}),
+              effort: callbackEffort,
+              onThread: async (threadId) => {
+                const registered = await updateCurrent((r) => {
+                  // Ephemeral Reviewer ids are process-local and must never be
+                  // persisted as Desktop-visible durable bindings.
+                  r.reviewerThreadOrigin = "app-server-ephemeral";
+                });
+                void threadId;
+                if (registered.submissionId !== submissionId) throw new Error("submission no longer owns the reviewer thread");
+                originalRegistered = true;
+              },
+              onStarted: async ({ threadId, turnId }) => {
+                const registered = await updateCurrent((r) => {
+                  r.reviewerTurnId = turnId;
+                  r.activeTurnId = turnId;
+                  r.lastProgressAt = new Date().toISOString();
+                  r.lastProgressMessage = "Reviewer turn is running";
+                });
+                if (registered.submissionId !== submissionId || registered.reviewerTurnId !== turnId) {
+                  throw new Error("submission no longer owns the active reviewer turn");
+                }
+              },
+              onOriginalThread: async (threadId, threadOwner) => {
+                if (leaseLost || this.ctx.runtime.stopped || signal?.aborted) return;
+                const record = await this.ctx.store.load(workflowId);
+                if (!record || !ownsProgress(record) || record.phase === "cancelled") return;
+                await this.ctx.bindUsage?.(workflowId, threadId, "reviewing",
+                  callbackModel, threadOwner);
+              },
+              onThreadReleased: (threadId, threadOwner) => this.ctx.releaseUsage?.(workflowId, threadId, threadOwner),
+              onProgress: (entry: any) => { if (canPublish()) { live.onProgress(entry); child?.progress(entry); } },
+              onContinuation: (instruction) => { if (canPublish()) child?.beginContinuation(instruction); },
+              onVisibleReview: (text) => { if (canPublish()) reviewEndDetail = { ...reviewEndDetail, visibleText: text }; },
+            }, consumer.signal);
+            if (outcome.kind === "verdict" && current.latestReviewEvidence?.fingerprint
+              && !current.latestReviewEvidence.insufficient) {
+              const latest = await this.ctx.store.load(workflowId);
+              if (!latest || !isCurrent(latest) || submissionReviewIdentity(latest, prompt) !== identity) {
+                throw new SubmissionReviewContextError("submission review context changed before retaining its completed result");
               }
-            },
-            onProgress: (entry: any) => { live.onProgress(entry); child?.progress(entry); },
-          }, signal);
+              if (signal?.aborted || this.ctx.runtime.stopped) throw abortError(signal ?? this.ctx.runtime.lifecycleController.signal);
+              checkpoint = { submissionId, identity, verdict: structuredClone(outcome.verdict),
+                visibleText: reviewEndDetail?.visibleText, child, cwd: current.cwd,
+                changedFiles: current.pendingReviewRequest?.changedFiles?.slice(),
+                fingerprint: current.latestReviewEvidence.fingerprint, evidenceKind: current.latestReviewEvidence.kind };
+              this.ctx.runtime.submissionReviewResults.set(workflowId, checkpoint);
+              await updateCurrent((r) => { r.submissionReviewPending = true; });
+            }
+          }
         } catch (error) {
           if (leaseLost) return current; // we were taken over mid-flight: write nothing
           if (
@@ -165,7 +319,7 @@ export class SubmissionExecution {
             || error instanceof CodexNoVerdictError
             || error instanceof CodexCallbackProcessError
           ) {
-            const failed = await this.ctx.stageSubmissionFailure(updateCurrent, workflowId, submissionId, error.message);
+            const failed = await this.ctx.stageSubmissionFailure(updateCurrent, workflowId, submissionId, error.message, failureReason(error));
             await this.ctx.enqueueSubmissionNotice(workflowId, submissionId, failed, signal);
             return current;
           }
@@ -177,6 +331,7 @@ export class SubmissionExecution {
             if (!this.ctx.runtime.stopped && !leaseLost) {
               await updateCurrent((r) => {
                 r.submissionState = "retrying";
+                r.submissionReviewPending = checkpoint ? true : undefined;
                 r.submissionError = "interrupted: callback aborted before a verdict";
                 r.submissionCallbackReason = "callback aborted (cancel/restart)";
                 r.submissionRetryAt = Date.now() + this.ctx.config.callbackRetryBaseMs;
@@ -203,7 +358,6 @@ export class SubmissionExecution {
         const priorPhase: WorkflowPhase = current.phase === "fixing" ? "fixing" : "executing";
         let contractConflict: ReviewConflictInfo | undefined;
         if (outcome.kind === "verdict") {
-          reviewEndDetail = { verdict: outcome.verdict.verdict, result: outcome.verdict, summary: outcome.verdict.summary };
           // 1.0.10 REVIEW AUTHORITY ALIGNMENT on the bridge path: the verdict
           // must align with the authority hierarchy before it may be staged.
           // One invisible alignment fork checks the result; on conflict the
@@ -216,15 +370,16 @@ export class SubmissionExecution {
           let verdict = applyReviewConsistency(outcome.verdict);
           let contractFailed = false;
           try {
-        await this.ctx.reviewObservation.mark(workflowId, "review_alignment", "Checking Review authority alignment", null);
+        await markReview("review_alignment", "Checking Review authority alignment", null);
             // The alignment prompt receives the PREVIOUSLY APPLIED review and
             // THIS submission's fix summary (both persisted on the record), so
             // a legitimately carried-forward finding is never misjudged as a
             // generic conflict.
-            const alignment = await this.ctx.alignReview(current, verdict, signal, current.pendingReviewRequest);
+            const alignment = await this.ctx.alignReview(current, verdict, signal, current.pendingReviewRequest, undefined, ownsProgress);
             if (!alignment.aligned) {
-              await this.ctx.reviewObservation.mark(workflowId, "review_reconciliation", "Reconciling Review findings", null);
-              const reconciled = await this.ctx.reconcileReview(current, verdict, alignment.conflicts, signal, current.pendingReviewRequest);
+              if (checkpoint) await verifyCheckpoint(checkpoint);
+              await markReview("review_reconciliation", "Reconciling Review findings", null);
+              const reconciled = await this.ctx.reconcileReview(current, verdict, alignment.conflicts, signal, current.pendingReviewRequest, undefined, ownsProgress);
               contractConflict = {
                 conflicts: alignment.conflicts,
                 reconciled: true,
@@ -232,7 +387,7 @@ export class SubmissionExecution {
                 at: new Date().toISOString(),
               };
               if (reconciled.aligned) {
-                await this.ctx.reviewObservation.mark(workflowId, "review_reconciliation",
+                await markReview("review_reconciliation",
                   `已按权威层级改写（${alignment.conflicts.length} 条冲突已解决）`, null);
                 verdict = reconciled.result;
               } else {
@@ -297,13 +452,19 @@ export class SubmissionExecution {
           }
         }
         if (outcome.kind === "verdict") {
-          await this.ctx.reviewObservation.mark(workflowId, "review_finalizing", "Finalizing Review status", null);
+          if (checkpoint) await verifyCheckpoint(checkpoint);
+          await markReview("review_finalizing", "Finalizing Review status", null);
           if (!this.ctx.bridgeQueue) {
             const committed = await updateCurrent((r) => {
+              r.submissionReviewPending = undefined;
               r.submissionState = "waiting_verdict";
               r.submissionError = undefined;
               r.callbackState = "waiting_verdict";
             });
+            if (committed.submissionId === submissionId && committed.submissionState === "waiting_verdict") {
+              reviewEndDetail = { ...reviewEndDetail, verdict: outcome.verdict.verdict,
+                result: outcome.verdict, summary: outcome.verdict.summary };
+            }
             return committed;
           }
           // Phase A: persist the FULL verdict command BEFORE touching the queue.
@@ -312,6 +473,7 @@ export class SubmissionExecution {
           // are identical every time.
           let stagedRequestId: string | undefined;
           const staged = await updateCurrent((r) => {
+            r.submissionReviewPending = undefined;
             stagedRequestId = newRequestId();
             const command: SubmitVerdictCommand = {
               version: 1,
@@ -338,6 +500,8 @@ export class SubmissionExecution {
             r.reviewContractFailures = 0;
           });
           if (staged.submissionId !== submissionId || submissionTerminal(staged.submissionState)) return staged;
+          reviewEndDetail = { ...reviewEndDetail, verdict: outcome.verdict.verdict,
+            result: outcome.verdict, summary: outcome.verdict.summary };
           // Phase B: idempotent enqueue of the exact staged command.
           const enqueued = await this.ctx.enqueueStagedVerdict(workflowId, submissionId, staged, signal);
           if (enqueued !== "committed") return enqueued;
@@ -354,9 +518,15 @@ export class SubmissionExecution {
         }
         const busy = await updateCurrent((r) => {
           r.submissionState = "retrying";
+          r.submissionReviewPending = checkpoint ? true : undefined;
           r.submissionError = `codex thread busy or rate limited${outcome.reason ? ` (${outcome.reason})` : ""}`;
           r.submissionCallbackReason = outcome.reason ?? "busy";
           r.callbackState = "retrying";
+          if (this.ctx.callback?.hasPendingStartReceipt?.(workflowId)) {
+            r.processState = "waiting";
+            r.retryState = { stage: "reviewing", reason: this.ctx.callback.getPendingStartReceipt?.(workflowId)?.pendingStart.message
+              ?? "Original Reviewer start receipt is pending", attempts: 1, awaitingContinuation: true, awaitingStartReceipt: true };
+          }
         });
         if (busy.submissionId !== submissionId || submissionTerminal(busy.submissionState)) return busy;
         const attemptsThisRound = attempt - roundStartAttempt;
@@ -364,6 +534,7 @@ export class SubmissionExecution {
           const retryDelayMs = callbackRecoveryDelay(this.ctx.config.callbackRetryBaseMs, attemptsThisRound);
           await updateCurrent((r) => {
             r.submissionState = "retrying";
+            r.submissionReviewPending = checkpoint ? true : undefined;
             r.submissionError = `codex thread busy after ${attemptsThisRound} attempts in this round (${outcome.reason ?? "busy"}); recovery will retry`;
             r.submissionCallbackReason = outcome.reason ?? "busy";
             r.submissionRetryAt = Date.now() + retryDelayMs;
@@ -378,17 +549,65 @@ export class SubmissionExecution {
         if (signal?.aborted) throw abortError(signal);
       }
     } catch (error) {
+      if (error instanceof SubmissionReviewContextError) { contextRejected = true; throw error; }
       if (signal?.aborted || this.ctx.runtime.stopped) throw error;
-      const failed = await this.ctx.stageSubmissionFailure(updateCurrent, workflowId, submissionId, this.ctx.errorMessage(error));
+      const latest = await this.ctx.store.load(workflowId);
+      if (!latest || !isCurrent(latest) || submissionReviewIdentity(latest, prompt) !== identity) {
+        contextRejected = true;
+        throw error;
+      }
+      const failed = await this.ctx.stageSubmissionFailure(updateCurrent, workflowId, submissionId, this.ctx.errorMessage(error), failureReason(error));
       await this.ctx.enqueueSubmissionNotice(workflowId, submissionId, failed, signal);
       return current;
     } finally {
-      child?.finish(reviewEndDetail?.visibleText ?? "", reviewEndDetail?.error ? "failed" : "completed");
-      await this.ctx.disposeChildSession(workflowId, child);
-      live.close();
-      lease?.stopHeartbeat();
-      await this.ctx.reviewObservation.finish(workflowId, undefined, reviewEndDetail);
-      await this.ctx.flushCleanupNotes(workflowId);
+      let retained = false;
+      try {
+        const pendingTerminal = this.ctx.callback?.hasPendingInterruption?.(workflowId) === true
+          || this.ctx.callback?.hasPendingTerminalCleanup?.(workflowId) === true;
+        // Keep observer teardown protected even when a displaced cleanup
+        // generation refuses retention of the original model operation.
+        retained = pendingTerminal;
+        if (pendingTerminal) await this.ctx.retainCallbackCleanup?.(workflowId, liveRecord);
+        else {
+          await this.ctx.releaseCallbackCleanup?.(workflowId, liveRecord);
+          if (consumer?.isCurrent() === true && !leaseLost && !this.ctx.runtime.stopped && !signal?.aborted
+            && current.phase !== "cancelled" && current.retryState?.awaitingStartReceipt) {
+            await updateCurrent((r) => { if (r.retryState?.awaitingStartReceipt) r.retryState = undefined; });
+          }
+        }
+        retained = pendingTerminal || consumer?.isCurrent() === true && !leaseLost && !this.ctx.runtime.stopped && !signal?.aborted
+          && !contextRejected && current.phase !== "cancelled" && current.submissionState === "retrying"
+          && (this.ctx.callback?.availableContinuation?.(workflowId) === true
+            || this.ctx.runtime.submissionReviewResults.get(workflowId)?.child === child && Boolean(checkpoint));
+        if (retained) child?.failAttempt(this.ctx.callback?.getPendingTerminalCleanup?.(workflowId)?.terminalFailure
+          ?? current.submissionError ?? "Review waiting for continuation");
+        else {
+          const cleanup = async (resourceConsumer: SubmissionReviewConsumer) => {
+            if (this.ctx.runtime.submissionReviewResults.get(workflowId) === checkpoint) {
+              this.ctx.runtime.submissionReviewResults.delete(workflowId);
+            }
+            if (resourceConsumer !== consumer || leaseLost || current.phase === "cancelled" || current.submissionState === "failed") {
+              await this.ctx.callback?.cancelSubmission(resourceConsumer.workflowId, resourceConsumer.submissionId,
+                this.ctx.callback.supportsConsumerOwnership ? resourceConsumer : undefined);
+            }
+            child?.finish(reviewEndDetail?.visibleText ?? "", current.phase === "cancelled" ? "aborted"
+              : current.submissionState === "failed" || reviewEndDetail?.error ? "failed" : "completed");
+            await this.ctx.disposeChildSession(workflowId, child);
+          };
+          await consumer?.close(() => cleanup(consumer!));
+          await retireOriginal?.(cleanup);
+        }
+      } finally {
+        live.close();
+        lease?.stopHeartbeat();
+        this.ctx.reviewObservation.stopHeartbeat(workflowId, reviewHeartbeat);
+        if (!contextRejected && !leaseLost) {
+          const expected = { dshSessionId: liveRecord.dshSessionId, reviewAttempt: liveRecord.reviewAttempt,
+            cwd: liveRecord.cwd, evidenceFingerprint: liveRecord.latestReviewEvidence?.fingerprint };
+          await this.ctx.reviewObservation.finish(workflowId, retained ? "waiting" : undefined, reviewEndDetail, expected, ownsFinalProgress, reviewHeartbeat);
+          await this.ctx.flushCleanupNotes(workflowId, expected, ownsFinalProgress);
+        }
+      }
     }
   }
 

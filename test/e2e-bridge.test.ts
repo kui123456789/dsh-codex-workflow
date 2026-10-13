@@ -393,11 +393,10 @@ test("codex_workflow_submit returns promptly; DSH turn-end never aborts the stil
   }
 });
 
-/** Defect 6: an invalid/missing background NORMALIZATION output is retryable —
- * never a terminal submission failure/notice, zero review cycles — and a
- * simulated restart (fresh App Server + manager) auto-continues the SAME
- * submission to its verdict via the shared mutable verdict queue. */
-test("invalid normalization output stays retryable; restart recovery auto-continues to the verdict", async () => {
+/** An invalid normalization retains the original Reviewer in its process.
+ * Restarting loses that ephemeral operation and cannot consume another model
+ * output by rebuilding the same submission. */
+test("invalid normalization stays retryable locally; restart reports the original ephemeral review unavailable", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-e2e-norm-retry-"));
   try {
     const cwd = join(directory, "ws");
@@ -410,8 +409,8 @@ test("invalid normalization output stays retryable; restart recovery auto-contin
     const store = new BridgeStore(storageDir);
     const workflowStore = new WorkflowStore(join(directory, "workflows"));
     const codexThreadId = newRequestId();
-    // A SHARED mutable verdict queue consumed by BOTH fake-server processes:
-    // attempt 1 returns garbage, attempt 2 returns a valid verdict.
+    // The second output is left unconsumed when a new process cannot recover
+    // the original ephemeral Reviewer.
     const seqFile = join(directory, "verdicts.json");
     await writeFile(seqFile, JSON.stringify([
       "not-json",
@@ -467,8 +466,9 @@ test("invalid normalization output stays retryable; restart recovery auto-contin
       assert.equal(r.reviewCycles, 0, "no review cycle consumed by a failed normalization");
       assert.equal(r.phase, "executing", "the DSH workflow stays intact and retryable");
 
-      // SIMULATED RESTART: the plugin + App Server close, a FRESH manager
-      // takes over and recovers the SAME submission.
+      const remainingBeforeRestart = await readFile(seqFile, "utf8");
+      assert.equal(JSON.parse(remainingBeforeRestart).length, 1);
+      // A fresh manager cannot reconstruct the original ephemeral thread.
       await manager1.stop();
       await manager1Codex.stop();
       const manager2Codex = makeClient();
@@ -482,13 +482,15 @@ test("invalid normalization output stays retryable; restart recovery auto-contin
       try {
         await waitFor(async () => ((await workflowStore.load(record.id))?.submissionRetryAt ?? 0) <= Date.now());
         assert.equal(await manager2.recoverCallbacks(), 1);
-        await waitFor(async () => (await workflowStore.load(record.id))?.submissionState === "received");
+        await waitFor(async () => (await workflowStore.load(record.id))?.submissionState === "failed");
         r = (await workflowStore.load(record.id))!;
-        assert.equal(r.submissionState, "received");
-        assert.equal(r.submissionNotice, undefined);
-        assert.equal(r.reviewCycles, 0, "still zero until the verdict is APPLIED");
-        assert.equal(r.submissionAttempts, 2, "the restart continued the same submission");
-        assert.equal(r.stagedVerdict?.command.verdict?.verdict, "pass");
+        assert.equal(r.submissionState, "failed");
+        assert.match(r.submissionError ?? "", /original.*(?:unavailable|retired)|unavailable.*process/i);
+        assert.ok(r.submissionNotice, "The unrecoverable original is reported to its owning DSH session");
+        assert.equal(r.reviewCycles, 0, "Unavailable resources consume no review cycle");
+        assert.equal(r.submissionAttempts, 1, "No replacement callback or model attempt runs after restart");
+        assert.equal(r.stagedVerdict, undefined);
+        assert.equal(await readFile(seqFile, "utf8"), remainingBeforeRestart, "The fresh process cannot consume a replacement verdict");
       } finally {
         await manager2.stop();
         await manager2Codex.stop();

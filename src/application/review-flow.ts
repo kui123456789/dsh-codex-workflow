@@ -1,12 +1,12 @@
 import type { ReviewPort } from "../ports.js";
 import type { SubmitVerdictCommand } from "../bridge-protocol.js";
-import type { ReviewInput, WorkflowRecord } from "../types.js";
+import type { ReviewRequestInput, WorkflowRecord } from "../types.js";
 
 /** Application boundary for visible and bridge review operations. */
 export class ReviewFlow {
   constructor(private readonly port: ReviewPort) {}
 
-  review(workflowId: string, input: ReviewInput, exec: Parameters<ReviewPort["review"]>[2]): Promise<WorkflowRecord> {
+  review(workflowId: string, input: ReviewRequestInput, exec: Parameters<ReviewPort["review"]>[2]): Promise<WorkflowRecord> {
     return this.port.review(workflowId, input, exec);
   }
 

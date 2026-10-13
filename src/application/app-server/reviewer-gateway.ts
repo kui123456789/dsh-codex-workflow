@@ -5,13 +5,14 @@ export interface ReviewerGatewayPort {
   updateReviewerInstructions?(threadId: string, cwd: string, instructions: string, signal?: AbortSignal): Promise<void>;
   startReviewerThread?(options: { cwd: string; name?: string; model?: string; developerInstructions?: string; ephemeral?: boolean }, signal?: AbortSignal): Promise<string>;
   startReviewerThreadShell?(options: { cwd: string; name?: string; model?: string; developerInstructions?: string; ephemeral?: boolean }, signal?: AbortSignal): Promise<string>;
-  configureReviewerThread?(threadId: string, options: { cwd: string; name?: string; model?: string; developerInstructions?: string; ephemeral?: boolean }, signal?: AbortSignal): Promise<void>;
-  unsubscribeThread?(threadId: string, signal?: AbortSignal): Promise<unknown>;
+  configureReviewerThread?(threadId: string, options: { cwd: string; name?: string; model?: string; developerInstructions?: string; ephemeral?: boolean; expectedOwner?: object }, signal?: AbortSignal): Promise<void>;
+  unsubscribeThread?(threadId: string, signal?: AbortSignal, expectedOwner?: object): Promise<unknown>;
   releaseThreadForExternal?(threadId: string, signal?: AbortSignal): Promise<void>;
   nameThread?(threadId: string, name: string, signal?: AbortSignal): Promise<void>;
 }
 
 export interface ReviewerStartOptions {
+  expectedOwner?: object;
   cwd: string;
   name?: string;
   model?: string;
@@ -44,8 +45,8 @@ export class ReviewerGateway {
     return this.port.configureReviewerThread?.(threadId, options, signal);
   }
 
-  unsubscribe(threadId: string, signal?: AbortSignal): Promise<unknown> | undefined {
-    return this.port.unsubscribeThread?.(threadId, signal);
+  unsubscribe(threadId: string, signal?: AbortSignal, expectedOwner?: object): Promise<unknown> | undefined {
+    return this.port.unsubscribeThread?.(threadId, signal, expectedOwner);
   }
 
   externalRelease(threadId: string, signal?: AbortSignal): Promise<void> | undefined {

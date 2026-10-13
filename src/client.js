@@ -30,16 +30,12 @@ window.__ModuleLoader__.load({
     const codexSubagentAddress = (parentSessionId, childSessionId) =>
       `dsh-resource://subagentchat/session/${encodeURIComponent(childSessionId)}?parent=${encodeURIComponent(parentSessionId)}&mode=one-shot`;
 
-    function emptyProjection() {
-      return { currentWorkflowId: null, plan: null, activeReview: null, reviews: [] };
-    }
+    const LOADING_PROJECTION = Object.freeze({ currentWorkflowId: null, plan: null, activeReview: null, reviews: Object.freeze([]) });
+    const subscribeToNothing = () => () => {};
 
     function useProjection(face) {
-      return useSyncExternalStore(
-        face?.subscribe ?? (() => () => {}),
-        face?.getSnapshot ?? emptyProjection,
-        face?.getSnapshot ?? emptyProjection,
-      );
+      const read = () => face?.getSnapshot?.() ?? LOADING_PROJECTION;
+      return useSyncExternalStore(face?.subscribe ?? subscribeToNothing, read, read);
     }
 
     function LiveLog({ entries }) {
@@ -83,30 +79,36 @@ window.__ModuleLoader__.load({
       );
     }
 
+    const UNAVAILABLE_CONFIG_SNAPSHOT = Object.freeze({ status: "unavailable", value: undefined, writable: false });
+
     function readConfigSnapshot(form) {
       try {
         const snapshot = form?.getSnapshot?.();
         return snapshot && typeof snapshot === "object"
           ? snapshot
-          : { status: "unavailable", value: undefined, writable: false };
+          : UNAVAILABLE_CONFIG_SNAPSHOT;
       } catch {
-        return { status: "unavailable", value: undefined, writable: false };
+        return UNAVAILABLE_CONFIG_SNAPSHOT;
       }
     }
 
-    function SettingsBody({ configForm }) {
+    function SettingsBody({ configForm, connection }) {
       // Keep this page deliberately independent from the live projection
       // hooks. The settings host may mount the tab before its ConfigForm has
       // answered; a synchronous, guarded read keeps the page visible then.
-      const snapshot = readConfigSnapshot(configForm);
+      const subscribe = typeof configForm?.subscribe === "function"
+        ? configForm.subscribe.bind(configForm)
+        : () => () => {};
+      const snapshot = React.useSyncExternalStore(subscribe, () => readConfigSnapshot(configForm));
       const value = snapshot.value && typeof snapshot.value === "object" ? snapshot.value : {};
       const [modelOptions, setModelOptions] = React.useState(MODEL_OPTIONS);
       const [catalogState, setCatalogState] = React.useState("loading");
       React.useEffect(() => {
         let active = true;
-        if (typeof fetch !== "function") { setCatalogState("unavailable"); return; }
-        void fetch("/api/dsh-codex-workflow/models", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })
-          .then((response) => response.ok ? response.json() : Promise.reject(new Error(`model catalog HTTP ${response.status}`)))
+        const rpc = connection?.rpc;
+        if (typeof rpc?.call !== "function") { setCatalogState("unavailable"); return; }
+        void rpc.call("/dsh-codex-workflow", "models", { args: {} })
+          .then((result) => result?.ok ? result.value : Promise.reject(new Error(result?.error?.message || "model catalog RPC failed")))
           .then((payload) => {
             if (!active || !Array.isArray(payload?.models)) return;
             const dynamic = [["", "自动（跟随 App Server 默认模型）"], ...payload.models
@@ -116,7 +118,7 @@ window.__ModuleLoader__.load({
             else setCatalogState("unavailable");
           }).catch(() => { if (active) setCatalogState("unavailable"); });
         return () => { active = false; };
-      }, []);
+      }, [connection]);
       const setField = (field, next, event) => {
         if (!configForm || !snapshot.writable || typeof configForm.set !== "function") return;
         const section = event?.currentTarget?.closest?.("section");
@@ -141,7 +143,7 @@ window.__ModuleLoader__.load({
         return h("label", { key: field, style: { display: "grid", gap: 6, marginBottom: 16 } },
           h("span", { style: { fontWeight: 600 } }, label),
           h("small", { style: { opacity: 0.7, lineHeight: 1.45 } }, description),
-          h("select", { defaultValue: current, disabled: !snapshot.writable, onChange: (event) => setField(field, event.target.value, event),
+          h("select", { value: current, disabled: !snapshot.writable, onChange: (event) => setField(field, event.target.value, event),
             style: { width: "100%", padding: "9px 10px", borderRadius: 8, background: "#27272a", color: "#f4f4f5", colorScheme: "dark" } },
             ...choices.map(([id, text]) => h("option", { key: id, value: id, style: { backgroundColor: "#27272a", color: "#f4f4f5" } }, text)),
           ),
@@ -167,15 +169,27 @@ window.__ModuleLoader__.load({
     function ReviewBody({ projectionFace, useTabInfo }) {
       const projection = useProjection(projectionFace);
       const info = useTabInfo();
+      if (projection === LOADING_PROJECTION) {
+        return h("section", { className: "dsh-codex-review", "aria-label": "Codex Review" },
+          h("h2", null, "Codex Review"), h("p", { role: "status" }, "正在加载工作流状态"));
+      }
       const reviews = Array.isArray(projection.reviews) ? projection.reviews : [];
+      const latest = projection.activeReview || reviews.at(-1);
+      let status = latest
+        ? latest.processState === "running"
+          ? latest.message || "Codex 正在审查"
+          : ({ waiting: "审查已暂停", completed: "最近审查已完成", failed: "审查失败",
+              cancelled: "审查已取消", stale: "审查进度暂未更新" })[latest.processState] || "审查状态未知"
+        : "等待审查";
+      if (!projection.activeReview && projection.plan) {
+        if (projection.plan.status === "planning") status = projection.plan.processState === "waiting" ? "规划已暂停" : "Codex 正在规划";
+        else if (projection.plan.status === "waiting_input") status = "规划等待用户回答";
+        else if (!latest) status = ({ failed: "规划失败", ready: "规划已完成" })[projection.plan.status] || status;
+      }
       return h("section", { className: "dsh-codex-review", "aria-label": "Codex Review" },
         h("header", { className: "dsh-codex-review-header" },
           h("h2", null, "Codex Review"),
-          projection.activeReview
-            ? h("span", { role: "status" }, projection.activeReview.message || "Codex 正在审查")
-            : projection.plan?.status === "planning"
-              ? h("span", { role: "status" }, "Codex 正在规划")
-            : h("span", { role: "status" }, reviews.length ? "最近审查已完成" : "等待审查"),
+          h("span", { role: "status" }, status),
         ),
         projection.plan && h("details", { open: true },
           h("summary", null, "Planner", " · ", projection.plan.status),
@@ -197,7 +211,7 @@ window.__ModuleLoader__.load({
           key: review.reviewId || index,
           open: review.reviewId === projection.activeReview?.reviewId || index === reviews.length - 1,
         },
-          h("summary", null, `第 ${review.attempt || index + 1} 轮`, " · ", review.processState, review.verdict ? ` · ${review.verdict}` : ""),
+          h("summary", null, `第 ${review.attempt || index + 1} 次尝试`, " · ", review.processState, review.verdict ? ` · ${review.verdict}` : ""),
           h("p", null, review.message || ""),
           h(LiveLog, { entries: review.live }),
           review.visibleText && h("pre", { className: "dsh-codex-review-text",
@@ -222,9 +236,10 @@ window.__ModuleLoader__.load({
 
     return {
       name: "dsh-codex-workflow-ui",
-      inject: ["slots", "sidebarRight", "sidebarRightTabs", "sessions", "configForms"],
+      inject: ["slots", "sidebarRight", "sidebarRightTabs", "sessions", "configForms", "connection"],
       apply(ctx) {
         const disposers = [];
+        let disposed = false;
         const projectionOf = (sessionId) => {
           const binding = sessionId ? ctx.sessions.binding(sessionId) : undefined;
           return binding?.session.projections.faceOf("codexWorkflow");
@@ -260,9 +275,9 @@ window.__ModuleLoader__.load({
           label: "Codex 工作流",
           inject: () => {
             try {
-              return { configForm: ctx.configForms?.get?.("dsh-codex-workflow") };
+              return { configForm: ctx.configForms?.get?.("dsh-codex-workflow"), connection: ctx.connection };
             } catch {
-              return { configForm: undefined };
+              return { configForm: undefined, connection: ctx.connection };
             }
           },
         }, SettingsBody)));
@@ -270,10 +285,16 @@ window.__ModuleLoader__.load({
         let currentSessionId;
         let currentProjectionFace;
         let currentProjectionDisposer;
+        const releaseProjection = () => {
+          const dispose = currentProjectionDisposer;
+          currentProjectionDisposer = undefined;
+          dispose?.();
+        };
         const opened = new Set();
         const opening = new Set();
         const openRetries = new Map();
         const retryTimers = new Map();
+        const exhaustedOpenRetries = new Set();
         const MAX_OPEN_RETRIES = 8;
         const OPEN_RETRY_WINDOW_MS = 15_000;
         const RETRY_DELAY_MS = 150;
@@ -288,10 +309,12 @@ window.__ModuleLoader__.load({
           retryTimers.delete(key);
         };
         const scheduleOpenRetry = (key, reason) => {
+          if (disposed) return;
           const now = Date.now();
           const previous = openRetries.get(key) || { attempts: 0, firstAt: now };
           if (now - previous.firstAt >= OPEN_RETRY_WINDOW_MS || previous.attempts >= MAX_OPEN_RETRIES) {
             openRetries.delete(key);
+            exhaustedOpenRetries.add(key);
             clearRetryTimer(key);
             warn(`giving up sidebar open after ${previous.attempts} attempts (${reason})`);
             return;
@@ -305,7 +328,17 @@ window.__ModuleLoader__.load({
           }, RETRY_DELAY_MS);
           retryTimers.set(key, timer);
         };
+        const mayOpen = (key) => {
+          if (exhaustedOpenRetries.has(key)) return false;
+          const retry = openRetries.get(key);
+          if (retry && Date.now() - retry.firstAt >= OPEN_RETRY_WINDOW_MS) {
+            scheduleOpenRetry(key, "original retry window expired");
+            return false;
+          }
+          return true;
+        };
         const scheduleFaceRetry = () => {
+          if (disposed) return;
           if (faceRetryTimer || faceRetryAttempts >= 40) return;
           faceRetryAttempts += 1;
           faceRetryTimer = setTimeout(() => {
@@ -314,9 +347,12 @@ window.__ModuleLoader__.load({
           }, RETRY_DELAY_MS);
         };
         const scan = () => {
+          // A Host notifier may already have captured this callback before
+          // unsubscribe. Retired clients must not reacquire sidebar resources.
+          if (disposed) return;
           const sessionId = ctx.sidebarRight.mounted.getSnapshot();
           if (sessionId !== currentSessionId) {
-            currentProjectionDisposer?.();
+            releaseProjection();
             currentSessionId = sessionId;
             currentProjectionFace = undefined;
             faceRetryAttempts = 0;
@@ -334,7 +370,7 @@ window.__ModuleLoader__.load({
             return;
           }
           if (face !== currentProjectionFace) {
-            currentProjectionDisposer?.();
+            releaseProjection();
             currentProjectionFace = face;
             currentProjectionDisposer = face?.subscribe(scan);
           }
@@ -354,11 +390,13 @@ window.__ModuleLoader__.load({
           faceRetryAttempts = 0;
           const active = projection.activeReview;
           const latest = active || projection.reviews?.at?.(-1);
-          const childSessionId = active?.childSessionId || projection.plan?.childSessionId;
+          // Waiting and completed reviews retain their child in the history.
+          // Keep that native conversation visible after activeReview is cleared.
+          const childSessionId = latest?.childSessionId || projection.plan?.childSessionId;
           if (childSessionId && typeof ctx.sidebarRight.openResource === "function") {
             const key = `${sessionId}:subagent:${childSessionId}`;
             const address = codexSubagentAddress(sessionId, childSessionId);
-            if (!opened.has(key) && !opening.has(key)) {
+            if (!opened.has(key) && !opening.has(key) && mayOpen(key)) {
               if (ctx.sidebarRight.mounted.getSnapshot() !== sessionId) {
                 scheduleOpenRetry(key, "session seat changed before native open");
                 return;
@@ -395,7 +433,7 @@ window.__ModuleLoader__.load({
               : undefined;
           if (!target) return;
           const key = target.key;
-          if (!opened.has(key) && !opening.has(key)) {
+          if (!opened.has(key) && !opening.has(key) && mayOpen(key)) {
             if (ctx.sidebarRight.mounted.getSnapshot() !== sessionId) {
               scheduleOpenRetry(key, "session seat changed before fallback open");
               return;
@@ -421,13 +459,16 @@ window.__ModuleLoader__.load({
         disposers.push(ctx.sidebarRight.mounted.subscribe(scan));
         scan();
         return () => {
+          if (disposed) return;
+          disposed = true;
           if (faceRetryTimer) clearTimeout(faceRetryTimer);
           faceRetryTimer = undefined;
           for (const timer of retryTimers.values()) clearTimeout(timer);
           retryTimers.clear();
           openRetries.clear();
+          exhaustedOpenRetries.clear();
           opening.clear();
-          currentProjectionDisposer?.();
+          releaseProjection();
           for (const dispose of disposers.reverse()) dispose?.();
         };
       },

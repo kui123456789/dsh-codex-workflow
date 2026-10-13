@@ -1,12 +1,12 @@
 import type { SubmissionPort } from "../ports.js";
 import type { SubmissionNoticeCommand, SubmitVerdictCommand } from "../bridge-protocol.js";
-import type { ReviewInput, WorkflowRecord } from "../types.js";
+import type { SubmitInput, WorkflowRecord } from "../types.js";
 
 /** Application boundary for durable bridge submissions and delivery. */
 export class SubmissionFlow {
   constructor(private readonly port: SubmissionPort) {}
 
-  submit(workflowId: string, input: ReviewInput, exec: Parameters<SubmissionPort["submit"]>[2]): Promise<WorkflowRecord> {
+  submit(workflowId: string, input: SubmitInput, exec: Parameters<SubmissionPort["submit"]>[2]): Promise<WorkflowRecord> {
     return this.port.submit(workflowId, input, exec);
   }
 

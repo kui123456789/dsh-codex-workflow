@@ -40,6 +40,7 @@ export async function isGitRepository(cwd: string): Promise<boolean> {
 }
 
 async function collectGitEvidence(options: EvidenceOptions): Promise<ReviewEvidence> {
+  const baseRevision = await readGitBaseRevision(options.cwd);
   const { stdout } = await runGitCapture(options.cwd, [
     "-c", "core.quotepath=false",
     "status", "--porcelain=v1", "-z",
@@ -53,9 +54,8 @@ async function collectGitEvidence(options: EvidenceOptions): Promise<ReviewEvide
     })
     .join("\n");
   const changedFiles = entries.flatMap((entry) => (entry.target ? [entry.path, entry.target] : [entry.path]));
-  const hasHead = await repositoryHasHead(options.cwd);
-  const commands = hasHead
-    ? [["diff", "HEAD", "--no-ext-diff", "--no-color"]]
+  const commands = baseRevision !== "unborn"
+    ? [["diff", baseRevision, "--no-ext-diff", "--no-color"]]
     : [
         ["diff", "--cached", "--no-ext-diff", "--no-color"],
         ["diff", "--no-ext-diff", "--no-color"],
@@ -76,7 +76,11 @@ async function collectGitEvidence(options: EvidenceOptions): Promise<ReviewEvide
       // Entry vanished between status and hash; keep the fingerprint stable.
     }
   }
+  if (await readGitBaseRevision(options.cwd) !== baseRevision) {
+    throw new Error("Git HEAD changed while collecting review evidence");
+  }
   const fingerprintHash = createHash("sha256");
+  fingerprintHash.update(`HEAD:${baseRevision}\n`);
   fingerprintHash.update(status);
   fingerprintHash.update("\n");
   fingerprintHash.update(diff.digest);
@@ -84,6 +88,7 @@ async function collectGitEvidence(options: EvidenceOptions): Promise<ReviewEvide
   fingerprintHash.update(untrackedDigest.digest());
   return {
     kind: "git",
+    baseRevision,
     changedFiles,
     status,
     diff: decodeUtf8Safely(captured),
@@ -256,7 +261,7 @@ async function streamGitDiff(cwd: string, commands: string[][], maxBytes: number
   return { captured: Buffer.concat(captured), digest: hash.digest("hex"), totalBytes };
 }
 
-function runGitCapture(cwd: string, args: string[]): Promise<{ stdout: string }> {
+function runGitCapture(cwd: string, args: string[], missingRefExitCode?: 1 | 2): Promise<{ stdout: string; missing?: true }> {
   return new Promise((resolvePromise, reject) => {
     const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     // Accumulate raw bytes and decode once: a per-chunk toString() can split a
@@ -271,19 +276,23 @@ function runGitCapture(cwd: string, args: string[]): Promise<{ stdout: string }>
     });
     child.on("error", reject);
     child.on("close", (code) => {
+      const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
       if (code === 0) resolvePromise({ stdout: Buffer.concat(stdoutChunks).toString("utf8") });
-      else reject(new Error(`git ${args.join(" ")} failed (${code}): ${Buffer.concat(stderrChunks).toString("utf8").trim()}`));
+      else if (code === missingRefExitCode && (code === 2 || !stderr)) resolvePromise({ stdout: "", missing: true });
+      else reject(new Error(`git ${args.join(" ")} failed (${code}): ${stderr}`));
     });
   });
 }
 
-async function repositoryHasHead(cwd: string): Promise<boolean> {
-  try {
-    await runGitCapture(cwd, ["rev-parse", "--verify", "--quiet", "HEAD"]);
-    return true;
-  } catch {
-    return false;
-  }
+async function readGitBaseRevision(cwd: string): Promise<string> {
+  const head = await runGitCapture(cwd, ["rev-parse", "--verify", "--quiet", "HEAD"], 1);
+  if (!head.missing) return head.stdout.trim();
+  // A missing HEAD is unborn only when its symbolic branch is confirmed
+  // absent. Corrupt/unreadable refs still fail and use the existing file fallback.
+  const branch = (await runGitCapture(cwd, ["symbolic-ref", "--quiet", "HEAD"])).stdout.trim();
+  const ref = await runGitCapture(cwd, ["show-ref", "--exists", branch], 2);
+  if (!ref.missing) throw new Error("Git HEAD could not be resolved from its existing branch");
+  return "unborn";
 }
 
 function hashFile(path: string): Promise<string> {

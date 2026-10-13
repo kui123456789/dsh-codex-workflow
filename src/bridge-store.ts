@@ -195,12 +195,14 @@ export class BridgeStore {
    * with the next attempt time. */
   async retry(claim: ClaimedBridgeCommand, error: string, nextAttemptAt: string): Promise<boolean> {
     await this.init();
+    const next = Date.parse(nextAttemptAt);
+    if (!Number.isFinite(next)) throw new Error("invalid bridge retry deadline");
     return this.coordination!.retryClaim(
       claim.requestId,
       claim.claimEpoch,
       claim.claimOwner,
       error,
-      Date.parse(nextAttemptAt),
+      next,
     );
   }
 

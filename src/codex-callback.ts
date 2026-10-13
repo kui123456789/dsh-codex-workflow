@@ -2,12 +2,29 @@ import crossSpawn from "cross-spawn";
 import type { ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { parseReviewResult } from "./bridge-protocol.js";
-import type { ReasoningEffort, ReviewResult } from "./types.js";
+import type { ProcessInstanceIdentity, ReasoningEffort, ReviewResult } from "./types.js";
 import type { AppServerLiveEvent } from "./app-server.js";
+import type { SubmissionReviewConsumer } from "./application/submission-review-consumer.js";
+import type { CodexTurnReceiptPendingError } from "./pending-turn-receipt.js";
+import { isTerminalModelFailure } from "./transient-retry.js";
+
+/** Process-local ownership of an already submitted callback model operation. */
+export interface CodexCallbackPendingStartReceipt {
+  pendingStart: CodexTurnReceiptPendingError;
+  executionOwner: object;
+  originalProcessId?: number;
+  originalProcessIds?: readonly number[];
+  originalProcessIdentities?: readonly ProcessInstanceIdentity[];
+}
 
 export interface CodexCallbackRequest {
   workflowId: string;
   submissionId: string;
+  /** Optional admitted consumer of the original in-process operation. */
+  consumer?: SubmissionReviewConsumer;
+  /** This submission already created its original ephemeral Reviewer. A lost
+   * physical operation must be reported instead of starting another thread. */
+  originalReviewerRequired?: boolean;
   codexThreadId: string;
   cwd: string;
   prompt: string;
@@ -25,9 +42,19 @@ export interface CodexCallbackRequest {
   ephemeral?: boolean;
   model?: string;
   effort?: ReasoningEffort;
-  onThread?: (threadId: string) => Promise<void> | void;
+  onThread?: (threadId: string, expectedOwner?: object) => Promise<void> | void;
+  /** Usage observation after this invocation successfully claims its original
+   * Reviewer, once across retained continuations. This is separate from the
+   * authoritative onThread identity callback. */
+  onOriginalThread?: (threadId: string, expectedOwner?: object) => Promise<void> | void;
+  /** Usage observation awaited before the owner's final unsubscribe; never
+   * called for an unclaimed foreign Reviewer or a private conversion fork. */
+  onThreadReleased?: (threadId: string, expectedOwner?: object) => Promise<void> | void;
   onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
   onProgress?: (entry: AppServerLiveEvent) => void;
+  /** A new visible turn is continuing the existing Reviewer conversation. */
+  onContinuation?: (instruction: string) => Promise<void> | void;
+  onVisibleReview?: (text: string) => Promise<void> | void;
   /** Called when the EPHEMERAL conversion fork's turn starts, with the FORK
    * thread/turn. Never persisted: the fork id must not land in
    * plannerThreadId/reviewerThreadId. */
@@ -79,9 +106,11 @@ export class CodexNoVerdictError extends Error {
  * nor an invalid thread. Retrying it as "busy" would hide actionable CLI
  * configuration and environment errors from the operator. */
 export class CodexCallbackProcessError extends Error {
-  constructor(message: string) {
+  declare readonly recoverableModelFailure?: boolean;
+  constructor(message: string, recoverableModelFailure?: boolean) {
     super(message);
     this.name = "CodexCallbackProcessError";
+    Object.defineProperty(this, "recoverableModelFailure", { value: recoverableModelFailure });
   }
 }
 
@@ -296,7 +325,14 @@ export class CodexCallbackDispatcher {
             finish("error", new CodexInvalidThreadError(`codex thread ${request.codexThreadId} does not exist`));
             return;
           }
-          if (BUSY_PATTERNS.some((pattern) => pattern.test(diagnostic))) {
+          if (code === null && isTerminalModelFailure(diagnostic)) {
+            const detail = compactProcessDiagnostic(stderr || stdout);
+            finish("error", new CodexCallbackProcessError(
+              `codex callback exited with signal${detail ? `: ${detail}` : ""}`,
+            ));
+            return;
+          }
+          if (!isTerminalModelFailure(diagnostic) && BUSY_PATTERNS.some((pattern) => pattern.test(diagnostic))) {
             finish({ kind: "retryable_busy", reason: "rate limit / thread busy" });
             return;
           }

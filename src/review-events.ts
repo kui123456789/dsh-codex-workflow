@@ -31,6 +31,7 @@ export interface CodexPlanUpdatedEvent {
   workflowId: string;
   childSessionId?: string;
   status: "planning" | "waiting_input" | "ready" | "failed";
+  processState?: WorkflowProcessState;
   planMarkdown?: string;
   questions: PlannerQuestion[];
   assumptions: string[];
@@ -82,6 +83,7 @@ export interface CodexPlanView {
   workflowId: string;
   childSessionId?: string;
   status: CodexPlanUpdatedEvent["status"];
+  processState?: WorkflowProcessState;
   planMarkdown?: string;
   questions: PlannerQuestion[];
   assumptions: string[];
@@ -149,6 +151,7 @@ const reviewResultSchema = z.object({
 const planSchema = z.object({
   workflowId: z.string(),
   status: z.enum(["planning", "waiting_input", "ready", "failed"]),
+  processState: z.enum(["running", "waiting", "completed", "failed", "cancelled", "stale"]).optional(),
   planMarkdown: z.string().optional(),
   questions: z.array(z.any()),
   assumptions: z.array(z.string()),
@@ -228,6 +231,7 @@ export function applyCodexWorkflowProjection(
       case "dsh-codex-workflow/plan-updated": {
         const newWorkflow = state.currentWorkflowId !== event.data.workflowId;
         const plan: CodexPlanView = { workflowId: event.data.workflowId, status: event.data.status,
+          ...(event.data.processState === undefined ? {} : { processState: event.data.processState }),
           ...(event.data.childSessionId ?? (!newWorkflow ? state.plan?.childSessionId : undefined)
             ? { childSessionId: event.data.childSessionId ?? state.plan?.childSessionId } : {}),
           ...(event.data.planMarkdown === undefined ? {} : { planMarkdown: event.data.planMarkdown }),
@@ -293,5 +297,5 @@ export const codexWorkflowProjectionDefinition = {
   wire: { viewSchema: projectionSchema, view: (state: CodexWorkflowProjectionState): CodexWorkflowProjection => ({
     currentWorkflowId: state.currentWorkflowId, plan: state.plan, activeReview: state.activeReview, reviews: state.reviews,
   }) },
-  stateVersion: 1,
+  stateVersion: 2,
 } satisfies ProjectionDefinition<"codexWorkflow", CodexWorkflowProjectionState>;

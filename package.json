@@ -48,12 +48,14 @@
     "build": "tsc -p tsconfig.build.json && node scripts/copy-client.mjs",
     "typecheck": "tsc --noEmit",
     "pretest": "pnpm build",
-    "test": "tsx --test test/*.test.ts",
+    "test": "node scripts/run-tests.mjs",
     "verify": "pnpm typecheck && pnpm test",
     "doctor": "pnpm build && node scripts/doctor.mjs",
     "doctor:offline": "pnpm build && node scripts/doctor.mjs --offline",
     "host:check": "pnpm build && node scripts/host-compat-check.mjs",
-    "release:check": "node scripts/release-check.mjs"
+    "host:recovery:check": "pnpm build && node scripts/host-recovery-check.mjs",
+    "release:check": "node scripts/release-check.mjs",
+    "verify:isolated": "node scripts/verify-isolated.mjs"
   },
   "dsh": {
     "client": {
@@ -88,13 +90,16 @@
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.4",
     "@deepseek-ai/dsh-agent": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-api-session-controller": "0.1.7-rc.2",
     "@deepseek-ai/dsh-invariants": "0.1.7-rc.2",
     "@deepseek-ai/dsh-llm": "0.1.7-rc.2",
     "@deepseek-ai/dsh-scope": "0.1.7-rc.2",
     "@deepseek-ai/dsh-session": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-session-persistence-jsonl": "0.1.7-rc.2",
     "@deepseek-ai/dsh-session-projection": "0.1.7-rc.2",
     "@deepseek-ai/dsh-subagent": "0.1.7-rc.2",
     "@deepseek-ai/dsh-system-prompt": "0.1.7-rc.2",
+    "@deepseek-ai/dsh-tool-call-timeout-policy": "0.1.7-rc.2",
     "@deepseek-ai/dsh-tools": "0.1.7-rc.2",
     "@deepseek-ai/dsh-user-approval": "0.1.7-rc.2",
     "@deepseek-ai/dsh-util-values": "0.1.7-rc.2",

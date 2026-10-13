@@ -59,7 +59,7 @@ export const Config = z.object({
    * cancel/teardown. */
   reviewerReleaseTimeoutMs: z.number().default(10_000),
   leaseTtlMs: z.number().default(60_000),
-  turnTimeoutMs: z.number().default(10 * 60 * 1000),
+  turnTimeoutMs: z.number().default(10 * 60 * 1000).description("单次模型回合超时（毫秒）；完整工作流预算含多个回合、控制请求和重试，计算后须在 DSH 宿主期限范围内，超界配置会在工具注册前明确拒绝"),
   idleProcessMs: z.number().default(5_000),
   terminalRelayTimeoutMs: z.number().default(60_000),
   openCodexDesktopOnReview: z.boolean().default(true),

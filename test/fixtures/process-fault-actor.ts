@@ -184,8 +184,31 @@ async function main(): Promise<number> {
     const store = new WorkflowStore(dir);
     const callback = { send: async () => ({ kind: "retryable_busy" as const, reason: "test" }), cancel: () => undefined, cancelSubmission: () => undefined, stop: () => Promise.resolve() };
     const manager = new WorkflowManager(store, {} as never, baseConfig as never, callback, bridgeStore);
+    const staged = (await store.list()).find((record) => record.stagedVerdict);
+    if (!staged?.stagedVerdict || !staged.submissionId) throw new Error("recovery fixture has no durable staged verdict");
+    const requestId = staged.stagedVerdict.command.requestId;
     const count = await manager.recoverCallbacks();
     await outSink(out)({ kind: "recovered", count });
+    // recoverCallbacks schedules background work. Process exit must wait for
+    // both the exact queue row and its received CAS, not the scheduling count.
+    const deadline = Date.now() + 15_000;
+    for (;;) {
+      const current = await store.load(staged.id);
+      const row = bridgeStore.coordinationHandle.queueRow(requestId);
+      if (current?.submissionId !== staged.submissionId || current.stagedVerdict?.command.requestId !== requestId) {
+        throw new Error("the original staged recovery identity changed");
+      }
+      if (current.submissionState === "received" && row?.status === "inbox") {
+        await outSink(out)({ kind: "recovery-committed", workflowId: staged.id,
+          submissionId: staged.submissionId, requestId, submissionState: current.submissionState, queueStatus: row.status });
+        break;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`staged recovery did not commit: ${current.submissionState}/${row?.status ?? "missing"}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    await manager.stop();
     for (const row of bridgeStore.coordinationHandle.queueRowsByStatus("inbox")) {
       await outSink(out)({ kind: "queue-row", requestId: row.requestId, status: row.status });
     }

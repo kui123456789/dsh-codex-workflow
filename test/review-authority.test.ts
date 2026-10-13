@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ToolRunContext } from "@deepseek-ai/dsh-tools";
@@ -152,6 +152,14 @@ const ALIGN_CONFLICT = {
 
 const DEFAULT_ALIGN = { aligned: true, conflicts: [] };
 
+function assertDshReadableDestination(prompt: string): void {
+  const contract = prompt.split(/ORIGINAL TASK:|TASK:\n/)[0] ?? "";
+  assert.match(contract, /DSH child Session/, "the delivered model instructions identify the actual native child display");
+  assert.match(contract, /right sidebar/, "the readable result is routed to the DSH sidebar");
+  assert.doesNotMatch(contract, /Your visible reply[^\n]*stays in Codex Desktop/,
+    "the hidden ephemeral model must not be told its result remains in Desktop");
+}
+
 /** Minimal fake: enough of the Codex gateway for the DSH-led review pipeline
  * and the authority path (alignment fork + reconciliation turn), routed by
  * prompt content so the canned outputs are deterministic. */
@@ -187,7 +195,8 @@ class AuthorityGateway implements CodexGateway {
 
   async resumeThread(): Promise<void> {}
 
-  async startReviewerThread(): Promise<string> {
+  async startReviewerThread(options: { developerInstructions?: string }): Promise<string> {
+    assertDshReadableDestination(options.developerInstructions ?? "");
     return "reviewer-thread";
   }
 
@@ -241,6 +250,7 @@ class AuthorityGateway implements CodexGateway {
       return { kind: "completed", threadId, turnId: "reconcile-1", status: "completed", text: reply };
     }
     // Visible planner turn (only used to reach executing via start()).
+    if (options.planMode) assertDshReadableDestination(options.prompt ?? "");
     const reply = this.plannerReplies.shift() ?? DEFAULT_PLANNER_REPLY;
     options.onModel?.(options.model ?? "mode-model");
     if (options.onStarted) await options.onStarted({ threadId, turnId: "planner-turn-1" });
@@ -256,22 +266,24 @@ class AuthorityGateway implements CodexGateway {
     cwd: string;
     prompt: string;
     model?: string;
+    sourceEphemeral?: boolean;
     outputSchema?: Record<string, unknown>;
     onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
   }): Promise<TurnWaitResult> {
-    await options.onStarted?.({ threadId: "fork-thread", turnId: "fork-turn" });
+    const conversionThreadId = options.sourceEphemeral ? options.threadId : "fork-thread";
+    await options.onStarted?.({ threadId: conversionThreadId, turnId: "fork-turn" });
     const prompt = options.prompt ?? "";
     if (prompt.includes("REVIEW AUTHORITY checker")) {
       this.alignServed += 1;
       this.alignPrompts.push(prompt);
       const next = this.alignResults.shift() ?? DEFAULT_ALIGN;
-      return { kind: "completed", threadId: "fork-thread", turnId: "fork-turn", status: "completed", text: JSON.stringify(next) };
+      return { kind: "completed", threadId: conversionThreadId, turnId: "fork-turn", status: "completed", text: JSON.stringify(next) };
     }
     if (prompt.includes("Convert the readable code review")) {
       const review = this.reviewResults.shift() ?? { verdict: "pass", findings: [], testGaps: [], summary: "pass" };
-      return { kind: "completed", threadId: "fork-thread", turnId: "fork-turn", status: "completed", text: JSON.stringify(review) };
+      return { kind: "completed", threadId: conversionThreadId, turnId: "fork-turn", status: "completed", text: JSON.stringify(review) };
     }
-    return { kind: "completed", threadId: "fork-thread", turnId: "fork-turn", status: "completed", text: JSON.stringify(this.plannerResults.shift() ?? {
+    return { kind: "completed", threadId: conversionThreadId, turnId: "fork-turn", status: "completed", text: JSON.stringify(this.plannerResults.shift() ?? {
       status: "ready",
       planMarkdown: "<proposed_plan>\n实现安全读写模块\n</proposed_plan>",
       questions: [],
@@ -287,6 +299,7 @@ class AuthorityGateway implements CodexGateway {
     onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
   }): Promise<{ threadId: string; result: TurnWaitResult }> {
     this.reviewTargets.push(options.target.instructions ?? "");
+    assertDshReadableDestination(options.target.instructions ?? "");
     if (options.onStarted) await options.onStarted({ threadId: options.threadId, turnId: "review-turn-1" });
     const raw = this.rawReviewReplies.shift() ?? DEFAULT_RAW_REVIEW;
     this.append(options.threadId, raw);
@@ -294,10 +307,25 @@ class AuthorityGateway implements CodexGateway {
   }
 }
 
+class ScopeChangingAlignmentGateway extends AuthorityGateway {
+  constructor(private readonly scopeFile: string) {
+    super();
+  }
+
+  override async normalizeInFork(options: Parameters<AuthorityGateway["normalizeInFork"]>[0]): Promise<TurnWaitResult> {
+    const result = await super.normalizeInFork(options);
+    if (options.prompt.includes("REVIEW AUTHORITY checker") && this.alignServed === 2) {
+      await writeFile(this.scopeFile, "export function greet(name) { return String(name).trim(); }\n", "utf8");
+    }
+    return result;
+  }
+}
+
 /** Deterministic callback double for bridge submissions: hands a canned
  * verdict back and mirrors the real dispatcher's ownership callbacks. */
 class QueueCallback implements CodexCallback {
   results: CodexCallbackResult[] = [];
+  prompts: string[] = [];
   requests: Array<{ workflowId: string; submissionId: string; codexThreadId: string }> = [];
 
   async send(request: {
@@ -310,6 +338,7 @@ class QueueCallback implements CodexCallback {
     onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
     onEphemeralStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void;
   }): Promise<CodexCallbackResult> {
+    this.prompts.push(request.prompt);
     this.requests.push({ workflowId: request.workflowId, submissionId: request.submissionId, codexThreadId: request.codexThreadId });
     await request.onThread?.(request.codexThreadId);
     await request.onStarted?.({ threadId: request.codexThreadId, turnId: "review-turn-bg" });
@@ -455,12 +484,25 @@ test("the internal align schema carries aligned + conflicts and never changes th
 
 // ---------------------------------------------------------------- pipeline
 
-async function plannedWorkflow(instance: WorkflowManager, sessionId: string, directory: string, task: string): Promise<{ record: WorkflowRecord; deferred: unknown[] }> {
+async function plannedWorkflow(instance: WorkflowManager, sessionId: string, directory: string, task: string): Promise<{ record: WorkflowRecord; deferred: unknown[]; changedFiles: string[] }> {
   const deferred: unknown[] = [];
   const exec = fakeExec(sessionId, directory, deferred);
   const record = await instance.start({ task }, exec);
   assert.equal(record.phase, "executing");
-  return { record, deferred };
+  const scopeFile = "src/hello.mjs";
+  await mkdir(join(directory, "src"), { recursive: true });
+  await writeFile(join(directory, scopeFile), [
+    "export function greet(name) {",
+    "  const fallback = 'World';",
+    "  if (name === undefined) {",
+    "    return 'Hello, ' + fallback + '!';",
+    "  }",
+    "",
+    "  return 'Hello, ' + name.trim() + '!';",
+    "}",
+    "",
+  ].join("\n"), "utf8");
+  return { record, deferred, changedFiles: [scopeFile] };
 }
 
 test("aligned review applies normally: one cycle, contract-failure streak reset", async () => {
@@ -468,8 +510,8 @@ test("aligned review applies normally: one cycle, contract-failure streak reset"
   const gateway = new AuthorityGateway();
   const instance = manager(directory, gateway);
   try {
-    const { record, deferred } = await plannedWorkflow(instance, "session-aa", directory, "任务");
-    const after = await instance.review(record.id, { implementationSummary: "done" }, fakeExec("session-aa", directory, deferred));
+    const { record, deferred, changedFiles } = await plannedWorkflow(instance, "session-aa", directory, "任务");
+    const after = await instance.review(record.id, { implementationSummary: "done", changedFiles }, fakeExec("session-aa", directory, deferred));
     assert.equal(after.phase, "passed");
     assert.equal(after.reviewCycles, 1);
     assert.equal(after.reviewContractFailures, 0);
@@ -488,12 +530,12 @@ test("conflict + reconciled aligned applies the CORRECTED verdict in ONE busines
   const gateway = new AuthorityGateway();
   const instance = manager(directory, gateway);
   try {
-    const { record, deferred } = await plannedWorkflow(instance, "session-ar", directory, "任务");
+    const { record, deferred, changedFiles } = await plannedWorkflow(instance, "session-ar", directory, "任务");
     gateway.rawReviewReplies = [RAW_OVERREACH_REVIEW];
     gateway.reviewResults = [overreachingVerdict, passVerdict];
     gateway.alignResults = [ALIGN_CONFLICT, DEFAULT_ALIGN];
     gateway.reconcileReplies = [RAW_RECONCILED_REVIEW];
-    const after = await instance.review(record.id, { implementationSummary: "done" }, fakeExec("session-ar", directory, deferred));
+    const after = await instance.review(record.id, { implementationSummary: "done", changedFiles }, fakeExec("session-ar", directory, deferred));
     assert.equal(after.phase, "passed");
     assert.equal(after.reviewCycles, 1, "reconciliation + re-alignment still count ONE business cycle");
     assert.equal(after.reviewContractFailures, 0, "an aligned review resets the streak");
@@ -519,12 +561,12 @@ test("unresolved conflict restores the prior phase: no latestReview, no cycle, n
   const gateway = new AuthorityGateway();
   const instance = manager(directory, gateway);
   try {
-    const { record, deferred } = await plannedWorkflow(instance, "session-ac", directory, "任务");
+    const { record, deferred, changedFiles } = await plannedWorkflow(instance, "session-ac", directory, "任务");
     gateway.rawReviewReplies = [RAW_OVERREACH_REVIEW];
     gateway.reviewResults = [overreachingVerdict, overreachingVerdict];
     gateway.alignResults = [ALIGN_CONFLICT, ALIGN_CONFLICT];
     gateway.reconcileReplies = [RAW_RECONCILED_REVIEW];
-    const after = await instance.review(record.id, { implementationSummary: "done" }, fakeExec("session-ac", directory, deferred));
+    const after = await instance.review(record.id, { implementationSummary: "done", changedFiles }, fakeExec("session-ac", directory, deferred));
     assert.equal(after.phase, "executing", "pre-review phase restored — never fixing");
     assert.equal(after.reviewCycles, 0, "no consumed cycle");
     assert.equal(after.latestReview, undefined, "no latestReview for a refused review");
@@ -546,13 +588,14 @@ test("two consecutive unresolved conflicts BLOCK the workflow without consuming 
   const gateway = new AuthorityGateway();
   const instance = manager(directory, gateway);
   try {
-    const { record, deferred } = await plannedWorkflow(instance, "session-ab", directory, "任务");
+    const { record, deferred, changedFiles } = await plannedWorkflow(instance, "session-ab", directory, "任务");
     for (let round = 1; round <= 2; round += 1) {
       gateway.rawReviewReplies = [RAW_OVERREACH_REVIEW];
       gateway.reviewResults = [overreachingVerdict, overreachingVerdict];
       gateway.alignResults = [ALIGN_CONFLICT, ALIGN_CONFLICT];
       gateway.reconcileReplies = [RAW_RECONCILED_REVIEW];
-      const after = await instance.review(record.id, { implementationSummary: `fix round ${round}` }, fakeExec("session-ab", directory, deferred));
+      const after = await instance.review(record.id, { implementationSummary: `fix round ${round}`, changedFiles,
+        ...(round === 2 ? { newReviewRound: true } : {}) }, fakeExec("session-ab", directory, deferred));
       if (round === 1) {
         assert.equal(after.phase, "executing");
         assert.equal(after.reviewContractFailures, 1);
@@ -579,11 +622,24 @@ test("demo-smoke regression: overreaching automated-test demand is refused and r
   try {
     const deferred: unknown[] = [];
     const planned = await instance.start({ task: "新建 demo-smoke：三个文件、恰好两条 node:test 用例，CLI 以真实命令验证；不装依赖；不要过度设计" }, fakeExec("session-ad", directory, deferred));
+    await mkdir(join(directory, "demo-smoke/src"), { recursive: true });
+    await mkdir(join(directory, "demo-smoke/test"), { recursive: true });
+    const changedFiles = ["demo-smoke/src/hello.mjs", "demo-smoke/src/cli.mjs", "demo-smoke/test/hello.test.mjs"];
+    await writeFile(join(directory, changedFiles[0]!), "export function greet(name = 'World') { return 'Hello, ' + name.trim() + '!'; }\n", "utf8");
+    await writeFile(join(directory, changedFiles[1]!), "import { greet } from './hello.mjs';\nconsole.log(greet(process.argv[2]));\n", "utf8");
+    await writeFile(join(directory, changedFiles[2]!), [
+      "import test from 'node:test';",
+      "import assert from 'node:assert/strict';",
+      "import { greet } from '../src/hello.mjs';",
+      "test('default greeting', () => assert.equal(greet(), 'Hello, World!'));",
+      "test('named greeting', () => assert.equal(greet('Ada'), 'Hello, Ada!'));",
+      "",
+    ].join("\n"), "utf8");
     gateway.rawReviewReplies = [RAW_OVERREACH_REVIEW];
     gateway.reviewResults = [overreachingVerdict, passVerdict];
     gateway.alignResults = [ALIGN_CONFLICT, DEFAULT_ALIGN];
     gateway.reconcileReplies = [RAW_RECONCILED_REVIEW];
-    const after = await instance.review(planned!.id, { implementationSummary: "三个文件已创建，npm test 全绿，CLI 真实输出已验证" }, fakeExec("session-ad", directory, deferred));
+    const after = await instance.review(planned!.id, { implementationSummary: "三个文件已创建，npm test 全绿，CLI 真实输出已验证", changedFiles }, fakeExec("session-ad", directory, deferred));
     assert.equal(after.phase, "passed", "the plan-conformant implementation passes without adding tests");
     assert.equal(after.reviewCycles, 1);
     assert.equal(after.latestReview?.verdict, "pass");
@@ -591,6 +647,67 @@ test("demo-smoke regression: overreaching automated-test demand is refused and r
     assert.equal(gateway.reconcileCalls[0]!.threadId, "reviewer-thread", "reconciliation stayed on the private Reviewer thread");
     assert.notEqual(gateway.reconcileCalls[0]!.threadId, after.plannerThreadId, "the Planner task is never a review target");
     assert.ok(deferred.some((message) => /passed workflow/.test(deferredText(message))));
+  } finally {
+    await instance.stop();
+    await rmClosed(directory);
+  }
+});
+
+test("final freshness rejects a reconciled aligned verdict when the real scope changes before alignment returns", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-authority-stale-aligned-"));
+  const gateway = new ScopeChangingAlignmentGateway(join(directory, "src/hello.mjs"));
+  const instance = manager(directory, gateway);
+  try {
+    const { record, deferred, changedFiles } = await plannedWorkflow(instance, "session-stale-aligned", directory, "任务");
+    gateway.rawReviewReplies = [RAW_OVERREACH_REVIEW];
+    gateway.reviewResults = [overreachingVerdict, passVerdict];
+    gateway.alignResults = [ALIGN_CONFLICT, DEFAULT_ALIGN];
+    gateway.reconcileReplies = [RAW_RECONCILED_REVIEW];
+    await assert.rejects(
+      instance.review(record.id, { implementationSummary: "done", changedFiles }, fakeExec("session-stale-aligned", directory, deferred)),
+      /workspace changed during review; stale evidence result was not applied/,
+    );
+    const after = (await new WorkflowStore(directory).load(record.id))!;
+    assert.equal(gateway.alignServed, 2, "the corrected verdict reached its final aligned reply");
+    assert.equal(gateway.reconcileServed, 1);
+    assert.equal(gateway.reconcileCalls[0]!.threadId, "reviewer-thread");
+    assert.equal(after.phase, "executing");
+    assert.equal(after.reviewCycles, 0);
+    assert.equal(after.latestReview, undefined, "neither the old changes_requested nor corrected pass is accepted");
+    assert.equal(after.latestReviewConflict, undefined);
+    assert.equal(after.reviewContractFailures ?? 0, 0);
+    assert.ok(!deferred.some((message) => /passed workflow|Fix every finding/.test(deferredText(message))));
+  } finally {
+    await instance.stop();
+    await rmClosed(directory);
+  }
+});
+
+test("final freshness rejects an unresolved conflict without increasing the failure streak or blocking", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-authority-stale-conflict-"));
+  const gateway = new ScopeChangingAlignmentGateway(join(directory, "src/hello.mjs"));
+  const instance = manager(directory, gateway);
+  try {
+    const { record, deferred, changedFiles } = await plannedWorkflow(instance, "session-stale-conflict", directory, "任务");
+    const store = new WorkflowStore(directory);
+    await store.update(record.id, (current) => { current.reviewContractFailures = 1; });
+    gateway.rawReviewReplies = [RAW_OVERREACH_REVIEW];
+    gateway.reviewResults = [overreachingVerdict, overreachingVerdict];
+    gateway.alignResults = [ALIGN_CONFLICT, ALIGN_CONFLICT];
+    gateway.reconcileReplies = [RAW_RECONCILED_REVIEW];
+    await assert.rejects(
+      instance.review(record.id, { implementationSummary: "done", changedFiles }, fakeExec("session-stale-conflict", directory, deferred)),
+      /workspace changed during review; stale evidence result was not applied/,
+    );
+    const after = (await store.load(record.id))!;
+    assert.equal(gateway.alignServed, 2);
+    assert.equal(gateway.reconcileServed, 1);
+    assert.equal(after.phase, "executing", "the stale unresolved reply cannot block the workflow");
+    assert.equal(after.reviewContractFailures, 1, "the prior legitimate failure streak is unchanged");
+    assert.equal(after.reviewCycles, 0);
+    assert.equal(after.latestReview, undefined);
+    assert.equal(after.latestReviewConflict, undefined);
+    assert.ok(!deferred.some((message) => /REVIEWER CONTRACT FAILURE|Fix every finding/.test(deferredText(message))));
   } finally {
     await instance.stop();
     await rmClosed(directory);
@@ -667,6 +784,7 @@ test("bridge path: reconciled aligned verdict is staged with the CORRECTED resul
     const after = (await store.load(bridge.id))!;
     assert.equal(queue.commands.length, 1, "the corrected verdict is staged");
     assert.equal(queue.commands[0]!.verdict.verdict, "pass");
+    assertDshReadableDestination(callback.prompts[0] ?? "");
     assert.ok(after.latestReviewConflict && after.latestReviewConflict.resolved, "the corrected round records the auto-correction");
     assert.equal(after.reviewContractFailures, 0);
   } finally {
@@ -703,12 +821,12 @@ test("DSH-led: a legitimately CARRIED-FORWARD finding stays aligned across repai
   const gateway = new AuthorityGateway();
   const instance = manager(directory, gateway);
   try {
-    const { record, deferred } = await plannedWorkflow(instance, "session-cc", directory, "任务：修复 X 并保证两条测试");
+    const { record, deferred, changedFiles } = await plannedWorkflow(instance, "session-cc", directory, "任务：修复 X 并保证两条测试");
     // Round 1: the reviewer requires a fix; no conflict -> applied -> fixing.
     gateway.rawReviewReplies = [RAW_OVERREACH_REVIEW];
     gateway.reviewResults = [overreachingVerdict];
     gateway.alignResults = [DEFAULT_ALIGN];
-    const round1 = await instance.review(record.id, { implementationSummary: "第一轮实现" }, fakeExec("session-cc", directory, deferred));
+    const round1 = await instance.review(record.id, { implementationSummary: "第一轮实现", changedFiles }, fakeExec("session-cc", directory, deferred));
     assert.equal(round1.phase, "fixing");
     assert.equal(round1.reviewCycles, 1);
     assert.ok(round1.latestReview, "the carried finding is now the previously APPLIED review");
@@ -717,10 +835,11 @@ test("DSH-led: a legitimately CARRIED-FORWARD finding stays aligned across repai
     // DSH fixed it; the alignment prompt must carry level 4 (previous review +
     // this round's fix summary) so the model can judge it aligned — a generic
     // conflict misjudgment would block the legitimate repair loop.
+    await writeFile(join(directory, changedFiles[0]!), "export function greet(name) { return typeof name === 'string' ? name.trim() : ''; }\n", "utf8");
     gateway.rawReviewReplies = [RAW_OVERREACH_REVIEW];
     gateway.reviewResults = [overreachingVerdict];
     gateway.alignResults = [DEFAULT_ALIGN];
-    const round2 = await instance.review(record.id, { implementationSummary: "第二轮修复：已补上计划要求的实现并跑真实命令验证" }, fakeExec("session-cc", directory, deferred));
+    const round2 = await instance.review(record.id, { implementationSummary: "第二轮修复：已补上计划要求的实现并跑真实命令验证", changedFiles }, fakeExec("session-cc", directory, deferred));
     assert.equal(round2.phase, "fixing");
     assert.equal(round2.reviewCycles, 2);
     assert.equal(round2.reviewContractFailures, 0);
@@ -982,13 +1101,13 @@ test("DSH-led: a reconciliation that DROPS a real non-conflicting finding is a h
   const gateway = new AuthorityGateway();
   const instance = manager(directory, gateway);
   try {
-    const { record, deferred } = await plannedWorkflow(instance, "session-pv", directory, "任务");
+    const { record, deferred, changedFiles } = await plannedWorkflow(instance, "session-pv", directory, "任务");
     gateway.rawReviewReplies = [RAW_MIXED_REVIEW];
     gateway.reviewResults = [mixedVerdict, corruptVerdict];
     gateway.alignResults = [MIXED_ALIGN_CONFLICT, DEFAULT_ALIGN];
     gateway.reconcileReplies = [RAW_CORRUPT_RECONCILED_REVIEW];
     await assert.rejects(
-      instance.review(record.id, { implementationSummary: "已实现" }, fakeExec("session-pv", directory, deferred)),
+      instance.review(record.id, { implementationSummary: "已实现", changedFiles }, fakeExec("session-pv", directory, deferred)),
       /dropped a non-conflicting finding/,
     );
     const after = (await new WorkflowStore(directory).load(record.id))!;
@@ -1010,12 +1129,12 @@ test("DSH-led: a FAITHFUL reconciliation keeps the real finding and applies in O
   const gateway = new AuthorityGateway();
   const instance = manager(directory, gateway);
   try {
-    const { record, deferred } = await plannedWorkflow(instance, "session-pvo", directory, "任务");
+    const { record, deferred, changedFiles } = await plannedWorkflow(instance, "session-pvo", directory, "任务");
     gateway.rawReviewReplies = [RAW_MIXED_REVIEW];
     gateway.reviewResults = [mixedVerdict, mixedVerdict];
     gateway.alignResults = [MIXED_ALIGN_CONFLICT, DEFAULT_ALIGN];
     gateway.reconcileReplies = [RAW_FAITHFUL_RECONCILED_REVIEW];
-    const after = await instance.review(record.id, { implementationSummary: "已实现" }, fakeExec("session-pvo", directory, deferred));
+    const after = await instance.review(record.id, { implementationSummary: "已实现", changedFiles }, fakeExec("session-pvo", directory, deferred));
     assert.equal(after.phase, "fixing", "the preserved blocking finding keeps the repair loop");
     assert.equal(after.reviewCycles, 1);
     assert.equal(after.latestReview?.findings.length, 1);

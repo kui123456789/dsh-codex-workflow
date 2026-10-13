@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import type { ToolRunContext } from "@deepseek-ai/dsh-tools";
 import { closeCoordinationStoresForDirectory } from "../src/coordination.js";
+import { collectEvidence } from "../src/evidence.js";
 import { newRequestId, type BridgeCommand, type SubmissionNoticeCommand, type SubmitVerdictCommand } from "../src/bridge-protocol.js";
 import {
   CodexCallbackProcessError,
@@ -45,6 +46,7 @@ class FakeGateway implements CodexGateway {
    * uncommittedChanges target is never sent). */
   reviewTargets: Array<{ type: string; instructions?: string }> = [];
   threadCalls: Array<{ name: string; model?: string }> = [];
+  privateThreads: string[] = [];
   /** Durable Reviewer thread creations (startReviewerThread). */
   reviewerThreadCalls: Array<{ name: string; model?: string; developerInstructions?: string }> = [];
   /** Per-round developer-instruction refreshes on re-reviews. */
@@ -116,7 +118,12 @@ class FakeGateway implements CodexGateway {
 
   async startThread(options: { cwd: string; name: string; model?: string }): Promise<string> {
     this.threadCalls.push({ name: options.name, ...(options.model ? { model: options.model } : {}) });
-    return options.name.startsWith("DSH Review") ? "source-thread" : "planner-thread";
+    if (options.name.startsWith("DSH Review")) {
+      const threadId = `private-review-${this.privateThreads.length + 1}`;
+      this.privateThreads.push(threadId);
+      return threadId;
+    }
+    return "planner-thread";
   }
 
   async resumeThread(threadId: string): Promise<void> {
@@ -146,10 +153,12 @@ class FakeGateway implements CodexGateway {
 
   /** 1.1.4: N first `unsubscribeThread` calls fail (release is best-effort). */
   unsubscribeFailures = 0;
+  unsubscribeFailureThreadId?: string;
 
   async unsubscribeThread(threadId: string, signal?: AbortSignal): Promise<string> {
     this.unsubscribeSignals.push(signal);
-    if (this.unsubscribeFailures > 0) {
+    if (this.unsubscribeFailures > 0
+      && (this.unsubscribeFailureThreadId === undefined || this.unsubscribeFailureThreadId === threadId)) {
       this.unsubscribeFailures -= 1;
       throw new Error("thread/unsubscribe temporarily unavailable");
     }
@@ -272,9 +281,11 @@ class FakeGateway implements CodexGateway {
       ?? "<proposed_plan>\nImplement the feature\n</proposed_plan>");
   }
 
-  async normalizeInFork(options: { threadId: string; cwd?: string; prompt?: string; model?: string; effort?: string; outputSchema?: Record<string, unknown>; onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void }): Promise<TurnWaitResult> {
+  async normalizeInFork(options: { threadId: string; cwd?: string; prompt?: string; model?: string; effort?: string; sourceEphemeral?: boolean; outputSchema?: Record<string, unknown>; onStarted?: (started: { threadId: string; turnId: string }) => Promise<void> | void }): Promise<TurnWaitResult> {
     this.forkCount += 1;
-    const forkThreadId = `fork-thread-${this.forkCount}`;
+    // The real SDK converts ephemeral sources in place; only durable sources
+    // create a separate fork. Preserve this identity in protocol fixtures.
+    const forkThreadId = options.sourceEphemeral ? options.threadId : `fork-thread-${this.forkCount}`;
     const forkTurnId = `fork-turn-${this.forkCount}`;
     this.forkCalls.push({
       threadId: options.threadId,
@@ -466,6 +477,116 @@ function manager(
   return new WorkflowManager(new WorkflowStore(directory), gateway, { ...config, ...overrides, storageDir: directory }, callback, bridgeQueue, audit, retryHooks);
 }
 
+/** Exercise the actual visible-turn retry entries with the injected gateway;
+ * no parent-authored outcome or alternative retry loop is involved. */
+type RetryTurnEntries = {
+  startTurnWithTransientRetry(threadId: string, options: Parameters<CodexGateway["startTurn"]>[1], signal?: AbortSignal): Promise<TurnWaitResult>;
+  startReviewWithTransientRetry(options: Parameters<CodexGateway["startReview"]>[0], signal?: AbortSignal): Promise<{ threadId: string; result: TurnWaitResult }>;
+};
+
+for (const kind of ["planning", "reviewing"] as const) {
+  test(`${kind} positive jitter honors its delay ceiling and recovers on the original thread`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "dsh-retry-delay-ceiling-"));
+    let clock = 0;
+    const sleeps: number[] = [], threads: string[] = [], gateway = new FakeGateway();
+    const original = { kind: "completed", threadId: "original-capped-thread", turnId: "original-turn", text: "",
+      status: "failed", error: "503 Service Unavailable" } satisfies TurnWaitResult;
+    const next = { ...original, status: "completed" as const, text: "original result", error: undefined };
+    gateway.startTurn = async threadId => { threads.push(threadId); return threads.length === 1 ? original : next; };
+    gateway.startReview = async options => { threads.push(options.threadId);
+      return { threadId: options.threadId, result: threads.length === 1 ? original : next }; };
+    const instance = manager(directory, gateway, { transientRetryBaseMs: 60_000, transientRetryMaxMs: 60_000,
+      transientRetryBudgetMs: 65_000, transientRetryJitterRatio: 0.25 }, undefined, undefined, undefined,
+    { now: () => clock, random: () => 0.999999, sleep: async ms => { sleeps.push(ms); clock += ms; } });
+    const entries = instance as unknown as RetryTurnEntries;
+    try {
+      const result = kind === "planning"
+        ? await entries.startTurnWithTransientRetry(original.threadId, { prompt: "Original planning", planMode: true })
+        : (await entries.startReviewWithTransientRetry({ threadId: original.threadId, cwd: directory,
+          detached: true, target: { type: "custom", instructions: "Original review" } })).result;
+      assert.equal(result, next);
+      assert.deepEqual(threads, [original.threadId, original.threadId]);
+      assert.deepEqual(sleeps, [60_000]);
+      assert.equal(gateway.threadCalls.length, 0);
+    } finally { await instance.stop(); await rmClosed(directory); }
+  });
+}
+
+for (const kind of ["planning", "reviewing"] as const) {
+  for (const wakeAt of [50, 210]) {
+    test(`${kind} transient retry at ${wakeAt}ms returns its last original outcome without a post-budget turn`, async () => {
+      const directory = await mkdtemp(join(tmpdir(), "dsh-retry-wake-up-"));
+      let clock = 0, calls = 0;
+      const threads: string[] = [], gateway = new FakeGateway();
+      const original = { kind: "completed", threadId: "original-budget-thread", turnId: "original-turn", text: "",
+        status: "failed", error: "503 Service Unavailable" } satisfies TurnWaitResult;
+      const next = { ...original, status: "completed" as const, text: "unbudgeted completion", error: undefined };
+      gateway.startTurn = async threadId => { calls++; threads.push(threadId); return calls === 1 ? original : next; };
+      gateway.startReview = async options => { calls++; threads.push(options.threadId);
+        return { threadId: options.threadId, result: calls === 1 ? original : next }; };
+      const instance = manager(directory, gateway, { transientRetryBaseMs: 10, transientRetryMaxMs: 10,
+        transientRetryBudgetMs: 50, transientRetryJitterRatio: 0 }, undefined, undefined, undefined,
+      { now: () => clock, sleep: async () => { clock = wakeAt; } });
+      const entries = instance as unknown as RetryTurnEntries;
+      try {
+        const result = kind === "planning"
+          ? await entries.startTurnWithTransientRetry(original.threadId, { prompt: "Original planning", planMode: true })
+          : (await entries.startReviewWithTransientRetry({ threadId: original.threadId, cwd: directory,
+            detached: true, target: { type: "custom", instructions: "Original review" } })).result;
+        assert.equal(result, original, "Preserve the last actual failure instead of accepting an extra model result");
+        assert.equal(calls, 1);
+        assert.deepEqual(threads, [original.threadId]);
+        assert.equal(gateway.threadCalls.length, 0, "The retry entry cannot replace the original task");
+      } finally { await instance.stop(); await rmClosed(directory); }
+    });
+  }
+}
+
+test("visible retry waking inside budget still admits the same original thread", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-retry-inside-budget-"));
+  const gateway = new FakeGateway(), threads: string[] = [];
+  let clock = 0;
+  gateway.startTurn = async threadId => { threads.push(threadId); return { kind: "completed", threadId, turnId: "original-turn",
+    text: threads.length === 1 ? "" : "original result", status: threads.length === 1 ? "failed" : "completed",
+    error: threads.length === 1 ? "server_overloaded" : undefined }; };
+  const instance = manager(directory, gateway, { transientRetryBaseMs: 10, transientRetryMaxMs: 10,
+    transientRetryBudgetMs: 50, transientRetryJitterRatio: 0 }, undefined, undefined, undefined,
+  { now: () => clock, sleep: async () => { clock = 49; } });
+  try {
+    const result = await (instance as unknown as RetryTurnEntries).startTurnWithTransientRetry("original-thread", { prompt: "Continue" });
+    assert.equal(result.kind, "completed");
+    assert.equal(result.kind === "completed" && result.text, "original result");
+    assert.deepEqual(threads, ["original-thread", "original-thread"]);
+  } finally { await instance.stop(); await rmClosed(directory); }
+});
+
+test("visible retry keeps caller cancellation ahead of an exhausted wake-up", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-retry-abort-wake-up-"));
+  const gateway = new FakeGateway(), controller = new AbortController(), cause = new Error("original caller cancelled");
+  let clock = 0, calls = 0;
+  gateway.startTurn = async threadId => { calls++; return { kind: "completed", threadId, turnId: "original-turn", text: "",
+    status: "failed", error: "server_overloaded" }; };
+  const instance = manager(directory, gateway, { transientRetryBaseMs: 10, transientRetryMaxMs: 10,
+    transientRetryBudgetMs: 50, transientRetryJitterRatio: 0 }, undefined, undefined, undefined,
+  { now: () => clock, sleep: async () => { clock = 210; controller.abort(cause); } });
+  try {
+    await assert.rejects((instance as unknown as RetryTurnEntries).startTurnWithTransientRetry("original-thread", { prompt: "Continue" }, controller.signal),
+      error => error === cause);
+    assert.equal(calls, 1);
+  } finally { await instance.stop(); await rmClosed(directory); }
+});
+
+/** Foreground review scenarios need real, stable evidence in their explicit
+ * scope. Preserve files that a scenario already wrote for change detection. */
+async function reviewFiles(directory: string, ...paths: string[]): Promise<void> {
+  for (const path of paths) {
+    const target = join(directory, path);
+    await mkdir(dirname(target), { recursive: true });
+    try { await writeFile(target, "review fixture implementation v1\n", { encoding: "utf8", flag: "wx" }); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  }
+}
+
 /** Gateway whose N first turns fail with a scripted error (1.1.1 retry tests). */
 class FlakyTurnGateway extends FakeGateway {
   attempts = 0;
@@ -566,6 +687,7 @@ test("1.1.1: a TERMINAL planner failure is never retried", async () => {
 test("review observability heartbeats independently during a long Reviewer turn", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-review-heartbeat-"));
   try {
+    await reviewFiles(directory, "src/a.ts");
     const gateway = new FakeGateway();
     gateway.reviewGate = deferredGate();
     const instance = manager(directory, gateway, { reviewHeartbeatMs: 10, reviewStaleMs: 500 });
@@ -607,6 +729,7 @@ test("review observability heartbeats independently during a long Reviewer turn"
 test("1.1.2: a transient failure on the VISIBLE review turn is retried inside the tool", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-transient-review-"));
   try {
+    await reviewFiles(directory, "a.ts");
     const gateway = new FlakyReviewGateway({
       message: "Selected model is at capacity. Please try a different model.",
       times: 1,
@@ -669,6 +792,7 @@ test("status classifies a review with no recent heartbeat as stale", async () =>
 test("cancelling a review stops its heartbeat and records cancelled", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-review-cancel-"));
   try {
+    await reviewFiles(directory, "src/a.ts");
     const gateway = new FakeGateway();
     gateway.reviewGate = deferredGate();
     const instance = manager(directory, gateway, { reviewHeartbeatMs: 10, reviewStaleMs: 500 });
@@ -691,6 +815,7 @@ test("cancelling a review stops its heartbeat and records cancelled", async () =
 test("1.1.2: a TERMINAL visible-review failure is never retried", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-terminal-review-"));
   try {
+    await reviewFiles(directory, "a.ts");
     const gateway = new FlakyReviewGateway({ message: "codex thread 01a0 does not exist", times: 1 });
     const instance = manager(directory, gateway, {}, undefined, undefined, undefined, {
       sleep: async () => undefined,
@@ -808,6 +933,7 @@ class FakeCliAudit implements CodexCliAuditGateway {
 test("runs plan, repair, and review in the original DSH session", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-manager-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [
       { verdict: "changes_requested", findings: [blockingFinding], testGaps: [], summary: "Needs repair" },
@@ -820,12 +946,13 @@ test("runs plan, repair, and review in the original DSH session", async () => {
     assert.equal(planned.phase, "executing");
     assert.equal(planned.dshSessionId, "session-original");
     assert.equal(planned.mode, "planned");
-    const first = await managerInstance.review(planned.id, { implementationSummary: "Implemented", testResults: "pass" }, exec);
+    const releaseBaseline = gateway.unsubscribedThreads.length;
+    const first = await managerInstance.review(planned.id, { changedFiles: ["changed.txt"], implementationSummary: "Implemented", testResults: "pass" }, exec);
     assert.equal(first.phase, "fixing");
     // New review tasks are App Server ephemeral and never become durable
     // Planner/Reviewer bindings in the workflow record.
     assert.equal(first.reviewerThreadId, undefined);
-    const second = await managerInstance.review(planned.id, { implementationSummary: "Fixed", testResults: "pass" }, exec);
+    const second = await managerInstance.review(planned.id, { changedFiles: ["changed.txt"], implementationSummary: "Fixed", testResults: "pass" }, exec);
     assert.equal(second.phase, "passed");
     // Each round creates a fresh private Reviewer; the Planner task is never a
     // review target and no Desktop writer is resumed.
@@ -834,8 +961,10 @@ test("runs plan, repair, and review in the original DSH session", async () => {
     assert.deepEqual(gateway.reviewThreads, ["reviewer-thread", "reviewer-thread"]);
     assert.deepEqual(gateway.reviewStarts[0], { threadId: "reviewer-thread", detached: false });
     assert.deepEqual(gateway.reviewStarts[1], { threadId: "reviewer-thread", detached: false });
-    assert.deepEqual(gateway.unsubscribedThreads, ["reviewer-thread", "reviewer-thread"],
-      "each completed DSH-led review must release its Reviewer subscription before the next round");
+    assert.deepEqual(gateway.privateThreads, ["private-review-1", "private-review-2"]);
+    assert.deepEqual(gateway.unsubscribedThreads.slice(releaseBaseline), [
+      gateway.privateThreads[0]!, "reviewer-thread", gateway.privateThreads[1]!, "reviewer-thread",
+    ], "each completed DSH-led review releases its private checker and Reviewer before the next round");
     assert.deepEqual(gateway.releasedThreads, [],
       "a per-round release must NEVER take the external handoff (it idle-shuts the shared App Server)");
     assert.ok(!gateway.resumeCalls.includes("planner-thread"), "a review never resumes the Planner task");
@@ -1234,9 +1363,10 @@ test("1.0.7: planner normalization failure FAILS the workflow and never accepts 
   }
 });
 
-test("1.0.7: reviewer normalization (fork) failure falls back to a retryable phase and consumes NO review cycle", async () => {
+test("terminal reviewer normalization preserves cycle budget and requires an explicit independent review", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-107-reviewer-normfail-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [{ verdict: "pass", findings: [], testGaps: [], summary: "ok" }];
     let failFork = true;
@@ -1267,9 +1397,13 @@ test("1.0.7: reviewer normalization (fork) failure falls back to a retryable pha
     assert.equal(record.reviewCycles, 0, "conversion failure consumes no review cycle");
     assert.match(record.error ?? "", /fork unavailable/);
 
-    // The next review once the fork works again applies normally as cycle 1.
+    // A terminal failure cannot silently replace the same-material Reviewer.
     failFork = false;
-    const reviewed = await instance.review(planned.id, { implementationSummary: "two", changedFiles: ["changed.txt"] }, exec);
+    await assert.rejects(instance.review(planned.id, { implementationSummary: "two", changedFiles: ["changed.txt"] }, exec),
+      /original Reviewer is unavailable/);
+    assert.equal(gateway.reviewerThreadCalls.length, 1);
+    // A separately requested business round applies normally as cycle 1.
+    const reviewed = await instance.review(planned.id, { implementationSummary: "two", changedFiles: ["changed.txt"], newReviewRound: true }, exec);
     assert.equal(reviewed.phase, "passed");
     assert.equal(reviewed.reviewCycles, 1);
     record = (await new WorkflowStore(directory).load(planned.id))!;
@@ -1279,12 +1413,13 @@ test("1.0.7: reviewer normalization (fork) failure falls back to a retryable pha
   }
 });
 
-/** Defect 1: a FAILED/INTERRUPTED visible review turn must never reach the
- * conversion, never parse residual text and never consume a cycle — the
- * workflow falls back to its original executing/fixing phase. */
-test("a failed visible review turn is retryable: no conversion, no cycle, back to the original phase", async () => {
+/** A generic model failure gets one same-thread continuation. If that
+ * continuation also fails, the workflow waits on the original Reviewer rather
+ * than creating a replacement child/thread. */
+test("a failed visible review turn waits for same-thread continuation without conversion", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-review-turn-failed-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     const flaky = new Proxy(gateway, {
       get(target, property, receiver) {
@@ -1297,6 +1432,11 @@ test("a failed visible review turn is retryable: no conversion, no cycle, back t
             };
           };
         }
+        if (property === "startTurn") {
+          return async (threadId: string, options: Parameters<FakeGateway["startTurn"]>[1]) => options?.silentReview
+            ? { kind: "completed", threadId, turnId: "continue-failed", status: "failed", text: "", reason: "turn failed" }
+            : target.startTurn(threadId, options);
+        }
         const value = Reflect.get(target, property, receiver);
         return typeof value === "function" ? value.bind(target) : value;
       },
@@ -1306,13 +1446,12 @@ test("a failed visible review turn is retryable: no conversion, no cycle, back t
     const planned = await instance.start({ task: "Build it" }, exec);
     // Fork #1 was the planner conversion; after a failed review turn, NO
     // review conversion fork may ever run.
-    await assert.rejects(
-      instance.review(planned.id, { implementationSummary: "one", changedFiles: ["changed.txt"] }, exec),
-      /turn failed/,
-    );
-    assert.equal(gateway.forkCalls.length, 1, "the conversion fork must never run for a failed review turn");
+    const result = await instance.review(planned.id, { implementationSummary: "one", changedFiles: ["changed.txt"] }, exec);
+    assert.equal(gateway.forkCalls.length, 1, "the failed Reviewer continuation never reaches conversion");
     const record = (await new WorkflowStore(directory).load(planned.id))!;
     assert.equal(record.phase, "executing", "recovers to the original retryable phase");
+    assert.equal(result.processState, "waiting");
+    assert.equal(record.retryState?.stage, "reviewing");
     assert.equal(record.reviewCycles, 0, "no review cycle consumed");
     assert.equal(record.latestReview, undefined, "residual text was never parsed or applied");
   } finally {
@@ -1325,6 +1464,7 @@ test("a failed visible review turn is retryable: no conversion, no cycle, back t
 test("an interrupted normalization fork falls back retryable and consumes no cycle", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-fork-interrupted-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [{ verdict: "pass", findings: [], testGaps: [], summary: "ok" }];
     let interruptFork = false;
@@ -1469,6 +1609,7 @@ test("review_only on a Git repo sends a custom target with the full context and 
 test("non-Git reviews send a custom target with the full readable context and gate", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-nongit-ctx-"));
   try {
+    await reviewFiles(directory, "src/search.ts");
     const gateway = new FakeGateway();
     gateway.reviewResults = [
       { verdict: "changes_requested", findings: [blockingFinding], testGaps: [], summary: "No" },
@@ -1508,6 +1649,7 @@ test("non-Git reviews send a custom target with the full readable context and ga
 test("a Chinese task with an English one-line review triggers one rewrite on the same ephemeral Reviewer; the corrected text drives the conversion", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-display-enone-"));
   try {
+    await reviewFiles(directory, "src/login.ts");
     const gateway = new FakeGateway();
     gateway.rawReviewReplies = ["The uncommitted implementation strips sync and all 11 tests pass."];
     gateway.rewriteReplies = ["VERDICT: pass\nFINDINGS: none\nTEST GAPS: none\nSUMMARY: 实现符合计划，测试全部通过"];
@@ -1543,7 +1685,8 @@ test("a Chinese task with an English one-line review triggers one rewrite on the
     assert.ok(!conversionPrompt.includes("strips sync"), "the English one-liner never reaches the conversion");
     // The final authority-alignment conversion runs on its own ephemeral
     // private thread; the visible rewrite remains on the Reviewer thread.
-    assert.equal(gateway.forkCalls.at(-1)?.threadId, "source-thread");
+    assert.equal(gateway.privateThreads.length, 1);
+    assert.equal(gateway.forkCalls.at(-1)?.threadId, gateway.privateThreads[0]!);
     // The SAME dedicated Reviewer id was used for the rewrite: one thread total.
     assert.equal(gateway.reviewerThreadCalls.length, 1, "the dedicated Reviewer is reused across the rewrite");
   } finally {
@@ -1558,6 +1701,7 @@ test("a Chinese task with an English one-line review triggers one rewrite on the
 test("a paragraph containing all section keywords but no section lines triggers the display rewrite", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-display-paragraph-"));
   try {
+    await reviewFiles(directory, "a.ts");
     const gateway = new FakeGateway();
     gateway.rawReviewReplies = ["结论是通过，没有问题，测试已经完成，总结如下：一切正常。"];
     gateway.rewriteReplies = ["VERDICT: pass\nFINDINGS: none\nTEST GAPS: none\nSUMMARY: 实现符合计划"];
@@ -1591,6 +1735,7 @@ test("a paragraph containing all section keywords but no section lines triggers 
 test("reviews missing sections or leaking a JSON envelope trigger the display rewrite", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-display-sections-"));
   try {
+    await reviewFiles(directory, "a.ts");
     const gateway = new FakeGateway();
     gateway.rawReviewReplies = ["The implementation is fine."];
     gateway.rewriteReplies = ["VERDICT: pass\nFINDINGS: none\nTEST GAPS: none\nSUMMARY: 实现符合计划"];
@@ -1624,6 +1769,7 @@ test("reviews missing sections or leaking a JSON envelope trigger the display re
 test("a compliant Chinese review never triggers the display rewrite", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-display-ok-"));
   try {
+    await reviewFiles(directory, "src/login.ts");
     const gateway = new FakeGateway();
     gateway.rawReviewReplies = [
       "结论：通过\n发现：无\n测试缺口：无\n总结：实现符合计划，测试全部通过",
@@ -1647,10 +1793,11 @@ test("a compliant Chinese review never triggers the display rewrite", async () =
 
 /** Display contract: when the rewrite STILL violates the contract, the
  * workflow returns to its retryable phase — no latestReview, no cycle — and
- * a later conforming round applies normally. */
-test("a rewrite that still violates the display contract is retryable and consumes no cycle", async () => {
+ * an explicitly requested conforming round applies normally. */
+test("a terminal display contract failure requires an independent round and consumes no cycle", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-display-stillbad-"));
   try {
+    await reviewFiles(directory, "a.ts");
     const gateway = new FakeGateway();
     gateway.rawReviewReplies = ["The uncommitted implementation works."];
     gateway.rewriteReplies = ["still just an English sentence without any sections"];
@@ -1668,10 +1815,13 @@ test("a rewrite that still violates the display contract is retryable and consum
     assert.equal(record.latestReview, undefined, "no verdict was written");
     assert.match(record.error ?? "", /display contract/);
 
-    // The next round with a conforming rewrite applies normally as cycle 1.
+    await assert.rejects(instance.review(planned.id, { implementationSummary: "two", changedFiles: ["a.ts"] }, exec),
+      /original Reviewer is unavailable/);
+    assert.equal(gateway.reviewerThreadCalls.length, 1);
+    // An explicitly requested conforming round applies normally as cycle 1.
     gateway.rawReviewReplies.push("The uncommitted implementation works.");
     gateway.rewriteReplies.push("VERDICT: pass\nFINDINGS: none\nTEST GAPS: none\nSUMMARY: 实现符合计划，测试通过");
-    const reviewed = await instance.review(planned.id, { implementationSummary: "two", changedFiles: ["a.ts"] }, exec);
+    const reviewed = await instance.review(planned.id, { implementationSummary: "two", changedFiles: ["a.ts"], newReviewRound: true }, exec);
     assert.equal(reviewed.phase, "passed");
     record = (await new WorkflowStore(directory).load(planned.id))!;
     assert.equal(record.reviewCycles, 1);
@@ -1687,6 +1837,7 @@ test("a rewrite that still violates the display contract is retryable and consum
 test("cancel during the display rewrite interrupts exactly the rewrite turn and never resurrects", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-display-cancel-"));
   try {
+    await reviewFiles(directory, "a.ts");
     const gateway = new FakeGateway();
     gateway.rawReviewReplies = ["The uncommitted implementation passes."];
     gateway.rewriteGate = deferredGate();
@@ -1720,6 +1871,7 @@ test("cancel during the display rewrite interrupts exactly the rewrite turn and 
 test("an interrupted display rewrite turn is retryable with zero cycles", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-display-int-"));
   try {
+    await reviewFiles(directory, "a.ts");
     const gateway = new FakeGateway();
     gateway.rawReviewReplies = ["The uncommitted implementation passes."];
     const flaky = new Proxy(gateway, {
@@ -1758,6 +1910,7 @@ test("an interrupted display rewrite turn is retryable with zero cycles", async 
 test("teardown interrupts an in-flight display rewrite turn", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-display-stop-"));
   try {
+    await reviewFiles(directory, "a.ts");
     const gateway = new FakeGateway();
     gateway.rawReviewReplies = ["The uncommitted implementation passes."];
     gateway.rewriteGate = deferredGate();
@@ -1767,14 +1920,20 @@ test("teardown interrupts an in-flight display rewrite turn", async () => {
     const exec = fakeExec("session-display-stop", directory, []);
     const planned = await instance.start({ task: "实现搜索功能" }, exec);
     const pendingReview = instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.ts"] }, exec);
+    const settled = Promise.allSettled([pendingReview]);
     await waitFor(() => gateway.rewriteCalls.length === 1);
     const stopping = instance.stop();
     // Teardown interrupts the ACTIVE visible turn — the rewrite on the
     // dedicated Reviewer thread — while it is still held by the gate.
     await waitFor(() => gateway.interrupts.some((entry) => entry.threadId === "reviewer-thread" && entry.turnId === "rewrite-turn-1"));
     gateway.rewriteGate.release();
-    await pendingReview;
+    const outcome = (await settled)[0]!;
+    assert.equal(outcome.status, "rejected", "teardown cannot apply the late rewrite result");
+    if (outcome.status === "rejected") assert.match(String(outcome.reason), /aborted|teardown|stopped/i);
     await stopping;
+    const stopped = await new WorkflowStore(directory).load(planned.id);
+    assert.equal(stopped?.reviewCycles, 0);
+    assert.equal(stopped?.latestReview, undefined);
   } finally {
     await rmClosed(directory);
   }
@@ -1847,7 +2006,7 @@ test("clarification continues reuse the persisted effective planner model and re
   }
 });
 
-test("restart (new manager) continues with the persisted effective planner model", async () => {
+test("persisted Planner settings do not recreate an ephemeral clarification after manager restart", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-planner-model-restart-"));
   try {
     const gateway = new FakeGateway();
@@ -1864,17 +2023,18 @@ test("restart (new manager) continues with the persisted effective planner model
     assert.equal(planned.phase, "waiting_input");
     await first.stop();
 
-    // A FRESH manager (simulated restart) continues WITHOUT config help: the
-    // persisted effective model must still drive the visible turn and the fork.
+    // Settings remain readable after restart, but they are not a live thread
+    // handle. Answering must never silently create a replacement Planner.
     const freshGateway = new FakeGateway();
     freshGateway.plannerReplies.push("<proposed_plan>\nDone\n</proposed_plan>");
     freshGateway.plannerResults.push({ status: "ready", planMarkdown: "<proposed_plan>\nDone\n</proposed_plan>", questions: [], assumptions: [] });
     const second = manager(directory, freshGateway, { plannerModel: "" });
-    const continued = await second.continue(planned.id, { scope: ["Focused"] }, fakeExec("session-restart-model", directory, []));
-    assert.equal(continued.phase, "executing");
-    assert.equal(continued.plannerModel, "restart-model", "the persisted model survives the restart");
-    assert.equal(freshGateway.turnCalls[0]?.model, "restart-model", "the resumed visible turn uses the persisted model");
-    assert.equal(freshGateway.forkCalls[0]?.model, "restart-model", "the resumed conversion fork uses the persisted model");
+    const freshExec = fakeExec("session-restart-model", directory, []);
+    assert.equal((await second.status(planned.id, freshExec)).plannerModel, "restart-model", "settings survive without pretending the original process survived");
+    await assert.rejects(second.continue(planned.id, { scope: ["Focused"] }, freshExec), /no in-process original Planner clarification/);
+    assert.equal(freshGateway.threadCalls.length, 0);
+    assert.equal(freshGateway.turnCalls.length, 0);
+    assert.equal(freshGateway.forkCalls.length, 0);
     await second.stop();
   } finally {
     await rmClosed(directory);
@@ -1887,6 +2047,7 @@ test("restart (new manager) continues with the persisted effective planner model
 test("the reviewer model is explicit even when nothing is configured", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-reviewer-model-auto-"));
   try {
+    await reviewFiles(directory, "a.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [
       { verdict: "changes_requested", findings: [blockingFinding], testGaps: [], summary: "No" },
@@ -1898,7 +2059,7 @@ test("the reviewer model is explicit even when nothing is configured", async () 
     assert.equal(started.reviewerModel, "fake-default-model", "the resolved server default is persisted explicitly");
     assert.equal(gateway.reviewerThreadCalls[0]?.model, "fake-default-model", "the durable Reviewer thread uses it");
     assert.equal(gateway.forkCalls[0]?.model, "fake-default-model", "the conversion fork reuses the SAME model");
-    await instance.review(started.id, { implementationSummary: "Fixed" }, exec);
+    await instance.review(started.id, { changedFiles: ["a.txt"], implementationSummary: "Fixed" }, exec);
     // Each review round adds an invisible 1.0.10 review-authority alignment
     // fork that reuses the SAME model: 2 forks (conversion + alignment) per
     // round across the first review and the re-review.
@@ -1911,9 +2072,86 @@ test("the reviewer model is explicit even when nothing is configured", async () 
   }
 });
 
+test("a recoverable Planner failure resumes on the original thread", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-planner-resume-"));
+  try {
+    const gateway = new FakeGateway();
+    let attempts = 0;
+    const threadIds: string[] = [];
+    const flaky = new Proxy(gateway, {
+      get(target, property, receiver) {
+        if (property === "startTurn") {
+          return async (threadId: string, options: Parameters<FakeGateway["startTurn"]>[1]) => {
+            if (options?.planMode) {
+              attempts += 1;
+              threadIds.push(threadId);
+              if (attempts <= 2) return { kind: "completed", threadId, turnId: `failed-${attempts}`, status: "failed", reason: "turn failed", error: "Codex run failed" } as TurnWaitResult;
+            }
+            return target.startTurn(threadId, options);
+          };
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as FakeGateway;
+    const instance = manager(directory, flaky);
+    const exec = fakeExec("session-planner-resume", directory, []);
+    const waiting = await instance.start({ task: "Build it" }, exec);
+    assert.equal(waiting.processState, "waiting");
+    assert.equal(waiting.retryState?.stage, "planning");
+    const resumed = await instance.resume(waiting.id, "继续完成原规划", exec);
+    assert.equal(resumed.phase, "executing");
+    assert.equal(resumed.retryState, undefined);
+    assert.equal(new Set(threadIds).size, 1, "all Planner turns reuse the same App Server thread");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("a recoverable Reviewer failure continues on the same Reviewer thread", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-review-resume-"));
+  try {
+    await reviewFiles(directory, "changed.txt");
+    const gateway = new FakeGateway();
+    let attempts = 0;
+    const seenThreads: string[] = [];
+    const flaky = new Proxy(gateway, {
+      get(target, property, receiver) {
+        if (property === "startReview") {
+          return async (options: Parameters<FakeGateway["startReview"]>[0]) => {
+            attempts += 1;
+            seenThreads.push(options.threadId);
+            await target.startReview(options);
+            return { threadId: options.threadId, result: { kind: "completed", threadId: options.threadId, turnId: "failed-review", status: "failed", reason: "turn failed", error: "Codex run failed" } };
+          };
+        }
+        if (property === "startTurn") {
+          return async (threadId: string, options: Parameters<FakeGateway["startTurn"]>[1]) => {
+            if (options?.silentReview) { attempts += 1; seenThreads.push(threadId); }
+            return target.startTurn(threadId, options);
+          };
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as FakeGateway;
+    const instance = manager(directory, flaky);
+    const exec = fakeExec("session-review-resume", directory, []);
+    const planned = await instance.start({ task: "Build it" }, exec);
+    const reviewed = await instance.review(planned.id, { implementationSummary: "one", changedFiles: ["changed.txt"] }, exec);
+    assert.equal(reviewed.phase, "passed");
+    assert.equal(attempts, 2);
+    assert.equal(gateway.reviewStarts.length, 1, "the successful continuation reaches the same review/start seam without creating a new thread");
+    assert.equal(new Set(seenThreads).size, 1, "both Reviewer turns use the same thread");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
 test("review conversion defaults to the warm App Server path even when CLI audit is available", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-appserver-conversion-"));
   try {
+    await reviewFiles(directory, "src/a.ts");
     const gateway = new FakeGateway();
     gateway.reviewResults = [{ verdict: "pass", findings: [], testGaps: [], summary: "OK" }];
     const audit = new FakeCliAudit();
@@ -1930,6 +2168,7 @@ test("review conversion defaults to the warm App Server path even when CLI audit
 test("conversionTransport=cli explicitly selects the CLI structured conversion", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-cli-conversion-"));
   try {
+    await reviewFiles(directory, "src/a.ts");
     const gateway = new FakeGateway();
     gateway.reviewResults = [{ verdict: "pass", findings: [], testGaps: [], summary: "OK" }];
     const audit = new FakeCliAudit();
@@ -1949,6 +2188,7 @@ test("conversionTransport=cli explicitly selects the CLI structured conversion",
 test("teardown during normalization interrupts the fork and awaits the foreground flow", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-teardown-fork-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [
       { verdict: "pass", findings: [], testGaps: [], summary: "ok" },
@@ -1968,8 +2208,8 @@ test("teardown during normalization interrupts the fork and awaits the foregroun
     assert.equal(stopDone, false, "teardown must not settle while the foreground normalization is in flight");
     // The active ephemeral fork turn was interrupted exactly by teardown.
     assert.ok(gateway.interrupts.some(
-      (entry) => entry.threadId === "fork-thread-2" && entry.turnId === "fork-turn-2",
-    ), "teardown interrupts the actual active fork turn");
+      (entry) => entry.threadId === "reviewer-thread" && entry.turnId === "fork-turn-2",
+    ), "teardown interrupts the actual in-place conversion on its original ephemeral Reviewer");
     forkGate.release();
     await Promise.all([stopPromise, pendingReview.catch(() => undefined)]);
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -2048,6 +2288,7 @@ test("status reports reviewerActive during a DSH-led reviewing phase", async () 
 test("blocks after the configured third failed review", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-limit-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = Array.from({ length: 3 }, () => ({
       verdict: "changes_requested" as const,
@@ -2059,8 +2300,10 @@ test("blocks after the configured third failed review", async () => {
     const exec = fakeExec("session-limit", directory, []);
     const planned = await managerInstance.start({ task: "Build it" }, exec);
     await managerInstance.review(planned.id, { implementationSummary: "one", changedFiles: ["changed.txt"] }, exec);
+    await writeFile(join(directory, "changed.txt"), "repair attempt v2", "utf8");
     await managerInstance.review(planned.id, { implementationSummary: "two", changedFiles: ["changed.txt"] }, exec);
-    const final = await managerInstance.review(planned.id, { implementationSummary: "three" }, exec);
+    await writeFile(join(directory, "changed.txt"), "repair attempt v3", "utf8");
+    const final = await managerInstance.review(planned.id, { changedFiles: ["changed.txt"], implementationSummary: "three" }, exec);
     assert.equal(final.phase, "blocked");
     assert.equal(final.reviewCycles, 3);
   } finally {
@@ -2071,6 +2314,7 @@ test("blocks after the configured third failed review", async () => {
 test("blocking findings enter the automatic repair loop", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-blocking-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [
       { verdict: "changes_requested", findings: [blockingFinding], testGaps: ["missing tests"], summary: "Fix" },
@@ -2078,7 +2322,7 @@ test("blocking findings enter the automatic repair loop", async () => {
     const instance = manager(directory, gateway);
     const exec = fakeExec("session-blocking", directory, []);
     const planned = await instance.start({ task: "Build it" }, exec);
-    const reviewed = await instance.review(planned.id, { implementationSummary: "Impl" }, exec);
+    const reviewed = await instance.review(planned.id, { changedFiles: ["changed.txt"], implementationSummary: "Impl" }, exec);
     assert.equal(reviewed.phase, "fixing");
   } finally {
     await rmClosed(directory);
@@ -2088,6 +2332,7 @@ test("blocking findings enter the automatic repair loop", async () => {
 test("test gaps alone count as blocking", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-testgaps-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [
       { verdict: "changes_requested", findings: [], testGaps: ["add unit tests for the fix"], summary: "Tests" },
@@ -2095,7 +2340,7 @@ test("test gaps alone count as blocking", async () => {
     const instance = manager(directory, gateway);
     const exec = fakeExec("session-testgaps", directory, []);
     const planned = await instance.start({ task: "Build it" }, exec);
-    const reviewed = await instance.review(planned.id, { implementationSummary: "Impl" }, exec);
+    const reviewed = await instance.review(planned.id, { changedFiles: ["changed.txt"], implementationSummary: "Impl" }, exec);
     assert.equal(reviewed.phase, "fixing");
   } finally {
     await rmClosed(directory);
@@ -2105,6 +2350,7 @@ test("test gaps alone count as blocking", async () => {
 test("non-blocking findings stop at the review decision gate", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-gate-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [
       { verdict: "changes_requested", findings: [nonBlockingFinding], testGaps: [], summary: "Nits only" },
@@ -2112,11 +2358,11 @@ test("non-blocking findings stop at the review decision gate", async () => {
     const instance = manager(directory, gateway);
     const exec = fakeExec("session-gate", directory, []);
     const planned = await instance.start({ task: "Build it" }, exec);
-    const reviewed = await instance.review(planned.id, { implementationSummary: "Impl" }, exec);
+    const reviewed = await instance.review(planned.id, { changedFiles: ["changed.txt"], implementationSummary: "Impl" }, exec);
     assert.equal(reviewed.phase, "waiting_review_decision");
     assert.equal(reviewed.reviewCycles, 1);
     await assert.rejects(
-      instance.review(planned.id, { implementationSummary: "again" }, exec),
+      instance.review(planned.id, { changedFiles: ["changed.txt"], implementationSummary: "again" }, exec),
       /cannot be reviewed from phase waiting_review_decision/,
     );
     await assert.rejects(
@@ -2131,6 +2377,7 @@ test("non-blocking findings stop at the review decision gate", async () => {
 test("accept at the decision gate ships the workflow with findings recorded", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-accept-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [
       { verdict: "changes_requested", findings: [nonBlockingFinding], testGaps: [], summary: "Nits" },
@@ -2138,7 +2385,7 @@ test("accept at the decision gate ships the workflow with findings recorded", as
     const instance = manager(directory, gateway);
     const exec = fakeExec("session-accept", directory, []);
     const planned = await instance.start({ task: "Build it" }, exec);
-    await instance.review(planned.id, { implementationSummary: "Impl" }, exec);
+    await instance.review(planned.id, { changedFiles: ["changed.txt"], implementationSummary: "Impl" }, exec);
     const decided = await instance.decide(planned.id, { decision: "accept", note: "nitpick only" }, exec);
     assert.equal(decided.phase, "passed");
     assert.equal(decided.reviewDecision?.decision, "accept");
@@ -2152,6 +2399,7 @@ test("accept at the decision gate ships the workflow with findings recorded", as
 test("fix at the decision gate enters the repair loop and can pass later", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-fix-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [
       { verdict: "changes_requested", findings: [nonBlockingFinding], testGaps: [], summary: "Nits" },
@@ -2160,11 +2408,11 @@ test("fix at the decision gate enters the repair loop and can pass later", async
     const instance = manager(directory, gateway);
     const exec = fakeExec("session-fix", directory, []);
     const planned = await instance.start({ task: "Build it" }, exec);
-    await instance.review(planned.id, { implementationSummary: "Impl" }, exec);
+    await instance.review(planned.id, { changedFiles: ["changed.txt"], implementationSummary: "Impl" }, exec);
     const decided = await instance.decide(planned.id, { decision: "fix" }, exec);
     assert.equal(decided.phase, "fixing");
     assert.equal(decided.reviewDecision?.decision, "fix");
-    const repaired = await instance.review(planned.id, { implementationSummary: "Fixed nits" }, exec);
+    const repaired = await instance.review(planned.id, { changedFiles: ["changed.txt"], implementationSummary: "Fixed nits" }, exec);
     assert.equal(repaired.phase, "passed");
   } finally {
     await rmClosed(directory);
@@ -2174,6 +2422,7 @@ test("fix at the decision gate enters the repair loop and can pass later", async
 test("blocks a blocking re-review when the workspace did not change", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-nochange-"));
   try {
+    await reviewFiles(directory, "a.txt");
     const file = join(directory, "a.txt");
     await writeFile(file, "v1", "utf8");
     const gateway = new FakeGateway();
@@ -2200,6 +2449,7 @@ test("blocks a blocking re-review when the workspace did not change", async () =
 test("an actual workspace change resets the no-change counter", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-reset-"));
   try {
+    await reviewFiles(directory, "a.txt");
     const file = join(directory, "a.txt");
     await writeFile(file, "v1", "utf8");
     const gateway = new FakeGateway();
@@ -2228,6 +2478,7 @@ test("an actual workspace change resets the no-change counter", async () => {
 test("pass and non-blocking reviews are never blocked by identical fingerprints", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-passnoc-"));
   try {
+    await reviewFiles(directory, "a.txt");
     const file = join(directory, "a.txt");
     await writeFile(file, "v1", "utf8");
 
@@ -2259,7 +2510,7 @@ test("pass and non-blocking reviews are never blocked by identical fingerprints"
   }
 });
 
-test("insufficient evidence disables no-change detection", async () => {
+test("insufficient evidence rejects the review without inventing no-change progress", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-insufficient-"));
   try {
     const gateway = new FakeGateway();
@@ -2268,15 +2519,21 @@ test("insufficient evidence disables no-change detection", async () => {
       { verdict: "changes_requested", findings: [blockingFinding], testGaps: [], summary: "No" },
     ];
     const instance = manager(directory, gateway);
-    const exec = fakeExec("session-insufficient", directory, []);
+    const deferred: unknown[] = [];
+    const exec = fakeExec("session-insufficient", directory, deferred);
     const planned = await instance.start({ task: "Build it" }, exec);
-    // No changedFiles in a non-git workspace: nothing verifiable, no false block.
-    const first = await instance.review(planned.id, { implementationSummary: "one", changedFiles: ["changed.txt"] }, exec);
-    assert.equal(first.phase, "fixing");
-    assert.ok(first.latestReviewEvidence?.insufficient);
-    const second = await instance.review(planned.id, { implementationSummary: "two", changedFiles: ["changed.txt"] }, exec);
-    assert.equal(second.phase, "fixing");
+    const previousMessages = deferred.length;
+    // The declared file is absent: no verdict, cycle or repair may be applied.
+    await assert.rejects(instance.review(planned.id, { implementationSummary: "one", changedFiles: ["changed.txt"] }, exec), /evidence is unavailable|insufficient|unverifiable/);
+    await assert.rejects(instance.review(planned.id, { implementationSummary: "two", changedFiles: ["changed.txt"] }, exec), /evidence is unavailable|insufficient|unverifiable/);
+    const second = (await new WorkflowStore(directory).load(planned.id))!;
+    assert.equal(second.phase, "executing");
+    assert.equal(second.latestReview, undefined);
+    assert.equal(second.reviewCycles, 0);
     assert.equal(second.noChangeReviewRounds, 0);
+    assert.equal(second.previousReviewFingerprint, undefined);
+    assert.equal(deferred.length, previousMessages);
+    assert.equal(gateway.reviewStarts.length, 0);
   } finally {
     await rmClosed(directory);
   }
@@ -2286,6 +2543,7 @@ test("insufficient evidence disables no-change detection", async () => {
 test("review-only enforces single active workflow per session and supports cancel", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-own-"));
   try {
+    await reviewFiles(directory, "a.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [
       { verdict: "changes_requested", findings: [blockingFinding], testGaps: [], summary: "No" },
@@ -2295,7 +2553,7 @@ test("review-only enforces single active workflow per session and supports cance
     const started = await instance.reviewOnly({ implementationSummary: "Changed", changedFiles: ["a.txt"] }, exec);
     await assert.rejects(instance.start({ task: "Second" }, exec), /already has active Codex workflow/);
     await assert.rejects(
-      instance.reviewOnly({ implementationSummary: "Other" }, fakeExec("session-own", directory, [])),
+      instance.reviewOnly({ changedFiles: ["a.txt"], implementationSummary: "Other" }, fakeExec("session-own", directory, [])),
       /already has active Codex workflow/,
     );
     await assert.rejects(
@@ -2360,6 +2618,7 @@ test("different DSH sessions can autonomously start independent planned workflow
 test("review-only reviewer-thread creation failure is retryable and records the error", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-rofail-"));
   try {
+    await reviewFiles(directory, "a.txt");
     const gateway = new FakeGateway();
     const failing = new Proxy(gateway, {
       get(target, property, receiver) {
@@ -2386,7 +2645,7 @@ test("review-only reviewer-thread creation failure is retryable and records the 
   }
 });
 
-test("unobservable rounds break the fingerprint chain and are never blocked", async () => {
+test("unobservable rounds preserve applied fingerprint history and a real file change permits the next review", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-chain-"));
   try {
     const file = join(directory, "a.txt");
@@ -2404,15 +2663,20 @@ test("unobservable rounds break the fingerprint chain and are never blocked", as
     const first = await instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.txt"] }, exec);
     assert.equal(first.phase, "fixing");
     assert.ok(first.previousReviewFingerprint);
-    // All-missing round: unverifiable, clears the fingerprint chain.
-    const unobservable = await instance.review(planned.id, { implementationSummary: "two", changedFiles: ["missing.txt"] }, exec);
+    // A rejected all-missing scope is not an applied business round and cannot
+    // erase the previous verifiable fingerprint or consume another cycle.
+    await assert.rejects(instance.review(planned.id, { implementationSummary: "two", changedFiles: ["missing.txt"] }, exec), /evidence is unavailable|insufficient|unverifiable/);
+    const unobservable = (await new WorkflowStore(directory).load(planned.id))!;
     assert.equal(unobservable.phase, "fixing");
     assert.equal(unobservable.noChangeReviewRounds, 0);
-    assert.equal(unobservable.previousReviewFingerprint, undefined);
-    // Returning to the old fingerprint after an unobservable round is fresh progress.
+    assert.equal(unobservable.previousReviewFingerprint, first.previousReviewFingerprint);
+    assert.equal(unobservable.reviewCycles, first.reviewCycles);
+    assert.deepEqual(unobservable.latestReview, first.latestReview);
+    await writeFile(file, "v2 after a real repair", "utf8");
     const third = await instance.review(planned.id, { implementationSummary: "three", changedFiles: ["a.txt"] }, exec);
     assert.equal(third.phase, "fixing");
     assert.equal(third.noChangeReviewRounds, 0);
+    assert.equal(third.reviewCycles, 2);
   } finally {
     await rmClosed(directory);
   }
@@ -2421,6 +2685,7 @@ test("unobservable rounds break the fingerprint chain and are never blocked", as
 test("a pass verdict carrying actionable content is demoted to changes_requested", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-passcontent-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [
       { verdict: "pass", findings: [blockingFinding], testGaps: [], summary: "pass but has a finding" },
@@ -2432,9 +2697,10 @@ test("a pass verdict carrying actionable content is demoted to changes_requested
     const planned = await instance.start({ task: "Build it" }, exec);
     const blocking = await instance.review(planned.id, { implementationSummary: "one", changedFiles: ["changed.txt"] }, exec);
     assert.equal(blocking.phase, "fixing");
+    await writeFile(join(directory, "changed.txt"), "repair attempt v2", "utf8");
     const testGaps = await instance.review(planned.id, { implementationSummary: "two", changedFiles: ["changed.txt"] }, exec);
     assert.equal(testGaps.phase, "fixing");
-    const nits = await instance.review(planned.id, { implementationSummary: "three" }, exec);
+    const nits = await instance.review(planned.id, { changedFiles: ["changed.txt"], implementationSummary: "three" }, exec);
     assert.equal(nits.phase, "waiting_review_decision");
   } finally {
     await rmClosed(directory);
@@ -2444,6 +2710,7 @@ test("a pass verdict carrying actionable content is demoted to changes_requested
 test("an empty changes_requested verdict is an invalid review: retryable, no cycle consumed", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-emptyverdict-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [
       { verdict: "changes_requested", findings: [], testGaps: [], summary: "nothing to say" },
@@ -2470,6 +2737,7 @@ test("an empty changes_requested verdict is an invalid review: retryable, no cyc
 test("review-only honours reviewer model and effort overrides across repair rounds", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-rooverride-"));
   try {
+    await reviewFiles(directory, "src/a.ts");
     const gateway = new FakeGateway();
     gateway.reviewResults = [
       { verdict: "changes_requested", findings: [blockingFinding], testGaps: [], summary: "No" },
@@ -2491,7 +2759,7 @@ test("review-only honours reviewer model and effort overrides across repair roun
     assert.equal(gateway.reviewerThreadCalls[0]?.model, "override-model");
     // The invisible 1.0.10 authority-alignment fork reuses the SAME model.
     assert.deepEqual(gateway.forkCalls.map((call) => call.model), ["override-model", "override-model"]);
-    await instance.review(started.id, { implementationSummary: "Fixed" }, exec);
+    await instance.review(started.id, { changedFiles: ["src/a.ts"], implementationSummary: "Fixed" }, exec);
     assert.deepEqual(
       gateway.forkCalls.map((call) => call.model),
       ["override-model", "override-model", "override-model", "override-model"],
@@ -2504,6 +2772,7 @@ test("review-only honours reviewer model and effort overrides across repair roun
 test("review-only without changedFiles is rejected in a non-git workspace", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-rogitchanged-"));
   try {
+    await reviewFiles(directory, "a.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [
       { verdict: "changes_requested", findings: [blockingFinding], testGaps: [], summary: "No" },
@@ -2528,6 +2797,7 @@ test("review-only without changedFiles is rejected in a non-git workspace", asyn
 test("review-only Reviewer thread creation failure keeps a retryable record", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-sourcethreadfail-"));
   try {
+    await reviewFiles(directory, "a.txt");
     const gateway = new FakeGateway();
     const failing = new Proxy(gateway, {
       get(target, property, receiver) {
@@ -2567,27 +2837,69 @@ class GatedStore extends WorkflowStore {
   }
 }
 
-/** Test seam: fails the Nth update call so turn registration can be made to throw. */
+/** Fail one real business mutation, independent of intervening metering writes. */
 class FlakyStore extends WorkflowStore {
-  updateCount = 0;
-  failAtUpdate?: number;
+  failMutation?: (before: WorkflowRecord, after: WorkflowRecord) => boolean;
+  injectedFailures = 0;
+  meteringMutations = 0;
 
   override async update<T>(
     id: string,
     fn: (record: WorkflowRecord) => T,
     opts: { ignoreCancelled?: boolean } = {},
   ) {
-    this.updateCount += 1;
-    if (this.failAtUpdate === this.updateCount) {
-      throw new Error("store write failed");
-    }
-    return super.update(id, fn, opts);
+    return super.update(id, (record) => {
+      const before = structuredClone(record);
+      const result = fn(record);
+      if (JSON.stringify(before.observedUsage) !== JSON.stringify(record.observedUsage)) this.meteringMutations += 1;
+      if (this.failMutation?.(before, record)) {
+        this.failMutation = undefined;
+        this.injectedFailures += 1;
+        throw new Error("store write failed");
+      }
+      return result;
+    }, opts);
   }
 }
+
+test("a metering write failure does not consume or hide a later business registration failure", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-fault-isolation-"));
+  const gateway = new FakeGateway();
+  const store = new FlakyStore(directory);
+  const instance = new WorkflowManager(store, gateway, { ...config, storageDir: directory });
+  try {
+    await reviewFiles(directory, "a.txt");
+    const exec = fakeExec("session-fault-isolation", directory, []);
+    store.failMutation = (before, after) => {
+      const beforeBusiness = { ...before };
+      const afterBusiness = { ...after };
+      delete beforeBusiness.observedUsage;
+      delete afterBusiness.observedUsage;
+      return JSON.stringify(before.observedUsage) !== JSON.stringify(after.observedUsage)
+        && JSON.stringify(beforeBusiness) === JSON.stringify(afterBusiness);
+    };
+    const planned = await instance.start({ task: "Build it" }, exec);
+    assert.equal(planned.phase, "executing", "a metering-only fault cannot fail a valid plan");
+    assert.equal(store.injectedFailures, 1, "the injected metering failure was actually reached");
+    assert.equal(gateway.turnCalls.length, 1, "usage persistence does not rerun the Planner");
+    store.failMutation = (before, after) => before.activeTurnId !== after.activeTurnId && after.activeTurnId === "review-turn-1";
+    await assert.rejects(instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.txt"] }, exec), /store write failed/);
+    assert.equal(store.injectedFailures, 2, "the business fault remains separate from the metering fault");
+    assert.ok(gateway.interrupts.some((entry) => entry.threadId === "reviewer-thread" && entry.turnId === "review-turn-1"));
+    const record = await store.load(planned.id);
+    assert.equal(record?.phase, "executing");
+    assert.equal(record?.reviewCycles, 0);
+    assert.equal(record?.latestReview, undefined);
+  } finally {
+    await instance.stop();
+    await rmClosed(directory);
+  }
+});
 
 test("a failing turn registration fails the workflow and interrupts the new turn", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-regfail-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [
       { verdict: "changes_requested", findings: [blockingFinding], testGaps: [], summary: "No" },
@@ -2597,12 +2909,8 @@ test("a failing turn registration fails the workflow and interrupts the new turn
     const exec = fakeExec("session-regfail", directory, []);
     const planned = await instance.start({ task: "Build it" }, exec);
     assert.equal(planned.phase, "executing");
-    // start() used one update; the third review update is the raw-review turn
-    // registration (entering, evidence, registerActiveTurn).
-    // start() used several updates; the FOURTH review-scoped update is the
-    // raw-review turn registration (entering, evidence, reviewer-thread
-    // persist, registerActiveTurn) — registerActiveTurn is what must fail.
-    store.failAtUpdate = store.updateCount + 4;
+    // Fail the actual raw-review turn registration, after any usage-only writes.
+    store.failMutation = (before, after) => before.activeTurnId !== after.activeTurnId && after.activeTurnId === "review-turn-1";
     await assert.rejects(instance.review(planned.id, { implementationSummary: "one", changedFiles: ["changed.txt"] }, exec), /store write failed/);
     const records = await store.list();
     // An infrastructure failure returns the workflow to its RETRYABLE phase and
@@ -2613,6 +2921,8 @@ test("a failing turn registration fails the workflow and interrupts the new turn
     assert.ok(gateway.interrupts.some(
       (entry) => entry.threadId === "reviewer-thread" && entry.turnId === "review-turn-1",
     ));
+    assert.equal(store.injectedFailures, 1, "the intended business write was rejected once");
+    assert.ok(store.meteringMutations > 0, "metering writes occurred without consuming the registration fault");
     // The workflow stays ACTIVE (retryable) after an infrastructure failure.
     const active = await store.activeForSession("session-regfail");
     assert.equal(active?.id, planned.id, "the workflow remains active so a later review can retry");
@@ -2634,6 +2944,7 @@ test("a failing turn registration fails the workflow and interrupts the new turn
 test("1.1.3: a transient failure while configuring a created Reviewer retries the SAME task", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-config-retry-"));
   try {
+    await reviewFiles(directory, "a.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [{ verdict: "pass", findings: [], testGaps: [], summary: "ok" }];
     gateway.configureFailures = 1;
@@ -2648,7 +2959,9 @@ test("1.1.3: a transient failure while configuring a created Reviewer retries th
     assert.equal(gateway.reviewerThreadCalls.length, 1, "`thread/start` ran exactly ONCE");
     assert.deepEqual(gateway.configureCalls.map((call) => call.threadId), ["reviewer-thread"],
       "the retry configured the SAME task instead of leaking an orphan");
-    assert.deepEqual(gateway.unsubscribedThreads, ["reviewer-thread"], "the completed review releases the created Reviewer");
+    assert.equal(gateway.privateThreads.length, 1);
+    assert.deepEqual(gateway.unsubscribedThreads, [...gateway.privateThreads, "reviewer-thread"],
+      "the completed review releases its private checker and the created Reviewer once");
   } finally {
     await rmClosed(directory);
   }
@@ -2657,6 +2970,7 @@ test("1.1.3: a transient failure while configuring a created Reviewer retries th
 test("1.1.3: a configuration that never succeeds releases the created Reviewer and stays retryable", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-config-exhausted-"));
   try {
+    await reviewFiles(directory, "a.txt");
     const gateway = new FakeGateway();
     gateway.configureFailures = 10_000;
     const instance = manager(directory, gateway, {}, undefined, undefined, undefined, {
@@ -2692,6 +3006,7 @@ test("1.1.3: a configuration that never succeeds releases the created Reviewer a
 test("1.1.4: a round releases its own subscription and never takes the external handoff path", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-release-path-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [{ verdict: "pass", findings: [], testGaps: [], summary: "ok" }];
     const controller = new AbortController();
@@ -2703,9 +3018,11 @@ test("1.1.4: a round releases its own subscription and never takes the external 
       { ...exec, signal: controller.signal },
     );
     assert.equal(reviewed.phase, "passed");
-    assert.deepEqual(gateway.unsubscribedThreads, ["reviewer-thread"], "the round releases the subscription it took");
+    assert.equal(gateway.privateThreads.length, 1);
+    assert.deepEqual(gateway.unsubscribedThreads, [...gateway.privateThreads, "reviewer-thread"],
+      "the round releases each private checker and Reviewer subscription it took");
     assert.deepEqual(gateway.releasedThreads, [], "the release never goes through the external handoff");
-    assert.deepEqual(gateway.unsubscribeSignals, [undefined],
+    assert.deepEqual(gateway.unsubscribeSignals, [undefined, undefined],
       "the release must not carry the business signal — an abort would cancel the cleanup itself");
   } finally {
     await rmClosed(directory);
@@ -2715,6 +3032,7 @@ test("1.1.4: a round releases its own subscription and never takes the external 
 test("1.1.4: a round that FAILED after claiming the Reviewer still releases it", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-release-failed-round-"));
   try {
+    await reviewFiles(directory, "a.ts");
     const gateway = new FlakyReviewGateway({ message: "codex thread 01a0 does not exist", times: 1 });
     const instance = manager(directory, gateway, {}, undefined, undefined, undefined, {
       sleep: async () => undefined,
@@ -2722,11 +3040,12 @@ test("1.1.4: a round that FAILED after claiming the Reviewer still releases it",
     });
     const exec = fakeExec("session-release-failed-round", directory, []);
     const planned = await instance.start({ task: "Build it" }, exec);
+    const releaseBaseline = gateway.unsubscribedThreads.length;
     await assert.rejects(
       instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.ts"] }, exec),
       /turn failed/,
     );
-    assert.deepEqual(gateway.unsubscribedThreads, ["reviewer-thread"],
+    assert.deepEqual(gateway.unsubscribedThreads.slice(releaseBaseline), ["reviewer-thread"],
       "a failed round must not leave its Reviewer subscription behind");
     assert.deepEqual(gateway.releasedThreads, []);
   } finally {
@@ -2737,8 +3056,8 @@ test("1.1.4: a round that FAILED after claiming the Reviewer still releases it",
 test("1.1.4: a failed release is survivable — the next round backs off through the hold it left", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-release-failure-"));
   try {
+    await reviewFiles(directory, "a.txt", "second.txt");
     const gateway = new FakeGateway();
-    gateway.unsubscribeFailures = 1;
     gateway.reviewResults = [
       { verdict: "changes_requested", findings: [{ severity: "high", blocking: true, title: "t", body: "b" }], testGaps: [], summary: "first" },
       { verdict: "pass", findings: [], testGaps: [], summary: "second" },
@@ -2749,10 +3068,15 @@ test("1.1.4: a failed release is survivable — the next round backs off through
     });
     const exec = fakeExec("session-release-failure", directory, []);
     const planned = await instance.start({ task: "Build it" }, exec);
+    gateway.unsubscribeFailures = 1;
+    gateway.unsubscribeFailureThreadId = "reviewer-thread";
+    const releaseBaseline = gateway.unsubscribedThreads.length;
     const first = await instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.txt"] }, exec);
     assert.equal(first.phase, "fixing", "the round outcome is preserved when the cleanup fails");
     assert.equal(first.latestReview?.summary, "first");
-    assert.deepEqual(gateway.unsubscribedThreads, [], "the failed release recorded no subscription release");
+    assert.equal(gateway.privateThreads.length, 1);
+    assert.deepEqual(gateway.unsubscribedThreads.slice(releaseBaseline), gateway.privateThreads,
+      "the private checker releases once while the failed Reviewer release records no success");
     const persisted = (await new WorkflowStore(directory).load(planned.id))!;
     assert.match(persisted.lastProgressMessage ?? "", /reviewer release failed/,
       `a swallowed cleanup failure must still be visible on the round's terminal message (got ${JSON.stringify({ returned: first.lastProgressMessage, persisted: persisted.lastProgressMessage, state: persisted.processState })})`);
@@ -2762,8 +3086,9 @@ test("1.1.4: a failed release is survivable — the next round backs off through
     await writeFile(join(directory, "second.txt"), "v2", "utf8");
     const second = await instance.review(planned.id, { implementationSummary: "two", changedFiles: ["second.txt"] }, exec);
     assert.equal(second.phase, "passed");
-    assert.deepEqual(gateway.unsubscribedThreads, ["reviewer-thread"],
-      "the next round releases the subscription the failed release left behind");
+    assert.equal(gateway.privateThreads.length, 2);
+    assert.deepEqual(gateway.unsubscribedThreads.slice(releaseBaseline), [...gateway.privateThreads, "reviewer-thread"],
+      "each private checker releases once and the next round releases the Reviewer subscription left behind");
     assert.doesNotMatch(second.lastProgressMessage ?? "", /reviewer release failed/,
       "a successful release leaves no failure note behind");
   } finally {
@@ -2774,6 +3099,7 @@ test("1.1.4: a failed release is survivable — the next round backs off through
 test("1.1.4: a gateway without thread/unsubscribe releases nothing instead of idle-shutting the shared App Server", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-release-narrow-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [{ verdict: "pass", findings: [], testGaps: [], summary: "ok" }];
     // The ONLY release API this gateway has is the external handoff, which ends in
@@ -2797,11 +3123,14 @@ test("1.1.4: a gateway without thread/unsubscribe releases nothing instead of id
 test("1.1.4: a round cancelled AFTER claiming the Reviewer still releases it, without a signal", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-release-cancel-"));
   try {
+    await reviewFiles(directory, "a.ts");
     const gateway = new FakeGateway();
     const store = new WorkflowStore(directory);
     const instance = manager(directory, gateway);
     const exec = fakeExec("session-release-cancel", directory, []);
     const planned = await instance.start({ task: "Build it" }, exec);
+    const releaseBaseline = gateway.unsubscribedThreads.length;
+    const signalBaseline = gateway.unsubscribeSignals.length;
     await store.update(planned.id, (r) => {
       r.reviewerThreadId = "reviewer-thread";
       r.reviewerThreadOrigin = "app-server";
@@ -2816,9 +3145,9 @@ test("1.1.4: a round cancelled AFTER claiming the Reviewer still releases it, wi
     await instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.ts"] }, exec).catch(() => undefined);
     const record = (await store.load(planned.id))!;
     assert.equal(record.phase, "cancelled");
-    assert.deepEqual(gateway.unsubscribedThreads, ["reviewer-thread"],
+    assert.deepEqual(gateway.unsubscribedThreads.slice(releaseBaseline), ["reviewer-thread"],
       "a cancelled round still releases the subscription it claimed");
-    assert.deepEqual(gateway.unsubscribeSignals, [undefined],
+    assert.deepEqual(gateway.unsubscribeSignals.slice(signalBaseline), [undefined],
       "…and the cleanup never carries the business signal that was cancelled");
   } finally {
     await rmClosed(directory);
@@ -2828,6 +3157,7 @@ test("1.1.4: a round cancelled AFTER claiming the Reviewer still releases it, wi
 test("1.1.4: a hung release cannot wedge the round — the cleanup has its own deadline", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-release-hang-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [{ verdict: "pass", findings: [], testGaps: [], summary: "ok" }];
     // A `thread/unsubscribe` that never settles. The release carries no business
@@ -2854,15 +3184,16 @@ test("1.1.4: a hung release cannot wedge the round — the cleanup has its own d
 test("1.1.4: an unbound Reviewer whose release fails reports it on the round", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-unbound-note-"));
   try {
+    await reviewFiles(directory, "a.txt");
     const gateway = new FakeGateway();
-    gateway.unsubscribeFailures = 1;
     const store = new FlakyStore(directory);
     const instance = new WorkflowManager(store, gateway, { ...config, storageDir: directory });
     const exec = fakeExec("session-unbound-note", directory, []);
     const planned = await instance.start({ task: "Build it" }, exec);
-    // Fail the Reviewer-thread persist (the third review-scoped update), so the
-    // task exists but could never be bound — and its release also fails.
-    store.failAtUpdate = store.updateCount + 3;
+    gateway.unsubscribeFailures = 1;
+    // Fail the origin/binding mutation itself; metering never sets this marker.
+    store.failMutation = (before, after) => before.reviewerThreadOrigin !== after.reviewerThreadOrigin
+      && after.reviewerThreadOrigin === "app-server-ephemeral" && after.reviewStep === "review_native_turn";
     await assert.rejects(
       instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.txt"] }, exec),
       /store write failed/,
@@ -2871,12 +3202,15 @@ test("1.1.4: an unbound Reviewer whose release fails reports it on the round", a
     assert.equal(record.reviewerThreadId, undefined, "nothing is bound after the failed write");
     assert.match(record.lastProgressMessage ?? "", /reviewer release failed/,
       "an unbound release failure is reported, never silently dropped");
+    assert.equal(store.injectedFailures, 1);
+    assert.equal(gateway.reviewThreads.length, 0, "the binding failure prevents a visible model turn");
   } finally { await rmClosed(directory); }
 });
 
 test("cancel during first visible Reviewer creation cannot bind or apply a late result", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-cli-create-cancel-"));
   try {
+    await reviewFiles(directory, "a.txt");
     const gateway = new FakeGateway();
     const store = new WorkflowStore(directory);
     const instance = manager(directory, gateway);
@@ -2904,24 +3238,27 @@ test("cancel during first visible Reviewer creation cannot bind or apply a late 
 test("1.1.2: a Reviewer task created for a FAILED binding write is released too", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-bindfail-"));
   try {
+    await reviewFiles(directory, "a.txt");
     const gateway = new FakeGateway();
     const store = new FlakyStore(directory);
     const instance = new WorkflowManager(store, gateway, { ...config, storageDir: directory });
     const exec = fakeExec("session-bindfail", directory, []);
     const planned = await instance.start({ task: "Build it" }, exec);
-    // The review-scoped updates are: entering (1), evidence (2), Reviewer-thread
-    // persist (3) — failing the THIRD one means the task was created but could
-    // not be bound to the workflow.
-    store.failAtUpdate = store.updateCount + 3;
+    const releaseBaseline = gateway.unsubscribedThreads.length;
+    // Reject only the real Reviewer origin/binding mutation inside its CAS.
+    store.failMutation = (before, after) => before.reviewerThreadOrigin !== after.reviewerThreadOrigin
+      && after.reviewerThreadOrigin === "app-server-ephemeral" && after.reviewStep === "review_native_turn";
     await assert.rejects(
       instance.review(planned.id, { implementationSummary: "one", changedFiles: ["a.txt"] }, exec),
       /store write failed/,
     );
-    assert.deepEqual(gateway.unsubscribedThreads, ["reviewer-thread"],
+    assert.deepEqual(gateway.unsubscribedThreads.slice(releaseBaseline), ["reviewer-thread"],
       "an unbound created Reviewer is released instead of leaking its subscription");
     const record = (await store.load(planned.id))!;
     assert.equal(record.reviewerThreadId, undefined, "nothing is bound after the failed write");
     assert.equal(record.phase, "executing", "the workflow stays retryable");
+    assert.equal(store.injectedFailures, 1);
+    assert.equal(gateway.reviewThreads.length, 0, "a Reviewer cannot run after binding failed");
   } finally { await rmClosed(directory); }
 });
 
@@ -2930,6 +3267,7 @@ test("1.1.2: a Reviewer task created for a FAILED binding write is released too"
 test("cancel between the final check and the outcome commit: no overwrite, no outcome message", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-latecancel-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [
       { verdict: "pass", findings: [], testGaps: [], summary: "OK" },
@@ -2988,6 +3326,7 @@ test("interrupt failures never un-cancel a workflow or leave it active", async (
 test("onStarted interrupt failure after cancellation still leaves the record cancelled", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-onstartedfail-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [
       { verdict: "changes_requested", findings: [blockingFinding], testGaps: [], summary: "No" },
@@ -3189,7 +3528,9 @@ test("bridge callback ignores a legacy Reviewer id and uses a fresh ephemeral ro
     assert.equal(callback.requests[0]!.reviewerThreadId, undefined,
       "an unrenderable legacy Reviewer is handed over as UNBOUND so a visible one is created");
     assert.deepEqual(gateway.releasedThreads, [], "the legacy task is not resumed, so it is not released either");
-    assert.deepEqual(gateway.unsubscribedThreads, [], "the legacy task is never resumed, so it has no subscription to release");
+    assert.equal(gateway.privateThreads.length, 1);
+    assert.deepEqual(gateway.unsubscribedThreads, gateway.privateThreads, "only the created private checker is released");
+    assert.equal(gateway.unsubscribedThreads.includes("legacy-callback-reviewer"), false, "the legacy task has no subscription to release");
     assert.deepEqual(gateway.renamedThreads, [], "legacy ids are diagnostics only and are never renamed");
   } finally {
     await rmClosed(directory);
@@ -3216,7 +3557,9 @@ test("1.1.2: a bridge record whose Reviewer id IS the origin task is never renam
     assert.deepEqual(gateway.renamedThreads, [],
       "the ORIGIN task's title is never overwritten by the legacy-Reviewer rename");
     assert.deepEqual(gateway.releasedThreads, [], "the origin task is not resumed, so it is not released either");
-    assert.deepEqual(gateway.unsubscribedThreads, [], "the origin task is never resumed, so it has no subscription to release");
+    assert.equal(gateway.privateThreads.length, 1);
+    assert.deepEqual(gateway.unsubscribedThreads, gateway.privateThreads, "only the created private checker is released");
+    assert.equal(gateway.unsubscribedThreads.includes(sourceThreadId), false, "the origin task has no subscription to release");
   } finally {
     await rmClosed(directory);
   }
@@ -3432,6 +3775,11 @@ test("applyExternalVerdict reuses the outcome policy: pass, fixing, gate and no-
       const exec = fakeExec(sessionId, directory, []);
       const record = await bridgeWorkflow(instance, sessionId, directory, codexThreadId);
       const submitted = await instance.submit(record.id, { implementationSummary: "done", changedFiles: ["a.txt"] }, exec);
+      await waitFor(async () => {
+        const current = await new WorkflowStore(directory).load(record.id);
+        return current !== undefined && current.submissionId === submitted.submissionId
+          && current.submissionState === "waiting_verdict" && !current.submissionLeaseToken;
+      });
       return { record, submissionId: submitted.submissionId! };
     };
     const blockingVerdict = (summary: string, submissionId: string, workflowId: string) => ({
@@ -3471,6 +3819,11 @@ test("applyExternalVerdict reuses the outcome policy: pass, fixing, gate and no-
     // Cycle 2: DSH submits again (new submission), workspace unchanged.
     const exec2 = fakeExec("session-v-nochange", directory, []);
     const resubmitted = await instance.submit(noChange.record.id, { implementationSummary: "same state", changedFiles: ["a.txt"] }, exec2);
+    await waitFor(async () => {
+      const current = await new WorkflowStore(directory).load(noChange.record.id);
+      return current !== undefined && current.submissionId === resubmitted.submissionId
+        && current.submissionState === "waiting_verdict" && !current.submissionLeaseToken;
+    });
     assert.notEqual(resubmitted.submissionId, noChange.submissionId);
     const blocked = await instance.applyExternalVerdict(blockingVerdict("round two", resubmitted.submissionId!, noChange.record.id));
     assert.equal(blocked.phase, "blocked");
@@ -3526,6 +3879,11 @@ test("the same submission verdict replays idempotently even after the phase move
     const codexThreadId = newRequestId();
     const record = await bridgeWorkflow(instance, "session-v-replay", directory, codexThreadId);
     const submitted = await instance.submit(record.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, exec);
+    await waitFor(async () => {
+      const current = await new WorkflowStore(directory).load(record.id);
+      return current !== undefined && current.submissionId === submitted.submissionId
+        && current.submissionState === "waiting_verdict" && !current.submissionLeaseToken;
+    });
     const command = {
       version: 1 as const,
       kind: "submit_verdict" as const,
@@ -3592,7 +3950,7 @@ test("recoverCallbacks resumes persisted submissions exactly once with bounded a
     await waitFor(async () => {
       const record = await new WorkflowStore(directory).load(bridge.id);
       return record?.submissionState === "received" && !record.submissionLeaseToken;
-    });
+    }, 30_000);
     assert.equal(callback.requests.length, 1); // the live submit already ran
 
     // Reset to the pre-spawn state: submission queued, attempts 0.
@@ -3667,7 +4025,7 @@ test("callback infrastructure failures do not consume a review cycle; first appl
     await waitFor(async () => {
       const record = await new WorkflowStore(directory).load(bridge.id);
       return record?.submissionState === "retrying" && !record.submissionLeaseToken;
-    });
+    }, 30_000);
     const retrying = (await new WorkflowStore(directory).load(bridge.id))!;
     assert.equal(retrying.submissionState, "retrying", "busy exhaustion keeps the same submission active");
     assert.equal(retrying.reviewCycles, 0, "infrastructure failures consume no cycle");
@@ -3689,6 +4047,7 @@ test("callback infrastructure failures do not consume a review cycle; first appl
 test("a legacy DSH review consumes exactly one cycle per applied review", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-cycles-review-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [{ verdict: "changes_requested", findings: [blockingFinding], testGaps: [], summary: "no" }];
     const instance = manager(directory, gateway, {}, new FakeCallback());
@@ -4040,6 +4399,7 @@ test("decide(fix) steers bridge workflows to submit and legacy workflows to revi
   try {
     // Bridge workflow: the automatic callback produces a NON-BLOCKING
     // changes_requested verdict which reaches waiting_review_decision.
+    await reviewFiles(directory, "changed.txt");
     const queue = fakeBridgeQueue();
     const callback = new FakeCallback();
     callback.results = [{
@@ -4068,7 +4428,7 @@ test("decide(fix) steers bridge workflows to submit and legacy workflows to revi
     legacyGateway.reviewResults = [{ verdict: "changes_requested", findings: [nonBlockingFinding], testGaps: [], summary: "nits" }];
     const legacy = manager(join(directory, "legacy"), legacyGateway, {}, new FakeCallback(), fakeBridgeQueue());
     const planned = await legacy.start({ task: "Legacy" }, fakeExec("session-decide-legacy", directory, []));
-    await legacy.review(planned.id, { implementationSummary: "Impl" }, fakeExec("session-decide-legacy", directory, []));
+    await legacy.review(planned.id, { changedFiles: ["changed.txt"], implementationSummary: "Impl" }, fakeExec("session-decide-legacy", directory, []));
     const legacyDeferred: unknown[] = [];
     await legacy.decide(planned.id, { decision: "fix" }, fakeExec("session-decide-legacy", directory, legacyDeferred));
     const legacyText = JSON.stringify(legacyDeferred.map((m) => (m as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? ""));
@@ -4269,57 +4629,76 @@ test("concurrent dispatch of different requests on one session leaves exactly on
  * callback result must never write state or enqueue a verdict. */
 test("a callback owner that lost its lease cannot write or enqueue a verdict", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-leaselost-"));
+  const observationStore = new WorkflowStore(directory);
+  const callbackA = new DeferredCallback();
+  let instanceA: WorkflowManager | undefined;
+  let instanceB: WorkflowManager | undefined;
+  let pendingSubmit: Promise<WorkflowRecord> | undefined;
+  const settleBackground = async (instance: WorkflowManager) => {
+    const runtime = (instance as unknown as { runtime: { backgroundTasks: Set<Promise<unknown>> } }).runtime;
+    await Promise.allSettled([...runtime.backgroundTasks]);
+  };
   try {
     // A SHARED queue is injected into both owners, so the queue's content is
     // the single observable truth: only the new owner's staged command may
     // ever appear.
     const sharedQueue = fakeBridgeQueue();
-    const callbackA = new DeferredCallback();
     callbackA.deferredVerdict = { verdict: "pass", findings: [], testGaps: [], summary: "A-verdict" };
-    const instanceA = manager(directory, new FakeGateway(), { leaseTtlMs: 300 }, callbackA, sharedQueue);
+    // This tests actual ownership revocation, rather than expiry of a live
+    // owner's short lease while the scheduler runs the authority pipeline.
+    instanceA = manager(directory, new FakeGateway(), { leaseTtlMs: 10_000 }, callbackA, sharedQueue);
     const exec = fakeExec("session-leaselost", directory, []);
     const bridge = await bridgeWorkflow(instanceA, "session-leaselost", directory, newRequestId());
 
-    const pendingSubmit = instanceA.submit(bridge.id, { implementationSummary: "A", changedFiles: ["changed.txt"] }, exec);
+    pendingSubmit = instanceA.submit(bridge.id, { implementationSummary: "A", changedFiles: ["changed.txt"] }, exec);
+    void pendingSubmit.catch(() => undefined);
     // Wait until A's callback child is in flight (its deferred send pending).
     await waitFor(async () => callbackA.sentRequests.length === 1);
 
     // B (another process/manager) takes over A's now-abandoned submission lease.
     const callbackB = new FakeCallback();
     callbackB.results.push({ kind: "verdict", verdict: { verdict: "pass", findings: [], testGaps: [], summary: "B-verdict" } });
-    const instanceB = manager(directory, new FakeGateway(), { leaseTtlMs: 300 }, callbackB, sharedQueue);
-    const coordination = new WorkflowStore(directory).coordinationHandle;
-    const record = await new WorkflowStore(directory).load(bridge.id);
-    const resource = `submission:${bridge.id}:${record!.submissionId}`;
+    instanceB = manager(directory, new FakeGateway(), { leaseTtlMs: 10_000 }, callbackB, sharedQueue);
+    const coordination = observationStore.coordinationHandle;
+    const record = await observationStore.load(bridge.id);
+    assert.ok(record?.submissionId);
+    assert.ok(record.submissionLeaseToken);
+    assert.ok(record.submissionLeaseEpoch !== undefined);
+    const resource = `submission:${bridge.id}:${record.submissionId}`;
     // Simulate A's lease being gone (expired/taken): clear the lease row.
-    if (record!.submissionLeaseToken && record!.submissionLeaseEpoch !== undefined) {
-      coordination.releaseLease(resource, record!.submissionLeaseEpoch, record!.submissionLeaseToken);
-    }
+    assert.equal(coordination.releaseLease(resource, record.submissionLeaseEpoch, record.submissionLeaseToken), true,
+      "A's actual lease was revoked before B's recovery claim");
     assert.equal(await instanceB.recoverCallbacks(), 1);
     // B completes the pipeline (verdict staged + enqueued + received).
-    await waitFor(async () => (await new WorkflowStore(directory).load(bridge.id))?.submissionState === "received");
+    await waitFor(async () => (await observationStore.load(bridge.id))?.submissionState === "received");
+    await settleBackground(instanceB);
 
     // A's heartbeat detects the loss (renew changes 0 rows) and kills its child.
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    assert.ok(callbackA.cancelledSubmissions.includes(`${bridge.id}:${record!.submissionId}`),
+    await waitFor(() => callbackA.cancelledSubmissions.includes(`${bridge.id}:${record.submissionId}`));
+    assert.ok(callbackA.cancelledSubmissions.includes(`${bridge.id}:${record.submissionId}`),
       "A kills its own callback child after losing the lease");
 
     // A's late callback result arrives: it must NOT write or enqueue anything.
     callbackA.releaseDeferred();
     await pendingSubmit;
-    const after = await new WorkflowStore(directory).load(bridge.id);
+    await settleBackground(instanceA);
+    const after = await observationStore.load(bridge.id);
     assert.equal(after?.submissionState, "received", "A did not regress the state");
     assert.equal(after?.appliedVerdictRequestId, undefined, "A did not apply");
     // Shared-persistent-queue semantics: exactly the NEW owner's command exists.
     assert.equal(sharedQueue.commands.length, 1, "only B's verdict ever entered the shared queue");
     for (const command of sharedQueue.commands) {
       assert.equal(command.verdict.summary, "B-verdict", "only the NEW owner enqueues");
-      assert.equal(command.submissionId, record!.submissionId);
+      assert.equal(command.submissionId, record.submissionId);
       assert.equal(command.requestId, after?.stagedVerdict?.command.requestId);
     }
     assert.equal(after?.stagedVerdict?.command.verdict.summary, "B-verdict");
   } finally {
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    callbackA.releaseDeferred();
+    if (pendingSubmit) await Promise.allSettled([pendingSubmit]);
+    await instanceA?.stop();
+    await instanceB?.stop();
+    observationStore.close();
     await rmRetry(directory);
   }
 });
@@ -4497,12 +4876,16 @@ test("stop() awaits recovery-derived background tasks; nothing writes afterwards
  * caller never resolves before the first has truly finished tearing down. */
 test("concurrent manager.stop() share one settle promise", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-stopconc-"));
+  const cb = new DeferredCallback();
   try {
-    const cb = new DeferredCallback();
     cb.deferredVerdict = { verdict: "pass", findings: [], testGaps: [], summary: "ok" };
     const instance = manager(directory, new FakeGateway(), { leaseTtlMs: 30_000 }, cb, fakeBridgeQueue());
     const exec = fakeExec("session-stopconc", directory, []);
     const bridge = await bridgeWorkflow(instance, "session-stopconc", directory, newRequestId());
+    const evidence = await collectEvidence({ cwd: directory, maxDiffBytes: config.reviewDiffMaxBytes,
+      changedFiles: ["changed.txt"] });
+    assert.equal(evidence.insufficient, false);
+    assert.ok(evidence.fingerprint);
     // Persist a recoverable (queued) submission directly; a recovery then
     // spawns a derived callback task that blocks on the deferred gate (it
     // ignores the abort, so stop() must wait for the release).
@@ -4513,6 +4896,7 @@ test("concurrent manager.stop() share one settle promise", async () => {
       r.submissionAttempts = 0;
       r.callbackState = "queued";
       r.pendingReviewRequest = { implementationSummary: "done", changedFiles: ["changed.txt"] };
+      r.latestReviewEvidence = evidence;
     });
     const recovered = await instance.recoverCallbacks();
     assert.equal(recovered, 1);
@@ -4530,13 +4914,15 @@ test("concurrent manager.stop() share one settle promise", async () => {
     await Promise.all([first, second]);
     assert.equal(secondDone, true);
   } finally {
+    cb.releaseDeferred();
     await rmClosed(directory);
   }
 });
 
-test("review infra failures keep the workflow retryable; first applied verdict is still cycle 1", async () => {
+test("independently requested reviews after terminal infrastructure failures preserve the applied cycle budget", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-cycles-revfail-"));
   try {
+    await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [
       { verdict: "changes_requested", findings: [blockingFinding], testGaps: [], summary: "no" },
@@ -4558,19 +4944,26 @@ test("review infra failures keep the workflow retryable; first applied verdict i
     };
     for (let i = 0; i < 3; i += 1) {
       await assert.rejects(
-        instance.review(planned.id, { implementationSummary: `try ${i}`, changedFiles: ["changed.txt"] }, exec),
+        instance.review(planned.id, { implementationSummary: `try ${i}`, changedFiles: ["changed.txt"], ...(i > 0 ? { newReviewRound: true } : {}) }, exec),
         /app-server restarting/,
       );
       const r = await new WorkflowStore(directory).load(planned.id);
       assert.equal(r?.phase, "executing", `stays retryable after infra failure ${i + 1}`);
       assert.equal(r?.reviewCycles, 0, "infra failure consumed no cycle");
+      assert.equal(r?.noChangeReviewRounds, 0, "an infrastructure failure is not an applied no-change round");
+      assert.equal(r?.previousReviewFingerprint, undefined, "an infrastructure failure cannot create business fingerprint history");
       assert.ok(r?.error, "the error is recorded for diagnosis");
+      await assert.rejects(instance.review(planned.id, { implementationSummary: `try ${i}`, changedFiles: ["changed.txt"] }, exec),
+        /original Reviewer is unavailable/, "A default call cannot replace a failed same-material Reviewer");
+      assert.equal(gateway.reviewerThreadCalls.length, i + 1);
     }
     assert.equal(infraFailures, 0);
     // The FOURTH review is the first real verdict: it must be cycle 1.
-    const reviewed = await instance.review(planned.id, { implementationSummary: "real", changedFiles: ["changed.txt"] }, exec);
+    const reviewed = await instance.review(planned.id, { implementationSummary: "real", changedFiles: ["changed.txt"], newReviewRound: true }, exec);
     assert.equal(reviewed.reviewCycles, 1, "first applied verdict is cycle 1 after three infra failures");
     assert.equal(reviewed.phase, "fixing");
+    assert.equal(reviewed.noChangeReviewRounds, 0);
+    assert.ok(reviewed.previousReviewFingerprint, "the first applied verdict establishes the observable fingerprint history");
     void gateway;
   } finally {
     await rmClosed(directory);

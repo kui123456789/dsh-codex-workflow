@@ -46,6 +46,8 @@ const TRANSIENT_PATTERNS: RegExp[] = [
  * not exist, a display/schema contract violation, an explicit cancellation).
  * Checked BEFORE the transient patterns. */
 const TERMINAL_PATTERNS: RegExp[] = [
+  /^Codex turn interruption unconfirmed:/i,
+  /^codex app-server (?:stopped|exited|stdin is unavailable|stdout (?:is unavailable|closed))/i,
   /no rollout found for thread id/i,
   /does not exist/i,
   /cancelled by user/i,
@@ -55,6 +57,17 @@ const TERMINAL_PATTERNS: RegExp[] = [
   /schema/i,
   /invalid normalization output/i,
   /approval (?:denied|rejected|required)/i,
+  /\b(?:permission|access)\s+denied\b/i,
+  /\b(?:unauthorized|forbidden)\b/i,
+  /\b(?:HTTP\s*)?(?:401|403)\b/i,
+  /\b(?:authentication|authorization)\s+(?:failed|denied|required)\b/i,
+  /\binvalid\s+(?:api[_\s-]?key|access[_\s-]?token)\b/i,
+];
+
+const MODEL_FAILURE_PATTERNS: RegExp[] = [
+  /\bcodex run failed\b/i,
+  /\bturn failed\b/i,
+  /model (?:run|execution) failed/i,
 ];
 
 /** True when `text` names a TEMPORARY upstream condition worth retrying. */
@@ -75,15 +88,58 @@ export function transientReason(text: string | undefined | null): string | undef
   return "upstream unavailable";
 }
 
+/**
+ * A model can finish a turn with no visible output even when the upstream
+ * diagnostic is only the generic `turn failed`/`Codex run failed`. Those
+ * failures are safe to continue on the same thread, but must stay separate
+ * from the long transient backoff loop so a broken model does not consume
+ * tokens for twenty minutes.
+ */
+export function isRecoverableModelFailure(
+  input: unknown,
+): boolean {
+  const objectInput = typeof input === "object" && input !== null ? input as Record<string, unknown> : undefined;
+  const explicit = objectInput?.recoverableModelFailure === true;
+  const value = typeof input === "string" ? input : typeof objectInput?.message === "string" ? objectInput.message : "";
+  if (value.length === 0) return explicit;
+  if (TERMINAL_PATTERNS.some((pattern) => pattern.test(value))) return false;
+  // The model waiter has requested interruption of this known turn. Keep this
+  // separate from control-RPC timeouts and from repeated transient backoff.
+  if (/^Codex turn timed out:\s+\S+$/i.test(value.trim())) return true;
+  if (isTransientFailure(value)) return true;
+  if (explicit) return true;
+  if (!MODEL_FAILURE_PATTERNS.some((pattern) => pattern.test(value))) return false;
+  // `turn failed` is only a recoverable signal when it is the whole
+  // diagnostic. If the upstream supplied a different concrete explanation
+  // (for example an unreadable workspace), do not downgrade that terminal
+  // failure just because the protocol also appends the generic reason.
+  const detail = value
+    .replace(/codex run failed|model (?:run|execution) failed|turn failed/gi, " ")
+    .replace(/[{}[\](),":]/g, " ")
+    .replace(/\b(?:message|error|reason|code)\b/gi, " ")
+    .trim();
+  return detail.length === 0;
+}
+
+/** Terminal details take precedence over a generic envelope supplied by a CLI. */
+export function isTerminalModelFailure(text: string): boolean {
+  return TERMINAL_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 export interface BackoffPolicy {
   /** First (and exponential base) delay. */
   baseMs: number;
   /** Per-attempt delay ceiling. */
   maxMs: number;
-  /** Total wall-clock budget for one operation's retries. */
+  /** Total elapsed-time budget for one operation's retries. */
   budgetMs: number;
   /** ±fraction applied to every delay (default 0.25). 0 disables jitter. */
   jitterRatio?: number;
+}
+
+/** Monotonic process-local milliseconds for retry budgets. */
+export function retryClockNow(): number {
+  return performance.now();
 }
 
 /** Injectable seams: tests assert the exact sequence instead of sleeping. */
@@ -124,11 +180,13 @@ export function normalizeBackoff(policy: Partial<BackoffPolicy> | undefined): Ba
 
 /** Exponential delay for `attempt` (0-based) with bounded jitter. */
 export function backoffDelayMs(attempt: number, policy: BackoffPolicy, random: () => number = Math.random): number {
-  const ceiling = Math.max(1, Math.min(policy.maxMs, policy.baseMs * 2 ** Math.max(0, attempt)));
+  const maxDelayMs = Math.max(1, Math.floor(policy.maxMs));
+  const ceiling = Math.max(1, Math.min(maxDelayMs, policy.baseMs * 2 ** Math.max(0, attempt)));
   const ratio = policy.jitterRatio ?? DEFAULT_BACKOFF.jitterRatio;
   if (ratio <= 0) return Math.round(ceiling);
   const factor = 1 + ratio * (random() * 2 - 1);
-  return Math.max(1, Math.round(ceiling * factor));
+  // Positive jitter and millisecond rounding must obey the final delay cap.
+  return Math.min(maxDelayMs, Math.max(1, Math.round(ceiling * factor)));
 }
 
 export class TransientRetryExhaustedError extends Error {
@@ -156,7 +214,7 @@ export async function retryTransient<T>(
   hooks: BackoffHooks = {},
   signal?: AbortSignal,
 ): Promise<T> {
-  const now = hooks.now ?? Date.now;
+  const now = hooks.now ?? retryClockNow;
   const sleep = hooks.sleep ?? defaultSleep;
   const random = hooks.random ?? Math.random;
   const deadline = now() + policy.budgetMs;
@@ -173,6 +231,10 @@ export async function retryTransient<T>(
         throw new TransientRetryExhaustedError(reason, attempt + 1, error);
       }
       await sleep(delayMs, signal);
+      // Timer delivery can be later than requested. Cancellation retains its
+      // original cause; an exhausted wake-up never admits another operation.
+      throwIfAborted(signal);
+      if (now() >= deadline) throw new TransientRetryExhaustedError(reason, attempt + 1, error);
       attempt += 1;
     }
   }
@@ -210,9 +272,17 @@ function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
  */
 export function compactDiagnostic(text: string, maxBytes = 2048): string {
   const value = text.trim();
-  if (value.length <= maxBytes) return value;
-  const headBytes = Math.max(1, Math.floor((maxBytes - 40) / 2));
-  const tailBytes = Math.max(1, maxBytes - 40 - headBytes);
-  const omitted = value.length - headBytes - tailBytes;
-  return `${value.slice(0, headBytes)}\n…[${omitted} bytes omitted]…\n${value.slice(value.length - tailBytes)}`;
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  const bytes = Buffer.from(value, "utf8");
+  const marker = (omitted: number) => `\n…[${omitted} bytes omitted]…\n`;
+  // Reserving the full source byte count bounds the marker's digit width.
+  const available = maxBytes - Buffer.byteLength(marker(bytes.length), "utf8");
+  const headBudget = available > 0 ? Math.floor(available / 2) : maxBytes;
+  let headEnd = headBudget;
+  while (headEnd > 0 && (bytes[headEnd]! & 0xc0) === 0x80) headEnd -= 1;
+  // Very small budgets cannot hold a marker; return only a complete prefix.
+  if (available <= 0) return bytes.toString("utf8", 0, headEnd);
+  let tailStart = bytes.length - (available - headBudget);
+  while ((bytes[tailStart]! & 0xc0) === 0x80) tailStart += 1;
+  return `${bytes.toString("utf8", 0, headEnd)}${marker(tailStart - headEnd)}${bytes.toString("utf8", tailStart)}`;
 }
