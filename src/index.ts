@@ -17,7 +17,7 @@ import { WorkflowStore } from "./store.js";
 import { createWorkflowTools, workflowToolTimeouts } from "./tools.js";
 import type { WorkflowConfig } from "./types.js";
 import { WorkflowManager } from "./workflow.js";
-import { codexWorkflowProjectionDefinition } from "./review-events.js";
+import { codexWorkflowProjectionDefinition, registerCodexWorkflowSessionEventTypes } from "./review-events.js";
 import { CodexChildSessionFactory } from "./codex-child-session.js";
 import type {} from "@deepseek-ai/dsh-subagent";
 
@@ -30,6 +30,7 @@ export const Config = ConfigSchema;
 export type Config = RawConfig;
 
 export async function apply(ctx: Context, raw: Config): Promise<void> {
+  registerCodexWorkflowSessionEventTypes();
   const config = resolveConfig(raw);
   workflowToolTimeouts(config);
   const projections = ctx.get("sessionProjections") as { register(definition: typeof codexWorkflowProjectionDefinition): () => void } | undefined;
@@ -115,25 +116,45 @@ export async function apply(ctx: Context, raw: Config): Promise<void> {
     const disposedListener = ctx.on("agent/disposed", () => void runtime.refreshSessions().catch(() => undefined));
     runtime.start();
     return async () => {
-      disposeProjection();
-      childFactory.unregisterProvider();
-      await runtime.stop();
-      stopListener();
-      createdListener();
-      disposedListener();
-      for (const dispose of disposers.reverse()) dispose();
-      autoTriggerDisposer();
+      let firstError: unknown;
+      let hasError = false;
+      const attempt = async (step: () => unknown | Promise<unknown>): Promise<void> => {
+        try {
+          await step();
+        } catch (error) {
+          if (!hasError) {
+            firstError = error;
+            hasError = true;
+          }
+        }
+      };
+      // Teardown is best effort across independent resources. Preserve the
+      // first failure for the host, but never let one rejected disposer skip
+      // the remaining callbacks, transports or SQLite handles.
+      await attempt(() => disposeProjection());
+      await attempt(() => childFactory.unregisterProvider());
+      await attempt(() => runtime.stop());
+      await attempt(() => stopListener());
+      await attempt(() => createdListener());
+      await attempt(() => disposedListener());
+      for (const dispose of disposers.reverse()) await attempt(() => dispose());
+      await attempt(() => autoTriggerDisposer());
       // Manager teardown blocks new callback sends, aborts in-flight recovery
       // and its backoff, then cancels and awaits every Reviewer operation.
-      await manager.stop();
-      await callback.stop();
-      await disposeModelCatalogRoute?.();
-      await audit.stop();
-      await codex.stop();
-      await callback.stop();
-      await manager.stop();
-      bridgeStore.close();
-      store.close();
+      await attempt(() => manager.stop());
+      await attempt(() => callback.stop());
+      await attempt(() => disposeModelCatalogRoute?.());
+      await attempt(() => audit.stop());
+      await attempt(() => codex.stop());
+      // The first stop can deliberately retain terminal cleanup when the
+      // original App Server process is still alive. Reconcile those retained
+      // resources after the SDK has observed process exit; these calls are
+      // cleanup-only and must remain after codex.stop().
+      await attempt(() => callback.stop());
+      await attempt(() => manager.stop());
+      await attempt(() => bridgeStore.close());
+      await attempt(() => store.close());
+      if (hasError) throw firstError;
     };
   });
 }

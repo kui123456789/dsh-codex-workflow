@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { closeCoordinationStoresForDirectory } from "../src/coordination.js";
+import { closeCoordinationStoresForDirectory, CoordinationStore } from "../src/coordination.js";
 import { WorkflowStore } from "../src/store.js";
 import type { WorkflowRecord } from "../src/types.js";
 
@@ -191,6 +191,115 @@ test("loads records written before the review gate (missing mode, noChangeReview
   }
 });
 
+test("concurrent first lists wait for the same legacy import", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-legacy-concurrent-"));
+  try {
+    const legacy = {
+      schemaVersion: 1,
+      id: "zzzz-legacy-target",
+      dshSessionId: "session-legacy-concurrent",
+      cwd: process.cwd(),
+      task: "legacy concurrent import",
+      phase: "executing",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-02T00:00:00.000Z",
+      assumptions: [],
+      questions: [],
+      reviewCycles: 0,
+    };
+    await Promise.all([
+      ...Array.from({ length: 128 }, (_, index) =>
+        writeFile(join(directory, `legacy-noise-${index.toString().padStart(3, "0")}.json`), "not json\n", "utf8")),
+      writeFile(join(directory, "zzzz-legacy-target.json"), `${JSON.stringify(legacy)}\n`, "utf8"),
+    ]);
+    const store = new WorkflowStore(directory);
+    const [first, second] = await Promise.all([store.list(), store.list()]);
+    assert.equal(first.some((record) => record.id === legacy.id), true);
+    assert.equal(second.some((record) => record.id === legacy.id), true);
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("legacy workflow import retries a one-shot coordination failure and skips malformed records", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-legacy-retry-"));
+  try {
+    const legacy = {
+      schemaVersion: 1,
+      id: "legacy-retry-target",
+      dshSessionId: "session-legacy-retry",
+      cwd: process.cwd(),
+      task: "legacy retry after coordination failure",
+      phase: "executing",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-02T00:00:00.000Z",
+      assumptions: [],
+      questions: [],
+      reviewCycles: 0,
+    };
+    await Promise.all([
+      writeFile(join(directory, "000-malformed.json"), "not json\n", "utf8"),
+      writeFile(join(directory, `${legacy.id}.json`), `${JSON.stringify(legacy)}\n`, "utf8"),
+    ]);
+
+    const store = new WorkflowStore(directory);
+    const coordination = store.coordinationHandle;
+    const originalInsert = coordination.insertWorkflowIfAbsent.bind(coordination);
+    const mutable = coordination as unknown as {
+      insertWorkflowIfAbsent: (...args: Parameters<CoordinationStore["insertWorkflowIfAbsent"]>) => boolean;
+    };
+    let failed = false;
+    mutable.insertWorkflowIfAbsent = (...args) => {
+      if (!failed) {
+        failed = true;
+        const error = new Error("legacy workflow migration failed once") as NodeJS.ErrnoException;
+        error.code = "SQLITE_BUSY";
+        throw error;
+      }
+      return originalInsert(...args);
+    };
+
+    await assert.rejects(store.list(), /legacy workflow migration failed once/);
+    const records = await store.list();
+    assert.equal(records.some((record) => record.id === legacy.id), true);
+    assert.equal(records.length, 1, "malformed records remain skipped");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("legacy import never overwrites a workflow row created by another store", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-legacy-no-clobber-"));
+  try {
+    const legacy = {
+      schemaVersion: 1,
+      id: "legacy-no-clobber",
+      dshSessionId: "session-legacy-no-clobber",
+      cwd: process.cwd(),
+      task: "legacy task",
+      phase: "executing",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-02T00:00:00.000Z",
+      assumptions: [],
+      questions: [],
+      reviewCycles: 0,
+    };
+    await writeFile(join(directory, `${legacy.id}.json`), `${JSON.stringify(legacy)}\n`, "utf8");
+    const first = new WorkflowStore(directory);
+    const second = new WorkflowStore(directory);
+    await first.init();
+    await second.save({ ...legacy, task: "newer SQLite task", updatedAt: "2026-01-03T00:00:00.000Z" } as WorkflowRecord);
+    const imported = await (first as unknown as { importLegacyFile(id: string): Promise<WorkflowRecord | undefined> })
+      .importLegacyFile(legacy.id);
+    assert.equal(imported?.task, "newer SQLite task");
+    assert.equal((await first.load(legacy.id))?.task, "newer SQLite task");
+    first.close();
+    second.close();
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
 test("rejects records with an unknown phase", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-badphase-"));
   try {
@@ -319,7 +428,7 @@ test("workflow store creates a pre-schema-v2 database backup before opening an e
   }
 });
 
-test("workflow store fails closed when the pre-schema-v2 backup cannot be written", async (t) => {
+test("workflow store fails closed when the pre-schema-v2 backup cannot be written", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-schema-backup-failure-"));
   try {
     const first = new WorkflowStore(directory);
@@ -329,6 +438,117 @@ test("workflow store fails closed when the pre-schema-v2 backup cannot be writte
       copyFile: async () => { throw new Error("backup destination is unavailable"); },
     });
     await assert.rejects(second.init(), /backup destination is unavailable/);
+    second.close();
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("workflow store retries a failed pre-schema-v2 backup on the same instance", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-schema-backup-retry-"));
+  try {
+    const first = new WorkflowStore(directory);
+    await first.init();
+    first.close();
+    let attempts = 0;
+    const second = new WorkflowStore(directory, {
+      copyFile: async (source, destination) => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("backup destination is temporarily unavailable");
+        await copyFile(source, destination);
+      },
+    });
+    await assert.rejects(second.init(), /temporarily unavailable/);
+    await second.init();
+    assert.equal(attempts, 2);
+    await access(join(directory, "coord.sqlite.pre-schema-v2.bak"));
+    second.close();
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("workflow store shares an in-flight pre-schema-v2 backup across concurrent init calls", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-schema-backup-concurrent-"));
+  try {
+    const first = new WorkflowStore(directory);
+    await first.init();
+    first.close();
+    let copies = 0;
+    let releaseCopy!: () => void;
+    let copyStarted!: () => void;
+    const copyGate = new Promise<void>((resolve) => { releaseCopy = resolve; });
+    const started = new Promise<void>((resolve) => { copyStarted = resolve; });
+    const second = new WorkflowStore(directory, {
+      copyFile: async (source, destination) => {
+        copies += 1;
+        copyStarted();
+        await copyGate;
+        await copyFile(source, destination);
+      },
+    });
+    const firstInit = second.init();
+    await started;
+    const secondInit = second.init();
+    let secondResolved = false;
+    void secondInit.then(() => { secondResolved = true; });
+    await Promise.resolve();
+    assert.equal(secondResolved, false, "the second init waits for the first backup");
+    releaseCopy();
+    await Promise.all([firstInit, secondInit]);
+    assert.equal(copies, 1, "concurrent init calls copy the pre-migration database once");
+    await access(join(directory, "coord.sqlite.pre-schema-v2.bak"));
+    second.close();
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("independent workflow stores create one complete non-overwriting pre-schema backup", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-schema-backup-independent-"));
+  try {
+    const seed = new WorkflowStore(directory);
+    await seed.init();
+    seed.close();
+    const source = await readFile(join(directory, "coord.sqlite"));
+    const firstBytes = Buffer.concat([source, Buffer.from("\nfirst-candidate\n")]);
+    const secondBytes = Buffer.concat([source, Buffer.from("\nsecond-candidate\n")]);
+    let releaseFirst!: () => void;
+    let firstStarted!: () => void;
+    let releaseSecond!: () => void;
+    let secondStarted!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    const firstReady = new Promise<void>((resolve) => { firstStarted = resolve; });
+    const secondReady = new Promise<void>((resolve) => { secondStarted = resolve; });
+    const first = new WorkflowStore(directory, {
+      copyFile: async (_source, destination) => {
+        await writeFile(destination, firstBytes);
+        firstStarted();
+        await firstGate;
+      },
+    });
+    const second = new WorkflowStore(directory, {
+      copyFile: async (_source, destination) => {
+        await writeFile(destination, secondBytes);
+        secondStarted();
+        await secondGate;
+      },
+    });
+
+    const firstInit = first.init();
+    const secondInit = second.init();
+    await Promise.all([firstReady, secondReady]);
+    releaseFirst();
+    await firstInit;
+    releaseSecond();
+    await secondInit;
+
+    const backupPath = join(directory, "coord.sqlite.pre-schema-v2.bak");
+    assert.deepEqual(await readFile(backupPath), firstBytes, "the first atomic installer wins without being overwritten");
+    const leftovers = (await readdir(directory)).filter((name) => name.startsWith("coord.sqlite.pre-schema-v2.bak.") && name.endsWith(".tmp"));
+    assert.deepEqual(leftovers, [], "temporary backup files are cleaned up");
+    first.close();
     second.close();
   } finally {
     await rmClosed(directory);

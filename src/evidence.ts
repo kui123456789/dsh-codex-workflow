@@ -326,10 +326,6 @@ class DiffCapturer {
     return Buffer.concat(this.chunks);
   }
 
-  get size(): number {
-    return this.capturedBytes;
-  }
-
   get total(): number {
     return this.totalBytes;
   }

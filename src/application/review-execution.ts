@@ -499,14 +499,7 @@ export class ReviewExecution {
       // status`/`git diff`) and the item-by-item coverage gate — a native
       // review turn sees these directly, so the verdict never depends on
       // hidden thread settings.
-      // Capture the PERSISTED-turn baseline BEFORE the native review turn
-      // starts: the appended (newly-persisted) turn will be detected against
-      // these ids, because the `review/start` RPC turn id is NOT guaranteed
-      // to equal the persisted `thread.turns[].id` (real App Server
-      // evidence). The baseline read is metadata-only and never touches the
-      // thread's writer.
       if (!checkpoint) {
-        const reviewBaseline = undefined;
         // 1.1.2: the visible review turn runs through the SAME transient-retry
         // wrapper as every other visible turn (1.1.1 parity on the App Server
         // path). A retried attempt re-registers its own turn, so the active-turn
@@ -642,10 +635,6 @@ export class ReviewExecution {
         // contain the four required sections and follow the task language. A
         // display violation gets one corrective turn on the SAME ephemeral
         // Reviewer; the corrected text becomes the input to conversion.
-        if (review.result.kind !== "completed" || review.result.status !== "completed") {
-          if (review.result.kind !== "completed") throw new Error("review unexpectedly requested user input");
-          throw new Error(`${review.result.reason ?? `review turn ${review.result.status}`}${review.result.error ? `: ${review.result.error}` : ""}`);
-        }
         let authoritativeText = review.result.text ?? "";
         visibleReviewText = authoritativeText;
         const displayError = reviewDisplayError(authoritativeText, current);
@@ -656,10 +645,6 @@ export class ReviewExecution {
           if (authoritativeText.trim().length === 0) {
             throw new Error(`review is empty`);
           }
-          // Baseline BEFORE the rewrite turn, exactly like the native turn: the
-          // rewrite's persisted output is detected as an APPENDED turn, never by
-          // assuming the `turn/start` RPC id equals the persisted rollout id.
-          const rewriteBaseline = undefined;
           await this.ctx.reviewObservation.mark(workflowId, "review_display_rewrite", "Rewriting Reviewer display output", null);
           const rewrite = await this.ctx.startTurnWithTransientRetry(reviewerThreadId, {
             ...(reviewerThreadOwner ? { expectedOwner: reviewerThreadOwner } : {}),

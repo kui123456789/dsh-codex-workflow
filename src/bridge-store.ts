@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import {
   BRIDGE_MAX_PAYLOAD_BYTES,
-  isPlainObject,
   parseBridgeCommand,
   type BridgeCommand,
 } from "./bridge-protocol.js";
@@ -15,7 +14,6 @@ import {
 import { LegacyQueueImporter } from "./infrastructure/legacy-queue-import.js";
 
 export const BRIDGE_QUEUE_DIRS = ["inbox", "processing", "retry", "receipts", "dead-letter"] as const;
-export type BridgeQueueDir = (typeof BRIDGE_QUEUE_DIRS)[number];
 
 export interface BridgeReceipt {
   requestId: string;

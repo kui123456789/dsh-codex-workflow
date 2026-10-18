@@ -12,7 +12,7 @@ import { CodexAppServerClient } from "../src/app-server.js";
 import { CodexChildSessionFactory } from "../src/codex-child-session.js";
 import type { WorkflowRuntimeState } from "../src/application/workflow-runtime-state.js";
 import { WorkflowStore } from "../src/store.js";
-import type { WorkflowConfig, WorkflowRecord } from "../src/types.js";
+import type { WorkflowConfig } from "../src/types.js";
 import { WorkflowManager } from "../src/workflow.js";
 
 type Stage = "planning" | "reviewing";

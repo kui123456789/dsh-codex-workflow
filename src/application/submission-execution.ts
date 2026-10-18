@@ -1,4 +1,3 @@
-import type { ToolRunContext } from "@deepseek-ai/dsh-tools";
 import type { WorkflowStore } from "../store.js";
 import type { CodexCallback, ManagerLease } from "../workflow.js";
 import { CodexCallbackProcessError, CodexInvalidThreadError, CodexNoVerdictError } from "../codex-callback.js";
@@ -7,8 +6,8 @@ import { ReviewerGateway } from "./app-server/reviewer-gateway.js";
 import { ReviewObservation } from "./review-observation.js";
 import type { WorkflowRuntimeState } from "./workflow-runtime-state.js";
 import { transientReason } from "../transient-retry.js";
-import type { ReviewConflictInfo, ReviewInput, ReviewResult, ReviewStep, SubmissionState, WorkflowConfig, WorkflowPhase, WorkflowRecord } from "../types.js";
-import { applyReviewConsistency, abortError, callbackRecoveryDelay, delay, errorMessage, submissionTerminal } from "../workflow.js";
+import type { ReviewConflictInfo, ReviewResult, ReviewStep, WorkflowConfig, WorkflowPhase, WorkflowRecord } from "../types.js";
+import { applyReviewConsistency, abortError, callbackRecoveryDelay, delay, submissionTerminal } from "../workflow.js";
 import type { CodexReviewEndEvent } from "../review-events.js";
 import type { LiveRelay } from "./live-relay.js";
 import { collectEvidence } from "../evidence.js";
@@ -264,17 +263,16 @@ export class SubmissionExecution {
               ephemeral: true,
               ...(callbackModel ? { model: callbackModel } : {}),
               effort: callbackEffort,
-              onThread: async (threadId) => {
+              onThread: async () => {
                 const registered = await updateCurrent((r) => {
                   // Ephemeral Reviewer ids are process-local and must never be
                   // persisted as Desktop-visible durable bindings.
                   r.reviewerThreadOrigin = "app-server-ephemeral";
                 });
-                void threadId;
                 if (registered.submissionId !== submissionId) throw new Error("submission no longer owns the reviewer thread");
                 originalRegistered = true;
               },
-              onStarted: async ({ threadId, turnId }) => {
+              onStarted: async ({ turnId }) => {
                 const registered = await updateCurrent((r) => {
                   r.reviewerTurnId = turnId;
                   r.activeTurnId = turnId;

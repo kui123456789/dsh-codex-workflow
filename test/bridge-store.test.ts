@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { newRequestId, parseBridgeCommand, type DispatchPlanCommand } from "../src/bridge-protocol.js";
-import { BridgeStore, type ClaimedBridgeCommand } from "../src/bridge-store.js";
+import { BridgeStore, commandHash, type ClaimedBridgeCommand } from "../src/bridge-store.js";
 import { CoordinationStore, closeCoordinationStoresForDirectory, coordinationPath } from "../src/coordination.js";
 
 async function rmClosed(path: string): Promise<void> {
@@ -36,20 +36,6 @@ function plan(overrides: Partial<DispatchPlanCommand> = {}): DispatchPlanCommand
     task: "实现功能",
     planMarkdown: "<proposed_plan>\n计划\n</proposed_plan>",
     assumptions: [],
-    ...overrides,
-  };
-}
-
-function verdictCommand(overrides: Record<string, unknown> = {}): DispatchPlanCommand | Record<string, unknown> {
-  return {
-    version: 1,
-    kind: "submit_verdict",
-    requestId: uuid(),
-    createdAt: new Date().toISOString(),
-    workflowId: "wf-1",
-    codexThreadId: uuid(),
-    submissionId: uuid(),
-    verdict: { verdict: "pass", findings: [], testGaps: [], summary: "ok" },
     ...overrides,
   };
 }
@@ -483,6 +469,71 @@ test("legacy file-queue envelopes are imported on init", async () => {
   }
 });
 
+test("concurrent first queue reads wait for the same legacy import", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-bridge-store-legacy-concurrent-"));
+  try {
+    const { mkdir } = await import("node:fs/promises");
+    const inbox = join(directory, "bridge", "inbox");
+    await mkdir(inbox, { recursive: true });
+    const commandA = plan({ task: "concurrent legacy import A" });
+    const commandB = plan({ task: "concurrent legacy import B" });
+    await Promise.all([
+      ...Array.from({ length: 128 }, (_, index) =>
+        writeFile(join(inbox, `legacy-noise-${index.toString().padStart(3, "0")}.json`), "not json\n", "utf8")),
+      writeFile(join(inbox, `${commandA.requestId}.json`), `${JSON.stringify({ command: commandA, attempts: 0 })}\n`, "utf8"),
+      writeFile(join(inbox, `${commandB.requestId}.json`), `${JSON.stringify({ command: commandB, attempts: 0 })}\n`, "utf8"),
+    ]);
+    const store = new BridgeStore(directory);
+    const [first, second] = await Promise.all([
+      store.claimNext("concurrent-owner-a"),
+      store.claimNext("concurrent-owner-b"),
+    ]);
+    const claims = [first, second].filter((claim): claim is ClaimedBridgeCommand => Boolean(claim));
+    assert.equal(claims.length, 2);
+    assert.deepEqual(new Set(claims.map((claim) => claim.command.requestId)), new Set([commandA.requestId, commandB.requestId]));
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("legacy queue import retries a one-shot coordination failure and skips malformed records", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-bridge-store-legacy-retry-"));
+  try {
+    const { mkdir } = await import("node:fs/promises");
+    const inbox = join(directory, "bridge", "inbox");
+    await mkdir(inbox, { recursive: true });
+    const command = plan({ task: "legacy retry after coordination failure" });
+    await Promise.all([
+      writeFile(join(inbox, "000-malformed.json"), "not json\n", "utf8"),
+      writeFile(join(inbox, `${command.requestId}.json`), `${JSON.stringify({ command, attempts: 0 })}\n`, "utf8"),
+    ]);
+
+    const store = new BridgeStore(directory);
+    const coordination = store.coordinationHandle;
+    const originalImport = coordination.importLegacyRow.bind(coordination);
+    const mutable = coordination as unknown as {
+      importLegacyRow: (...args: Parameters<CoordinationStore["importLegacyRow"]>) => void;
+    };
+    let failed = false;
+    mutable.importLegacyRow = (...args) => {
+      if (!failed) {
+        failed = true;
+        const error = new Error("legacy queue migration failed once") as NodeJS.ErrnoException;
+        error.code = "SQLITE_BUSY";
+        throw error;
+      }
+      originalImport(...args);
+    };
+
+    await assert.rejects(store.init(), /legacy queue migration failed once/);
+    await store.init();
+    assert.equal(coordination.queueRow(command.requestId)?.status, "inbox");
+    assert.equal(coordination.queueRowsByStatus("inbox").length, 1, "malformed records remain skipped");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
 /** Migration must preserve legacy receipts (which are receipts, not envelopes)
  * and envelope fields: attempts, lastError, nextAttemptAt, deadLetterAt. */
 test("legacy migration preserves receipts and retry semantics", async () => {
@@ -524,6 +575,56 @@ test("legacy migration preserves receipts and retry semantics", async () => {
     assert.equal(claim.command.requestId, retryCommand.requestId);
     assert.equal(claim.attempts, 4, "legacy attempts preserved");
     assert.equal(claim.lastError, "busy: 429");
+  } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("legacy receipt completes an already-imported queue row and suppresses re-delivery", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-bridge-store-legacy-receipt-collision-"));
+  try {
+    const command = plan({ task: "partial legacy import" });
+    const bridgeDir = join(directory, "bridge");
+    await import("node:fs/promises").then(({ mkdir }) => Promise.all([
+      mkdir(join(bridgeDir, "inbox"), { recursive: true }),
+      mkdir(join(bridgeDir, "receipts"), { recursive: true }),
+    ]));
+    await writeFile(
+      join(bridgeDir, "inbox", `${command.requestId}.json`),
+      JSON.stringify({ command, attempts: 2 }),
+      "utf8",
+    );
+
+    const first = new BridgeStore(directory);
+    await first.init();
+    assert.equal(first.coordinationHandle.queueRow(command.requestId)?.status, "inbox");
+
+    const receipt = {
+      requestId: command.requestId,
+      status: "delivered",
+      workflowId: "wf-legacy",
+      deliveredAt: new Date().toISOString(),
+    };
+    await writeFile(
+      join(bridgeDir, "receipts", `${command.requestId}.json`),
+      JSON.stringify(receipt),
+      "utf8",
+    );
+    first.close();
+
+    const second = new BridgeStore(directory);
+    await second.init();
+    const row = second.coordinationHandle.queueRow(command.requestId);
+    assert.ok(row);
+    assert.equal(row!.status, "done");
+    assert.equal(row!.attempts, 2);
+    assert.equal(row!.commandHash, commandHash(command));
+    assert.equal(row!.commandJson, JSON.stringify(command));
+    assert.equal(row!.claimOwner, "");
+    assert.equal(row!.claimUntil, 0);
+    assert.equal(await second.claimNext("legacy-receipt-consumer"), undefined);
+    assert.deepEqual(await second.receipt(command.requestId), receipt);
+    second.close();
   } finally {
     await rmClosed(directory);
   }

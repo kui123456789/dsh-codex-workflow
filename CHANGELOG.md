@@ -2,7 +2,17 @@
 
 All notable changes to `dsh-codex-workflow`.
 
-## Unreleased
+## [1.1.14] - 2026-10-18
+
+- Harden bridge verdict delivery: retry evidence validation and post-relay bookkeeping failures, preserve reclaimable claims when retry persistence fails, and restore the terminal relay watchdog after receipt recovery without repeating the relay.
+- Retry legacy workflow and queue imports after I/O or SQLite failures without treating them as completed migrations; retain malformed-file isolation. Imported receipts complete existing queue rows so they cannot be delivered again.
+- Publish pre-schema backups atomically from unique temporary files without overwriting a backup won by another store. Keep backup failures closed and retryable.
+- Complete independent teardown steps even if an earlier disposer fails, preserving the first error and the original process ownership checks.
+- Compare native child identity instead of numeric PID inequality in initialization recovery tests, allowing operating-system PID reuse.
+- Retain the DSH 0.1.7-rc.2 development baseline while declaring the exact 0.2.0-rc.2 and 0.2.1-rc.2 peer alternatives. Synchronize release checks and register workflow event types before persisted host replay.
+- Add a source-checkout visual demo for planning, execution, review, and same-thread recovery; it uses simulated events and makes no model calls.
+
+The following accumulated reliability changes are included in this release:
 
 - Scope same-thread Reviewer continuation to failures raised by an actual model call. Progress, checkpoint and storage errors that only resemble a transient transport diagnostic now terminate the current round without issuing another model turn; explicit upstream model-failure markers remain recoverable.
 

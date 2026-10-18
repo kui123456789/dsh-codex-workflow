@@ -334,7 +334,6 @@ export class CodexAppServerClient {
    * of leaving them to time out against a closed process/store. */
   private readonly turnWaitersList = new Map<(error: Error, cleanupOnly?: boolean) => void, TurnRegistration>();
   private child?: ChildProcess;
-  private starting?: Promise<void>;
   private initialization?: InitializationFlight;
   /** Teardown latch: once `stop()` has begun, no new `start()`/request may
    * spawn the App Server again. Set synchronously at the START of the first
@@ -427,10 +426,8 @@ export class CodexAppServerClient {
       flight.settled = true;
       if (this.initialization === flight) {
         this.initialization = undefined;
-        this.starting = undefined;
       }
     });
-    this.starting = flight.promise;
     return this.waitForInitialization(flight, signal);
   }
 

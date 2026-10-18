@@ -33,6 +33,22 @@ export class WorkflowRepositorySql {
     }
   }
 
+  /** Insert a legacy row only when no current workflow owns the id. */
+  insertWorkflowIfAbsent(id: string, recordJson: string, now = Date.now()): boolean {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.db.prepare(
+        `INSERT INTO workflows (id, revision, record_json, updated_at) VALUES (?, 1, ?, ?)
+         ON CONFLICT(id) DO NOTHING`,
+      ).run(id, recordJson, now);
+      this.db.exec("COMMIT");
+      return Number(result.changes) === 1;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   compareAndUpdateWorkflow<T>(
     id: string,
     expectedRevision: number,

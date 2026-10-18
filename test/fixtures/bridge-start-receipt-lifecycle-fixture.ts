@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { WorkflowConfig, WorkflowRecord } from "../../src/types.js";
+import type { WorkflowConfig } from "../../src/types.js";
 import { WorkflowManager } from "../../src/workflow.js";
 import { WorkflowStore } from "../../src/store.js";
 import { AppServerCodexCallbackDispatcher } from "../../src/app-server-callback.js";

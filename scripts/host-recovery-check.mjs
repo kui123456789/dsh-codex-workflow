@@ -10,7 +10,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { CodexChildSessionFactory, codexSubagentChatAddress } from "../lib/codex-child-session.js";
-import { codexWorkflowProjectionDefinition } from "../lib/review-events.js";
+import { codexWorkflowProjectionDefinition, registerCodexWorkflowSessionEventTypes } from "../lib/review-events.js";
 import { WorkflowStore } from "../lib/store.js";
 import { createWorkflowTools } from "../lib/tools.js";
 import { WorkflowManager } from "../lib/workflow.js";
@@ -31,6 +31,7 @@ const [cordis, prompts, tools, agents, sessions, projections, subagents, llm, pe
   loadHost("@deepseek-ai/dsh-session-persistence-jsonl"),
 ]);
 const hostVersion = JSON.parse(await readFile(hostPackage, "utf8")).version;
+registerCodexWorkflowSessionEventTypes(sessions.KNOWN_SESSION_EVENT_TYPES);
 const PLAN = [
   "# Goal", "Add a local health check that reports configuration and storage status.",
   "# Changes", "- Inspect configuration through a read-only adapter and report readable failures.",

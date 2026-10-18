@@ -45,17 +45,6 @@ export interface ReviewConflictEntry {
   highSeverityException: boolean;
 }
 
-/** Durable audit of the most recent authority-alignment conflict. */
-export interface ReviewConflictInfo {
-  conflicts: ReviewConflictEntry[];
-  /** True when ONE visible reconciliation turn ran on the same Codex task. */
-  reconciled: boolean;
-  /** True when the reconciliation re-alignment ended aligned (the corrected
-   * verdict was applied). An unresolved conflict never touches `latestReview`. */
-  resolved: boolean;
-  at: string;
-}
-
 /** Internal result of the alignment fork. */
 export interface AlignmentOutcome {
   aligned: boolean;

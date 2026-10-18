@@ -12,7 +12,7 @@ import type { WorkflowRuntimeState } from "../src/application/workflow-runtime-s
 import { newRequestId, type BridgeCommand, type SubmitVerdictCommand } from "../src/bridge-protocol.js";
 import { collectEvidence } from "../src/evidence.js";
 import { WorkflowStore } from "../src/store.js";
-import type { ReviewInput, WorkflowConfig, WorkflowRecord } from "../src/types.js";
+import type { ReviewInput, WorkflowConfig } from "../src/types.js";
 import { WorkflowManager, type CodexCallback, type CodexGateway, type ManagerLease } from "../src/workflow.js";
 
 function gate() {

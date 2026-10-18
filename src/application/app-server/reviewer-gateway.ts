@@ -1,5 +1,3 @@
-import type { WorkflowConfig } from "../../types.js";
-
 export interface ReviewerGatewayPort {
   resumeThread(threadId: string, cwd: string, signal?: AbortSignal): Promise<void>;
   updateReviewerInstructions?(threadId: string, cwd: string, instructions: string, signal?: AbortSignal): Promise<void>;
@@ -10,7 +8,6 @@ export interface ReviewerGatewayPort {
   releaseThreadForExternal?(threadId: string, signal?: AbortSignal): Promise<void>;
   nameThread?(threadId: string, name: string, signal?: AbortSignal): Promise<void>;
 }
-
 export interface ReviewerStartOptions {
   expectedOwner?: object;
   cwd: string;
@@ -57,6 +54,3 @@ export class ReviewerGateway {
     return this.port.nameThread?.(threadId, name, signal);
   }
 }
-
-/** Keep the shared config shape available to future Reviewer flow adapters. */
-export type ReviewerEffort = WorkflowConfig["reviewerEffort"];

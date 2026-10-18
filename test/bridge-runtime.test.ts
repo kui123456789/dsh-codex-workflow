@@ -284,6 +284,54 @@ test("dispatch routes to the exact explicit session and delivers one followup", 
   }
 });
 
+test("a dispatch delivery commit failure retries after the relay without dead-lettering", async () => {
+  const h = await harness(5, 60_000, 2);
+  try {
+    const target = makeAgent("session-dispatch-commit-retry", "C:\\work");
+    h.registry.register(target);
+    const originalUpdate = h.workflowStore.update.bind(h.workflowStore);
+    let failOnce = true;
+    const command = dispatch({ target: { dshSessionId: target.id, cwd: target.cwd } });
+    const runtime = new BridgeRuntime(h.store, h.registry, {
+      pollMs: 5,
+      storageDir: join(h.directory, "storage"),
+      manager: h.manager,
+      workflowStore: h.workflowStore,
+      retryBaseMs: 60_000,
+      afterFollowupHook: async () => {
+        if (!failOnce) return;
+        failOnce = false;
+        const record = await h.workflowStore.byBridgeRequest(command.requestId);
+        assert.ok(record);
+        h.workflowStore.update = async (id, mutate, opts) => {
+          if (id === record.id) throw new Error("transient dispatch commit failure");
+          return originalUpdate(id, mutate, opts);
+        };
+      },
+    });
+    await h.store.enqueue(command);
+    await runtime.pump();
+    const row = h.store.coordinationHandle.queueRow(command.requestId)!;
+    assert.equal(row.status, "retry");
+    assert.equal(target.followups.length, 1);
+    assert.equal((await h.store.rowsByStatus("dead-letter")).some((item) => item.requestId === command.requestId), false);
+    const record = await h.workflowStore.byBridgeRequest(command.requestId);
+    assert.ok(record);
+    assert.equal(record.bridgeDeliveryState, "prepared");
+    h.workflowStore.update = originalUpdate;
+    h.store.coordinationHandle.db.prepare("UPDATE queue SET next_attempt_at = 0 WHERE request_id = ?").run(command.requestId);
+    await runtime.pump();
+    const receipt = await waitForReceipt(h.store, command.requestId);
+    assert.equal(receipt.status, "delivered");
+    assert.equal(target.followups.length, 1, "retry deduplicates the already landed plan relay");
+    assert.equal((await h.workflowStore.load(record.id))?.bridgeDeliveryState, "delivered");
+    await runtime.stop();
+  } finally {
+    await h.runtime.stop();
+    await rmClosed(h.directory);
+  }
+});
+
 /**
  * 1.1.3 (DSH 0.1.7 adaptation): the shared catch-all `plugin` message source is
  * gone — every producer augments `MessageSourceMap` in its own module. The
@@ -791,6 +839,62 @@ test("a terminal submission notice survives a relay crash and wakes the original
   }
 });
 
+test("a submission notice commit failure retries after the relay without dead-lettering", async () => {
+  const h = await harness(5, 60_000, 2);
+  try {
+    const workspace = await makeWorkspace(h.directory);
+    const target = makeAgent("session-notice-commit-retry", workspace);
+    h.registry.register(target);
+    const record = await h.manager.startExternalPlan({
+      version: 1,
+      kind: "dispatch_plan",
+      requestId: newRequestId(),
+      createdAt: new Date().toISOString(),
+      codexThreadId: newRequestId(),
+      target: { cwd: workspace, dshSessionId: target.id },
+      task: "Bridge task",
+      planMarkdown: "<proposed_plan>\nDo it\n</proposed_plan>",
+      assumptions: [],
+    }, target.agent);
+    const command = notice({
+      workflowId: record.id,
+      codexThreadId: record.codexThreadId!,
+      dshSessionId: target.id,
+    });
+    await h.workflowStore.update(record.id, (r) => {
+      r.submissionId = command.submissionId;
+      r.submissionState = "failed";
+      r.submissionError = command.message;
+      r.submissionNotice = { command, state: "prepared" };
+    });
+    const originalCommit = h.manager.commitSubmissionNoticeDelivery.bind(h.manager);
+    let failOnce = true;
+    h.manager.commitSubmissionNoticeDelivery = async (input) => {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error("transient notice commit failure");
+      }
+      return originalCommit(input);
+    };
+    await h.store.enqueue(command);
+    await h.runtime.pump();
+    const row = h.store.coordinationHandle.queueRow(command.requestId)!;
+    assert.equal(row.status, "retry");
+    assert.equal(target.followups.length, 1, "the notice lands before the commit failure");
+    assert.equal((await h.workflowStore.load(record.id))?.submissionNotice?.state, "prepared");
+    assert.equal((await h.store.rowsByStatus("dead-letter")).some((item) => item.requestId === command.requestId), false);
+    h.store.coordinationHandle.db.prepare("UPDATE queue SET next_attempt_at = 0 WHERE request_id = ?").run(command.requestId);
+    await h.runtime.pump();
+    const receipt = await waitForReceipt(h.store, command.requestId);
+    assert.equal(receipt.status, "delivered");
+    assert.equal(target.followups.length, 1, "retry deduplicates the already landed notice");
+    assert.equal((await h.workflowStore.load(record.id))?.submissionNotice?.state, "delivered");
+  } finally {
+    await h.runtime.stop();
+    await rmClosed(h.directory);
+  }
+});
+
 test("blocking findings route the workflow back to fixing with the findings relayed", async () => {
   const h = await harness();
   try {
@@ -1191,6 +1295,220 @@ test("a transient followup failure retries persistently and delivers exactly onc
     assert.match(target.followups[0]!.text, /Codex review passed workflow/);
     const dead = await h.store.rowsByStatus("dead-letter");
     assert.equal(dead.filter((row) => row.requestId === command.requestId).length, 0, "verdict delivery never dead-letters");
+  } finally {
+    await h.runtime.stop();
+    await rmClosed(h.directory);
+  }
+});
+
+test("a verdict delivery commit failure retries after the relay without dead-lettering", async () => {
+  const h = await harness(5, 60_000, 2);
+  try {
+    const workspace = await makeWorkspace(h.directory);
+    const target = makeAgent("session-commit-retry", "C:\\work");
+    h.registry.register(target);
+    const bridge = await makeBridgeWorkflow(h, target.id, workspace);
+    const originalCommit = h.manager.commitVerdictDelivery.bind(h.manager);
+    let failOnce = true;
+    h.manager.commitVerdictDelivery = async (command) => {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error("transient verdict commit failure");
+      }
+      return originalCommit(command);
+    };
+    const command = verdict({
+      workflowId: bridge.workflowId,
+      codexThreadId: bridge.codexThreadId,
+      submissionId: bridge.submissionId,
+    });
+    await h.store.enqueue(command);
+    await h.runtime.pump();
+    assert.equal(target.followups.length, 1, "the relay lands before the commit failure");
+    assert.equal((await h.workflowStore.load(bridge.workflowId))?.submissionState, "applied");
+    assert.equal((await h.store.rowsByStatus("dead-letter")).some((row) => row.requestId === command.requestId), false);
+    const row = h.store.coordinationHandle.queueRow(command.requestId)!;
+    assert.equal(row.status, "retry");
+    h.store.coordinationHandle.db.prepare("UPDATE queue SET next_attempt_at = 0 WHERE request_id = ?").run(command.requestId);
+    await h.runtime.pump();
+    const receipt = await waitForReceipt(h.store, command.requestId);
+    assert.equal(receipt.status, "delivered");
+    assert.equal(target.followups.length, 1, "retry deduplicates the already landed relay");
+    assert.equal((await h.workflowStore.load(bridge.workflowId))?.submissionState, "delivered");
+  } finally {
+    await h.runtime.stop();
+    await rmClosed(h.directory);
+  }
+});
+
+test("a delivered verdict receipt failure retries without relaying twice", async () => {
+  const h = await harness(5, 60_000, 2);
+  try {
+    const workspace = await makeWorkspace(h.directory);
+    const target = makeAgent("session-ack-retry", "C:\\work");
+    h.registry.register(target);
+    const bridge = await makeBridgeWorkflow(h, target.id, workspace);
+    const originalAck = h.store.ack.bind(h.store);
+    let failOnce = true;
+    h.store.ack = async (claim, result) => {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error("transient receipt write failure");
+      }
+      return originalAck(claim, result);
+    };
+    const command = verdict({
+      workflowId: bridge.workflowId,
+      codexThreadId: bridge.codexThreadId,
+      submissionId: bridge.submissionId,
+    });
+    await h.store.enqueue(command);
+    await h.runtime.pump();
+    assert.equal(target.followups.length, 1);
+    assert.equal((await h.workflowStore.load(bridge.workflowId))?.submissionState, "delivered");
+    assert.equal(h.store.coordinationHandle.queueRow(command.requestId)?.status, "retry");
+    assert.equal(await h.store.receipt(command.requestId), undefined);
+    h.store.coordinationHandle.db.prepare("UPDATE queue SET next_attempt_at = 0 WHERE request_id = ?").run(command.requestId);
+    await h.runtime.pump();
+    const receipt = await waitForReceipt(h.store, command.requestId);
+    assert.equal(receipt.status, "delivered");
+    assert.equal(target.followups.length, 1, "receipt retry deduplicates the relay");
+  } finally {
+    await h.runtime.stop();
+    await rmClosed(h.directory);
+  }
+});
+
+test("a delivered receipt retry re-arms the terminal relay watchdog once", async () => {
+  const h = await harness(5, 60_000, 2, 60_000, 20);
+  try {
+    const workspace = await makeWorkspace(h.directory);
+    const target = makeAgent("session-ack-watchdog-retry", "C:\\work", 0, true);
+    h.registry.register(target);
+    const bridge = await makeBridgeWorkflow(h, target.id, workspace);
+    const originalAck = h.store.ack.bind(h.store);
+    let failOnce = true;
+    h.store.ack = async (claim, result) => {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error("transient receipt write failure");
+      }
+      return originalAck(claim, result);
+    };
+    const command = verdict({
+      workflowId: bridge.workflowId,
+      codexThreadId: bridge.codexThreadId,
+      submissionId: bridge.submissionId,
+    });
+    await h.store.enqueue(command);
+    await h.runtime.pump();
+    assert.equal(target.followups.length, 1);
+    assert.equal(target.cancels.length, 0, "the watchdog must wait for the retried receipt");
+    assert.equal(h.store.coordinationHandle.queueRow(command.requestId)?.status, "retry");
+    h.store.coordinationHandle.db.prepare("UPDATE queue SET next_attempt_at = 0 WHERE request_id = ?").run(command.requestId);
+    await h.runtime.pump();
+    const receipt = await waitForReceipt(h.store, command.requestId);
+    assert.equal(receipt.status, "delivered");
+    assert.equal(target.followups.length, 1, "receipt retry must not relay twice");
+    await waitFor(() => target.cancels.length === 1);
+    assert.deepEqual(target.cancels[0]?.options, { keepInbox: true });
+    assert.deepEqual(target.cancels[0]?.cause, {
+      kind: "hook",
+      reason: `dsh-codex-workflow terminal relay exceeded 20ms for workflow ${bridge.workflowId}`,
+    });
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 30));
+    assert.equal(target.cancels.length, 1, "the retried receipt arms exactly one watchdog");
+  } finally {
+    await h.runtime.stop();
+    await rmClosed(h.directory);
+  }
+});
+
+test("a persistent retry write failure leaves the claim reclaimable", async () => {
+  const h = await harness(5, 60_000, 2, 100);
+  try {
+    const workspace = await makeWorkspace(h.directory);
+    const target = makeAgent("session-persistent-retry-write", "C:\\work");
+    h.registry.register(target);
+    const bridge = await makeBridgeWorkflow(h, target.id, workspace);
+    const originalAck = h.store.ack.bind(h.store);
+    const originalRetry = h.store.retry.bind(h.store);
+    let failAckOnce = true;
+    let failRetryOnce = true;
+    h.store.ack = async (claim, result) => {
+      if (failAckOnce) {
+        failAckOnce = false;
+        throw new Error("transient receipt write failure");
+      }
+      return originalAck(claim, result);
+    };
+    h.store.retry = async (claim, error, nextAttemptAt) => {
+      if (failRetryOnce) {
+        failRetryOnce = false;
+        throw new Error("transient retry write failure");
+      }
+      return originalRetry(claim, error, nextAttemptAt);
+    };
+    const command = verdict({
+      workflowId: bridge.workflowId,
+      codexThreadId: bridge.codexThreadId,
+      submissionId: bridge.submissionId,
+    });
+    await h.store.enqueue(command);
+    await h.runtime.pump();
+    const processing = h.store.coordinationHandle.queueRow(command.requestId);
+    assert.equal(processing?.status, "processing", "a failed retry write keeps the fenced claim in processing");
+    assert.equal((await h.store.rowsByStatus("dead-letter")).some((row) => row.requestId === command.requestId), false);
+    assert.equal(await h.store.receipt(command.requestId), undefined);
+
+    h.store.ack = originalAck;
+    h.store.retry = originalRetry;
+    expireClaimLease(h.store, command.requestId);
+    await h.runtime.pump();
+    const receipt = await waitForReceipt(h.store, command.requestId);
+    assert.equal(receipt.status, "delivered");
+    assert.equal(target.followups.length, 1, "reclaim replay must deduplicate the landed relay");
+    assert.equal((await h.store.rowsByStatus("dead-letter")).some((row) => row.requestId === command.requestId), false);
+  } finally {
+    await h.runtime.stop();
+    await rmClosed(h.directory);
+  }
+});
+
+test("a transient pre-relay validity failure retries an applied verdict", async () => {
+  const h = await harness(5, 60_000, 2);
+  try {
+    const workspace = await makeWorkspace(h.directory);
+    const target = makeAgent("session-validity-retry", "C:\\work");
+    h.registry.register(target);
+    const bridge = await makeBridgeWorkflow(h, target.id, workspace);
+    const originalValidity = h.manager.assertVerdictStillValid.bind(h.manager);
+    let failOnce = true;
+    h.manager.assertVerdictStillValid = async (input) => {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error("transient evidence store failure");
+      }
+      return originalValidity(input);
+    };
+    const command = verdict({
+      workflowId: bridge.workflowId,
+      codexThreadId: bridge.codexThreadId,
+      submissionId: bridge.submissionId,
+    });
+    await h.store.enqueue(command);
+    await h.runtime.pump();
+    assert.equal(h.store.coordinationHandle.queueRow(command.requestId)?.status, "retry");
+    assert.equal((await h.store.rowsByStatus("dead-letter")).some((row) => row.requestId === command.requestId), false);
+    assert.equal(target.followups.length, 0, "a failed validity check must precede the relay");
+
+    h.manager.assertVerdictStillValid = originalValidity;
+    h.store.coordinationHandle.db.prepare("UPDATE queue SET next_attempt_at = 0 WHERE request_id = ?").run(command.requestId);
+    await h.runtime.pump();
+    const receipt = await waitForReceipt(h.store, command.requestId);
+    assert.equal(receipt.status, "delivered");
+    assert.equal(target.followups.length, 1, "the retry delivers the verdict once");
+    assert.equal((await h.store.rowsByStatus("dead-letter")).some((row) => row.requestId === command.requestId), false);
   } finally {
     await h.runtime.stop();
     await rmClosed(h.directory);
@@ -1623,21 +1941,6 @@ test("two runtimes route dispatch+verdict to their owning session; no HOL blocki
     await rmClosed(directory);
   }
 });
-
-async function makeBridgeWorkflowFor(manager: WorkflowManager, reg: FakeRegistry, sessionId: string, ws: string, codexThreadId: string): Promise<import("../src/types.js").WorkflowRecord> {
-  const agent = reg.get(sessionId)!;
-  return manager.startExternalPlan({
-    version: 1,
-    kind: "dispatch_plan",
-    requestId: newRequestId(),
-    createdAt: new Date().toISOString(),
-    codexThreadId,
-    target: { cwd: ws, dshSessionId: sessionId },
-    task: "Bridge",
-    planMarkdown: "<proposed_plan>\nDo\n</proposed_plan>",
-    assumptions: [],
-  }, agent);
-}
 
 async function setReceived(store: WorkflowStore, workflowId: string, submissionId: string, ws: string): Promise<void> {
   const evidence = await collectEvidence({ cwd: ws, maxDiffBytes: 65536, changedFiles: ["a.txt"] });

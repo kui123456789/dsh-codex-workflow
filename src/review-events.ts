@@ -1,4 +1,5 @@
 import z, { type ZodType } from "zod";
+import { KNOWN_SESSION_EVENT_TYPES } from "@deepseek-ai/dsh-session";
 import type { SessionEvent } from "@deepseek-ai/dsh-session";
 import type { ProjectionDefinition } from "@deepseek-ai/dsh-session-projection";
 import type { PlannerQuestion, ReviewResult, ReviewStep, WorkflowProcessState } from "./types.js";
@@ -131,6 +132,25 @@ export type CodexWorkflowSessionEvent =
   | { type: "dsh-codex-workflow/review-progress"; data: CodexReviewProgressEvent }
   | { type: "dsh-codex-workflow/review-end"; data: CodexReviewEndEvent }
   | { type: "dsh-codex-workflow/live"; data: CodexLiveEvent };
+
+const CODEX_WORKFLOW_SESSION_EVENT_TYPES = [
+  "dsh-codex-workflow/plan-updated",
+  "dsh-codex-workflow/review-start",
+  "dsh-codex-workflow/review-progress",
+  "dsh-codex-workflow/review-end",
+  "dsh-codex-workflow/live",
+] as const;
+
+/**
+ * Register this plugin's session events before a host replays persisted history.
+ * The host exposes this catalog as a mutable Set at runtime, although its
+ * declaration is readonly for consumers that only need membership checks.
+ */
+export function registerCodexWorkflowSessionEventTypes(
+  runtimeCatalog: Set<string> = KNOWN_SESSION_EVENT_TYPES as Set<string>,
+): void {
+  for (const type of CODEX_WORKFLOW_SESSION_EVENT_TYPES) runtimeCatalog.add(type);
+}
 
 declare module "@deepseek-ai/dsh-session-projection/types" {
   interface SessionProjectionStateMap {

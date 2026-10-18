@@ -2,6 +2,8 @@
 
 DeepSeek Harness plugin that gives Codex read-only planning/review roles while DSH remains the sole executor. Two flows share the same workflow engine:
 
+From a source checkout, run `pnpm demo` and open `http://127.0.0.1:4175` for a standalone local visual demo. It uses simulated events to demonstrate planning, execution, review and same-thread recovery without connecting to DSH or a model. See [the demo guide](demo/README.md).
+
 - **Codex-led bridge (preferred)** — the Codex task that produced the plan sends it to the exact live DSH session through a durable SQLite bridge; DSH implements it, and the plugin runs the review in private App Server ephemeral threads before returning the verdict to the original DSH session (the originating Codex task is never resumed or written; it receives the outcome through the bridge relay).
 - **DSH-led tools** — the DSH agent can autonomously start `codex_workflow_start` for complex development tasks, or the user can request it explicitly; implementation and review still run through the same workflow engine.
 
@@ -99,13 +101,13 @@ Unconfirmed cleanup captures original process identities once: Windows uses CIM 
 
 ## Requirements
 
-- DeepSeek Harness `0.1.7-rc.2` (the verified host baseline; the declared peer range is `^0.1.7-rc.2`)
+- DeepSeek Harness `0.1.7-rc.2` (the development and type-check baseline; the declared peer range also accepts `0.2.0-rc.2` and `0.2.1-rc.2`)
 - Node.js `^22.19.0` or `>=24`
 - Codex CLI with a valid ChatGPT login and App Server support (verified by `pnpm doctor`)
 
 ### Upgrading after a DSH update
 
-Version 1.1.4 is verified against DSH `0.1.7-rc.2` with cordis `4.0.4`: `pnpm host:check` loads the built plugin against the **operator's installed** core packages (isolated temp storage, no live profile/session/model) and additionally asserts the declared peer range with the host's own `evaluatePluginCompatibility`, so the claim is measured rather than assumed. Other 0.1.x versions are NOT verified by this repository.
+The plugin is developed and type-checked against DSH `0.1.7-rc.2` with cordis `4.0.4`; its declared peer range accepts DSH `0.1.7-rc.2`, `0.2.0-rc.2`, and `0.2.1-rc.2`. Run `pnpm host:check` against the **operator's installed** core packages (isolated temp storage, no live profile/session/model) before treating a host as verified; the check also asks the host's own `evaluatePluginCompatibility` to judge the declared range.
 
 Two things matter when the host moves:
 

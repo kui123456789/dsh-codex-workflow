@@ -6,7 +6,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { CodexAppServerClient } from "../src/app-server.js";
 import { AppServerCodexCallbackDispatcher } from "../src/app-server-callback.js";
-import { CodexCallbackProcessError, CodexInvalidThreadError, CodexNoVerdictError } from "../src/codex-callback.js";
+import { CodexCallbackProcessError, CodexInvalidThreadError } from "../src/codex-callback.js";
 
 const fixture = join(fileURLToPath(new URL(".", import.meta.url)), "fixtures", "fake-codex-app-server.mjs");
 

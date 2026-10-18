@@ -1,5 +1,4 @@
 import { DatabaseSync } from "node:sqlite";
-import { isAbsolute, resolve } from "node:path";
 
 export interface CoordinationDatabaseOptions { busyTimeoutMs?: number; }
 
@@ -35,8 +34,4 @@ export class CoordinationDatabase {
     return messages;
   }
 
-  static normalizePath(path: string): string {
-    const resolved = isAbsolute(path) ? resolve(path) : resolve(process.cwd(), path);
-    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
-  }
 }

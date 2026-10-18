@@ -218,7 +218,11 @@ export class QueueRepositorySql {
         this.db.prepare(
       `INSERT INTO queue (request_id, command_hash, command_json, status, attempts, receipt_json, created_at)
        VALUES (?, ?, '{}', 'done', 0, ?, ?)
-       ON CONFLICT(request_id) DO UPDATE SET receipt_json = excluded.receipt_json WHERE queue.receipt_json IS NULL`,
+       ON CONFLICT(request_id) DO UPDATE SET
+         status = 'done', receipt_json = excluded.receipt_json,
+         claim_owner = '', claim_until = 0, last_error = NULL,
+         next_attempt_at = NULL, dead_letter_at = NULL
+       WHERE queue.receipt_json IS NULL`,
     ).run(requestId, commandHash, receiptJson, now);
   }
 

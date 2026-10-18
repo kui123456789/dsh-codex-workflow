@@ -2,6 +2,13 @@
 // Node-core runtime deps so both the script and the test suite can import it.
 import { gunzipSync } from "node:zlib";
 
+/** Whether a DSH peer range retains the exact pinned development baseline. */
+export function dshPeerRangeIncludesDevBaseline(range, devVersion) {
+  if (typeof range !== "string" || typeof devVersion !== "string") return false;
+  const baseline = `^${devVersion}`;
+  return range.split("||").some((clause) => clause.trim() === baseline);
+}
+
 /** List member names of a tar.gz buffer (ustar format, gzip compressed). */
 export function parseTarGzMembers(buffer) {
   const raw = gunzipSync(buffer);

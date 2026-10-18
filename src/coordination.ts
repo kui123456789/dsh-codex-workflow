@@ -67,8 +67,6 @@ export interface WorkflowRow {
   updatedAt: number;
 }
 
-export type QueueStatus = "inbox" | "retry" | "processing" | "done" | "dead-letter" | "failed";
-
 export interface PruneRequestCandidate {
   requestId: string;
   status: string;
@@ -120,16 +118,6 @@ CREATE TABLE IF NOT EXISTS live_sessions (
   updated_at    INTEGER NOT NULL
 );
 `;
-
-/** Refuse network/UNC storage paths: the journal must live on local disk. A
- * UNC path is `\\server\share` or `//server/share`. */
-function assertLocalDisk(path: string): void {
-  if (/^[\\/]{2}/.test(path)) {
-    throw new Error(`coordination database path must be on local disk, got UNC path: ${path}`);
-  }
-  // A drive-letter path on Windows may still point at a mapped network drive,
-  // which cannot be detected reliably; UNC is the definite network shape.
-}
 
 /** Live connections grouped by the NORMALIZED database path, so test cleanup
  * (and teardown helpers) can close only the handles for one storage directory
@@ -525,6 +513,11 @@ export class CoordinationStore {
   saveWorkflow(id: string, recordJson: string, now = Date.now()): void {
     this.assertOpen();
     this.workflows.saveWorkflow(id, recordJson, now);
+  }
+
+  insertWorkflowIfAbsent(id: string, recordJson: string, now = Date.now()): boolean {
+    this.assertOpen();
+    return this.workflows.insertWorkflowIfAbsent(id, recordJson, now);
   }
 
   compareAndUpdateWorkflow<T>(

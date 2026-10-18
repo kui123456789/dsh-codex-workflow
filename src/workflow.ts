@@ -1,6 +1,4 @@
-import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { promisify } from "node:util";
 import { WorkflowReviewAdmission } from "./application/workflow-review-admission.js";
 import { assertReviewerRecovery } from "./application/reviewer-run-identity.js";
 import type { Agent } from "@deepseek-ai/dsh-agent";
@@ -8,9 +6,6 @@ import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import type { ToolRunContext } from "@deepseek-ai/dsh-tools";
 import type { CoordinationStore } from "./coordination.js";
 import {
-  CodexCallbackProcessError,
-  CodexInvalidThreadError,
-  CodexNoVerdictError,
   type CodexCallbackRequest,
   type CodexCallbackResult,
   type CodexCallbackPendingStartReceipt,
@@ -28,7 +23,6 @@ import { backoffDelayMs, compactDiagnostic, isRecoverableModelFailure, normalize
 import {
   SILENT_REVIEW_PROMPT_BLOCK,
   reviewDisplayError,
-  reviewRewritePrompt,
 } from "./review-contract.js";
 import {
   ALIGN_OUTPUT_SCHEMA,
@@ -69,7 +63,6 @@ import type {
   PersistedTurnBaseline,
   PlannerResult,
   ReviewConflict,
-  ReviewConflictInfo,
   ReviewEvidence,
   ReviewInput,
   ReviewRequestInput,
@@ -91,8 +84,6 @@ import type { TokenUsageSnapshot } from "./usage-accounting.js";
 import { WorkflowUsageObserver } from "./application/workflow-usage-observer.js";
 import { LiveRelay } from "./application/live-relay.js";
 import { CodexChildSessionFactory, type CodexChildSessionHandle } from "./codex-child-session.js";
-
-const execFileAsync = promisify(execFile);
 
 export interface CodexGateway {
   /** Observe the current process-local thread registry without starting RPCs. */
@@ -3657,7 +3648,7 @@ ${evidence.diff}`;
  * reviewer's final message is a silent, readable Markdown review in the SAME
  * language as the original task — never JSON (the structured verdict comes
  * from the ephemeral conversion fork). */
-function visibleReviewContract(record: WorkflowRecord): string {
+function visibleReviewContract(): string {
   return `${SILENT_REVIEW_PROMPT_BLOCK}
 
 Reply in the same language as the original task. The plugin displays your visible reply in the current DSH child Session and its Codex Review right sidebar, so write readable Markdown with these sections, and NOT as JSON:
@@ -3674,7 +3665,7 @@ SUMMARY: a short readable summary`;
  * instructions, so the complete context and the coverage gate always ride
  * the custom target's instructions on every path (Git included). */
 export function reviewContractInstructions(record: WorkflowRecord, input: ReviewInput, evidence: ReviewEvidence): string {
-  return `${visibleReviewContract(record)}
+  return `${visibleReviewContract()}
 
 ${reviewContextBlock(record, input, evidence)}`;
 }
@@ -3717,7 +3708,7 @@ ITEM-BY-ITEM COVERAGE:
  * the review to the current staged/unstaged/untracked changes and requires
  * an independent read-only `git status`/`git diff` check. */
 export function reviewInstructions(record: WorkflowRecord, input: ReviewInput, evidence: ReviewEvidence, git: boolean): string {
-  return `Review the current workspace read-only. Focus on correctness, regressions, security, and missing tests. Do not edit files. ${visibleReviewContract(record)}
+  return `Review the current workspace read-only. Focus on correctness, regressions, security, and missing tests. Do not edit files. ${visibleReviewContract()}
 
 ${reviewRequirementGate(record, git)}
 ${reviewContextBlock(record, input, evidence)}`;
@@ -3752,7 +3743,7 @@ ${rawReview}`;
  * the embedded evidence — but never to write/modify anything, create threads,
  * call DSH tools or the bridge CLI. */
 function callbackPrompt(record: WorkflowRecord, input: ReviewInput, evidence: ReviewEvidence): string {
-  return `You are the independent reviewer for a DSH-executed coding workflow. Review the implementation below against the original plan. Stay read-only: do not edit files, do not create replacement threads, and do not call any dsh tools. ${visibleReviewContract(record)}
+  return `You are the independent reviewer for a DSH-executed coding workflow. Review the implementation below against the original plan. Stay read-only: do not edit files, do not create replacement threads, and do not call any dsh tools. ${visibleReviewContract()}
 
 ${reviewRequirementGate(record, evidence.kind === "git")}
 ${reviewContextBlock(record, input, evidence)}

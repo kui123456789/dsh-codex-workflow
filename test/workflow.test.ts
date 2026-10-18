@@ -199,7 +199,7 @@ class FakeGateway implements CodexGateway {
     this.configureCalls.push({ threadId, name: options.name });
   }
 
-  async updateReviewerInstructions(threadId: string, cwd: string, instructions: string): Promise<void> {
+  async updateReviewerInstructions(threadId: string, _cwd: string, instructions: string): Promise<void> {
     this.instructionCalls.push({ threadId, instructions });
   }
 
@@ -4107,8 +4107,7 @@ test("onTurnStopping steers bridge workflows to submit and legacy workflows to r
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-turnstop-"));
   try {
     const instance = manager(directory, new FakeGateway());
-    const exec = fakeExec("session-turnstop", directory, []);
-    const bridge = await bridgeWorkflow(instance, "session-turnstop", directory, newRequestId());
+    await bridgeWorkflow(instance, "session-turnstop", directory, newRequestId());
     const steers: string[] = [];
     const agent = {
       id: "session-turnstop",
@@ -4383,7 +4382,7 @@ test("a pass verdict is refused when the workspace changed since the review (non
     assert.notEqual(refused.phase, "passed");
     assert.match(refused.error ?? "", /workspace changed since the review/);
 
-    const resubmitted = await instance.submit(bridge.id, { implementationSummary: "v2", changedFiles: ["a.txt"] }, exec);
+    await instance.submit(bridge.id, { implementationSummary: "v2", changedFiles: ["a.txt"] }, exec);
     await waitFor(() => queue.commands.length === 2);
     const passed = await instance.applyExternalVerdict(queue.commands[1]!);
     assert.equal(passed.phase, "passed");
@@ -4410,7 +4409,7 @@ test("decide(fix) steers bridge workflows to submit and legacy workflows to revi
     const bridgeExec = fakeExec("session-decide-bridge", directory, []);
     const codexThreadId = newRequestId();
     const bridge = await bridgeWorkflow(instance, "session-decide-bridge", directory, codexThreadId);
-    const submitted = await instance.submit(bridge.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, bridgeExec);
+    await instance.submit(bridge.id, { implementationSummary: "done", changedFiles: ["changed.txt"] }, bridgeExec);
     await waitFor(() => queue.commands.length === 1);
     const stagedCommand = queue.commands[0]!;
     assert.equal(stagedCommand.verdict.verdict, "changes_requested");
@@ -4880,7 +4879,6 @@ test("concurrent manager.stop() share one settle promise", async () => {
   try {
     cb.deferredVerdict = { verdict: "pass", findings: [], testGaps: [], summary: "ok" };
     const instance = manager(directory, new FakeGateway(), { leaseTtlMs: 30_000 }, cb, fakeBridgeQueue());
-    const exec = fakeExec("session-stopconc", directory, []);
     const bridge = await bridgeWorkflow(instance, "session-stopconc", directory, newRequestId());
     const evidence = await collectEvidence({ cwd: directory, maxDiffBytes: config.reviewDiffMaxBytes,
       changedFiles: ["changed.txt"] });

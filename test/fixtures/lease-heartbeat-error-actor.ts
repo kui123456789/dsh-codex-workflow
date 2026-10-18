@@ -22,7 +22,7 @@ const onUncaught=(error:Error)=>{uncaught++;log("uncaught-timer",{message:error.
 process.on("uncaughtException",onUncaught);
 try{
  if(mode==="live-busy"){
-   const record=await f.start();lease=f.firstLease;assert.ok(lease);
+    await f.start();lease=f.firstLease;assert.ok(lease);
    const initial=await f.control("fixture/stats");assert.equal(initial.turnStartRequests.length,1);
    peer.exec("BEGIN IMMEDIATE");locked=true;
    await f.lossSeen.entered;

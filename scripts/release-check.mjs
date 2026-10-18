@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  dshPeerRangeIncludesDevBaseline,
   parseTarGzMembers,
   RELEASE_ALLOWED_FILES,
   RELEASE_ALLOWED_PREFIXES,
@@ -68,9 +69,9 @@ report("system-prompt peer dependency is declared", typeof packageJson.peerDepen
 // (the runtime verdict is checked by `pnpm host:check` and `pnpm doctor`).
 const dshPeerDrift = Object.entries(packageJson.peerDependencies ?? {})
   .filter(([name]) => name.startsWith("@deepseek-ai/dsh"))
-  .filter(([name, range]) => range !== `^${packageJson.devDependencies?.[name]}`);
-report("every dsh peer range matches its pinned dev dependency", dshPeerDrift.length === 0,
-  dshPeerDrift.map(([name, range]) => `${name} peer ${range} != ^${packageJson.devDependencies?.[name]}`).join(", "));
+  .filter(([name, range]) => !dshPeerRangeIncludesDevBaseline(range, packageJson.devDependencies?.[name]));
+report("every dsh peer range includes its pinned dev dependency baseline", dshPeerDrift.length === 0,
+  dshPeerDrift.map(([name, range]) => `${name} peer ${range} does not include ^${packageJson.devDependencies?.[name]}`).join(", "));
 
 // 1.1.12 VISIBILITY CONTRACT. Plugin-created Planner/Reviewer threads are
 // App Server ephemeral threads: they are not named, are omitted from

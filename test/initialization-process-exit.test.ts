@@ -105,7 +105,7 @@ child.once("error",()=>process.exit(1));child.once("exit",code=>process.exit(cod
       const successor: { value?: string; error?: unknown } = raced ? await raced
         : await client.startThread({ cwd: directory }).then((value) => ({ value }), (error: unknown) => ({ error }));
       assert.equal(successor.error, undefined, "A later explicit metadata request follows cleanup instead of joining a failed initializer");
-      assert.ok(successor.value); assert.notEqual(port.child.pid, original.pid);
+      assert.ok(successor.value); assert.notEqual(port.child, original);
       await client.releaseThreadForExternal(successor.value!, undefined, client.captureThreadOwner(successor.value!));
       const finalRows = (await readFile(journal, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
       assert.equal(finalRows.filter((row) => row.kind === "process-start").length, 2);

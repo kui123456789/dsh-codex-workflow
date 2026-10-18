@@ -1243,7 +1243,6 @@ test("authority semantic matrix M3: a plan-mandated regression test missing stay
     await instance.submit(bridge.id, { implementationSummary: "实现排序", changedFiles: ["changed.txt"] }, exec);
     const store = new WorkflowStore(directory);
     await waitFor(async () => (await store.load(bridge.id))?.submissionState === "received");
-    const after = (await store.load(bridge.id))!;
     assert.equal(queue.commands.length, 1);
     assert.equal(queue.commands[0]!.verdict.verdict, "changes_requested", "the plan-mandated test gap stays blocking");
     const applied = await instance.applyExternalVerdict(queue.commands[0]!);
@@ -1296,7 +1295,6 @@ test("authority semantic matrix M4: a HIGH defect with concrete code evidence cr
     await instance.submit(bridge.id, { implementationSummary: "实现扣减", changedFiles: ["changed.txt"] }, exec);
     const store = new WorkflowStore(directory);
     await waitFor(async () => (await store.load(bridge.id))?.submissionState === "received");
-    const after = (await store.load(bridge.id))!;
     assert.equal(queue.commands.length, 1);
     const applied = await instance.applyExternalVerdict(queue.commands[0]!);
     assert.equal(applied.phase, "fixing", "the reproducible high defect crosses the plan's file-scope bound (level-1 exception)");

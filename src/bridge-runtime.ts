@@ -1,12 +1,11 @@
-import { mkdir, rename, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import { MessageId, createUserMessage, freezeMessage, type UserMessage } from "@deepseek-ai/dsh-llm";
 import { cwdKey } from "./coordination.js";
 import type { DispatchPlanCommand, SubmissionNoticeCommand, SubmitVerdictCommand, BridgeCommand } from "./bridge-protocol.js";
 import { relaySource } from "./message-source.js";
-import type { BridgeStore, ClaimedBridgeCommand } from "./bridge-store.js";
+import type { BridgeReceipt, BridgeStore, ClaimedBridgeCommand } from "./bridge-store.js";
 import { WorkflowStore } from "./store.js";
 import type { WorkflowRecord } from "./types.js";
 import { executionPrompt, formatFindings } from "./workflow.js";
@@ -72,12 +71,6 @@ export class BridgeCrashSimulationError extends Error {
     super("simulated crash after followup");
     this.name = "BridgeCrashSimulationError";
   }
-}
-
-interface SessionEntry {
-  id: string;
-  cwd: string;
-  updatedAt: string;
 }
 
 type ResolvedTarget =
@@ -421,13 +414,12 @@ export class BridgeRuntime {
     if (existing) {
       if (existing.bridgeDeliveryState === "delivered") {
         // Delivered before the crash, but the receipt never landed: just ack.
-        if (isLost()) return;
-        await this.queue.ack(claim, {
+        await this.ackAfterDelivery(claim, {
           requestId: claim.requestId,
           status: "delivered",
           workflowId: existing.id,
           deliveredAt: new Date().toISOString(),
-        });
+        }, isLost);
         return;
       }
       record = existing; // prepared: re-deliver without creating a second workflow
@@ -449,15 +441,20 @@ export class BridgeRuntime {
     const messageId = MessageId(`dsh-codex-workflow:${command.requestId}`);
     if (this.hasDeliveredMessage(target.agent, messageId)) {
       if (isLost()) return;
-      await this.options.workflowStore.update(record.id, (r) => {
-        r.bridgeDeliveryState = "delivered";
-      }, { ignoreCancelled: false });
-      await this.queue.ack(claim, {
+      try {
+        await this.options.workflowStore.update(record.id, (r) => {
+          r.bridgeDeliveryState = "delivered";
+        }, { ignoreCancelled: false });
+      } catch (error) {
+        if (!isLost()) await this.retryPersistent(claim, `delivery commit failed: ${errorMessage(error)}`);
+        return;
+      }
+      await this.ackAfterDelivery(claim, {
         requestId: claim.requestId,
         status: "delivered",
         workflowId: record.id,
         deliveredAt: new Date().toISOString(),
-      });
+      }, isLost);
       return;
     }
     try {
@@ -474,16 +471,24 @@ export class BridgeRuntime {
       return;
     }
     if (isLost()) return;
-    await this.options.workflowStore.update(record.id, (r) => {
-      r.bridgeDeliveryState = "delivered";
-    }, { ignoreCancelled: false });
+    try {
+      await this.options.workflowStore.update(record.id, (r) => {
+        r.bridgeDeliveryState = "delivered";
+      }, { ignoreCancelled: false });
+    } catch (error) {
+      // The DSH followup has already landed. A bookkeeping failure must keep
+      // this claim retryable so replay can observe the deterministic message
+      // id and commit/ack it without creating a duplicate workflow message.
+      if (!isLost()) await this.retryPersistent(claim, `delivery commit failed: ${errorMessage(error)}`);
+      return;
+    }
     if (isLost()) return;
-    await this.queue.ack(claim, {
+    await this.ackAfterDelivery(claim, {
       requestId: claim.requestId,
       status: "delivered",
       workflowId: record.id,
       deliveredAt: new Date().toISOString(),
-    });
+    }, isLost);
   }
 
   private relayMessage(record: WorkflowRecord, messageId: MessageId): UserMessage {
@@ -604,23 +609,32 @@ export class BridgeRuntime {
       return;
     }
     if (isLost()) return;
-    const committed = await this.deliveryCoordinator.commitSubmissionNoticeDelivery(command);
+    let committed: Awaited<ReturnType<DeliveryCoordinator["commitSubmissionNoticeDelivery"]>>;
+    try {
+      committed = await this.deliveryCoordinator.commitSubmissionNoticeDelivery(command);
+    } catch (error) {
+      // The notice was already appended to the DSH inbox. Retry the durable
+      // marker and deterministic receipt instead of letting pumpInternal turn
+      // a transient SQLite/CAS error into a dead letter.
+      if (!isLost()) await this.retryPersistent(claim, `delivery commit failed: ${errorMessage(error)}`);
+      return;
+    }
     if (!committed.committed) {
-      await this.queue.ack(claim, {
+      await this.ackAfterDelivery(claim, {
         requestId: claim.requestId,
         status: committed.record.phase === "cancelled" ? "cancelled" : "no_such_workflow",
         workflowId: command.workflowId,
         error: "submission notice was superseded before delivery commit",
         deliveredAt: new Date().toISOString(),
-      });
+      }, isLost);
       return;
     }
-    await this.queue.ack(claim, {
+    await this.ackAfterDelivery(claim, {
       requestId: claim.requestId,
       status: "delivered",
       workflowId: command.workflowId,
       deliveredAt: new Date().toISOString(),
-    });
+    }, isLost);
   }
 
   /**
@@ -665,15 +679,13 @@ export class BridgeRuntime {
     }
     if (record.phase === "cancelled") {
       // Late verdict on a cancelled workflow: idempotent receipt, never wake DSH.
-      if (!isLost()) {
-        await this.queue.ack(claim, {
-          requestId: claim.requestId,
-          status: "cancelled",
-          workflowId: record.id,
-          error: "workflow is cancelled",
-          deliveredAt: new Date().toISOString(),
-        });
-      }
+      await this.ackAfterDelivery(claim, {
+        requestId: claim.requestId,
+        status: "cancelled",
+        workflowId: record.id,
+        error: "workflow is cancelled",
+        deliveredAt: new Date().toISOString(),
+      }, isLost);
       return;
     }
     if (record.submissionState === "delivered"
@@ -682,13 +694,19 @@ export class BridgeRuntime {
       // This verdict was already applied AND delivered (e.g. a manual respond
       // duplicating the automatic path): idempotent ack, no second relay.
       await this.tryOpenDesktopReview(record, command, isLost);
-      if (!isLost()) {
-        await this.queue.ack(claim, {
-          requestId: claim.requestId,
-          status: "delivered",
-          workflowId: record.id,
-          deliveredAt: new Date().toISOString(),
-        });
+      const acknowledged = await this.ackAfterDelivery(claim, {
+        requestId: claim.requestId,
+        status: "delivered",
+        workflowId: record.id,
+        deliveredAt: new Date().toISOString(),
+      }, isLost);
+      // A receipt write can fail after the verdict relay and delivered marker
+      // have both landed. The replay above is the first point where the queue
+      // is durably acknowledged, so arm the terminal watchdog here as well.
+      // The fenced ack means this branch can succeed only once for this claim.
+      if (acknowledged && record.phase === "passed") {
+        const agent = this.agents.get(record.dshSessionId);
+        if (agent) this.startTerminalRelayGuard(agent, record.id);
       }
       return;
     }
@@ -708,18 +726,40 @@ export class BridgeRuntime {
     // fingerprint and void an applied verdict (even a pass) if the workspace
     // changed while the outcome was pending delivery. This verifies but does
     // NOT yet write delivered (invalidation stays pending-applied).
-      const validity = await this.deliveryCoordinator.assertVerdictStillValid(command);
+    let validity: Awaited<ReturnType<DeliveryCoordinator["assertVerdictStillValid"]>>;
+    try {
+      validity = await this.deliveryCoordinator.assertVerdictStillValid(command);
+    } catch (error) {
+      // Evidence collection/store reads can fail transiently after the verdict
+      // was applied. Keep the claim on the persistent path; a pump-level throw
+      // would incorrectly dead-letter an otherwise recoverable delivery.
+      if (isLost()) return;
+      await this.retryPersistent(claim, `delivery validity check failed: ${errorMessage(error)}`);
+      return;
+    }
     record = validity.record;
 
     let messageId: MessageId;
     try {
       if (this.options.beforeRelayHook) await this.options.beforeRelayHook();
-      // Final fingerprint verification AFTER the hook: if the hook changed the
-      // workspace, the old verdict (a pass) must be invalidated here, before
-      // any relay; if the hook cancelled the workflow, this returns without
-      // touching state and the pre-relay check below acks cancelled.
-      const final = await this.deliveryCoordinator.assertVerdictStillValid(command);
-      record = final.record;
+    } catch (error) {
+      if (error instanceof BridgeCrashSimulationError) return; // leave orphaned
+      throw error;
+    }
+    // Final fingerprint verification AFTER the hook: if the hook changed the
+    // workspace, the old verdict (a pass) must be invalidated here, before
+    // any relay; if the hook cancelled the workflow, this returns without
+    // touching state and the pre-relay check below acks cancelled.
+    let final: Awaited<ReturnType<DeliveryCoordinator["assertVerdictStillValid"]>>;
+    try {
+      final = await this.deliveryCoordinator.assertVerdictStillValid(command);
+    } catch (error) {
+      if (isLost()) return;
+      await this.retryPersistent(claim, `delivery validity check failed: ${errorMessage(error)}`);
+      return;
+    }
+    record = final.record;
+    try {
       // Pre-relay re-check: a cancel or a new submission that won between
       // prepare and relay must NOT wake the session or write delivered.
       const fresh = await this.options.workflowStore.load(record.id);
@@ -790,30 +830,55 @@ export class BridgeRuntime {
     }
     if (isLost()) return; // a stale owner must not mark delivered
     // Commit delivered only AFTER the relay landed; fenced on identity/state.
-    const commit = await this.deliveryCoordinator.commitVerdictDelivery(command);
+    let commit: Awaited<ReturnType<DeliveryCoordinator["commitVerdictDelivery"]>>;
+    try {
+      commit = await this.deliveryCoordinator.commitVerdictDelivery(command);
+    } catch (error) {
+      // The verdict relay has already landed. Keep the claim on the persistent
+      // retry path so the next pass can deduplicate the message and finish the
+      // durable delivered marker without a second followup or dead letter.
+      if (!isLost()) await this.retryPersistent(claim, `delivery commit failed: ${errorMessage(error)}`);
+      return;
+    }
     if (commit.committed) {
-      if (isLost()) return;
-      await this.queue.ack(claim, {
+      const acknowledged = await this.ackAfterDelivery(claim, {
         requestId: claim.requestId,
         status: "delivered",
         workflowId: record.id,
         deliveredAt: new Date().toISOString(),
-      });
-      if (relayed && record.phase === "passed") {
+      }, isLost);
+      if (acknowledged && relayed && record.phase === "passed") {
         this.startTerminalRelayGuard(agent, record.id);
       }
       return;
     }
     // The relay landed but the exact commit lost to a cancel/new submission:
     // never overwrite the new state with delivered.
-    if (isLost()) return;
-    await this.queue.ack(claim, {
+    await this.ackAfterDelivery(claim, {
       requestId: claim.requestId,
       status: commit.record.phase === "cancelled" ? "cancelled" : "no_such_workflow",
       workflowId: record.id,
       error: "delivery superseded before commit; not marked delivered",
       deliveredAt: new Date().toISOString(),
-    });
+    }, isLost);
+  }
+
+  /** A relay or durable delivery marker has already succeeded. If writing the
+   * queue receipt fails, keep the claim on the persistent replay path so the
+   * deterministic message id prevents a duplicate external delivery. */
+  private async ackAfterDelivery(
+    claim: ClaimedBridgeCommand,
+    result: BridgeReceipt,
+    isLost: () => boolean,
+  ): Promise<boolean> {
+    if (isLost()) return false;
+    try {
+      return await this.queue.ack(claim, result);
+    } catch (error) {
+      if (isLost()) return false;
+      await this.retryPersistent(claim, `receipt commit failed: ${errorMessage(error)}`);
+      return false;
+    }
   }
 
   /** Retry a claim with exponential backoff that NEVER dead-letters: used for
@@ -823,7 +888,13 @@ export class BridgeRuntime {
   private async retryPersistent(claim: ClaimedBridgeCommand, error: string): Promise<void> {
     const attempts = claim.attempts + 1;
     const delayMs = Math.min(60_000, this.options.retryBaseMs * 2 ** Math.min(attempts - 1, 6));
-    await this.queue.retry(claim, error, new Date(Date.now() + delayMs).toISOString());
+    try {
+      await this.queue.retry(claim, error, new Date(Date.now() + delayMs).toISOString());
+    } catch {
+      // Keep the processing claim fenced when SQLite/CAS cannot record the
+      // retry. Its lease expiry is the recovery boundary; letting this error
+      // escape would send the pump's catch-all path to dead-letter instead.
+    }
   }
 
   /** Resume due desktop-open work after startup and on every normal pump. */

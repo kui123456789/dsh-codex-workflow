@@ -1,4 +1,5 @@
-import { access, copyFile, mkdir, readFile, readdir } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { access, copyFile, link, mkdir, readFile, readdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { CoordinationStore, coordinationPath } from "./coordination.js";
 import type { ReviewFinding, ReviewStep, WorkflowMode, WorkflowPhase, WorkflowProcessState, WorkflowRecord } from "./types.js";
@@ -29,8 +30,10 @@ export interface WorkflowStoreOptions {
 export class WorkflowStore {
   private coordination?: CoordinationStore;
   private importedLegacy = false;
+  private legacyImport?: Promise<void>;
   private closed = false;
   private migrationBackupDone = false;
+  private migrationBackup?: Promise<void>;
 
   constructor(readonly directory: string, private readonly options: WorkflowStoreOptions = {}) {}
 
@@ -49,7 +52,18 @@ export class WorkflowStore {
   /** Keep one pre-v2 copy before the first process opens/migrates the DB. */
   private async backupBeforeSchemaMigration(): Promise<void> {
     if (this.migrationBackupDone) return;
-    this.migrationBackupDone = true;
+    if (this.migrationBackup) return this.migrationBackup;
+    const task = this.performMigrationBackup();
+    this.migrationBackup = task;
+    try {
+      await task;
+      this.migrationBackupDone = true;
+    } finally {
+      if (this.migrationBackup === task) this.migrationBackup = undefined;
+    }
+  }
+
+  private async performMigrationBackup(): Promise<void> {
     const source = coordinationPath(this.directory);
     const backup = `${source}.pre-schema-v2.bak`;
     try { await access(source); } catch (error) {
@@ -58,7 +72,22 @@ export class WorkflowStore {
     }
     try { await access(backup); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      await (this.options.copyFile ?? copyFile)(source, backup);
+      const temporary = `${backup}.${randomUUID()}.tmp`;
+      try {
+        await (this.options.copyFile ?? copyFile)(source, temporary);
+        // A hard link is the portable no-replace atomic install primitive in
+        // Node: it publishes only a complete temp file and loses harmlessly
+        // when another independent store wins the race for the backup path.
+        try {
+          await link(temporary, backup);
+        } catch (installError) {
+          if (!isAlreadyExists(installError)) throw installError;
+        }
+      } finally {
+        try { await unlink(temporary); } catch (cleanupError) {
+          if (!isMissing(cleanupError)) throw cleanupError;
+        }
+      }
     }
   }
 
@@ -244,35 +273,62 @@ export class WorkflowStore {
   /** Import a legacy `<directory>/<id>.json` record on first access so
    * pre-SQLite data keeps working. The returned record reports the actual
    * SQLite row revision (1 after the first import). */
-  private async importLegacyFile(id: string): Promise<WorkflowRecord | undefined> {
+  private async importLegacyFile(id: string, skipMalformed = false): Promise<WorkflowRecord | undefined> {
     const path = join(this.directory, `${id}.json`);
+    let raw: string;
     try {
-      const raw = await readFile(path, "utf8");
-      const record = parseRecord(JSON.parse(raw));
-      this.coordination!.saveWorkflow(id, recordJson(record));
-      const row = this.coordination!.loadWorkflow(id);
-      return row ? parseWorkflowRow(row) : undefined;
+      raw = await readFile(path, "utf8");
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      if (isMissing(error)) return undefined;
       throw error;
     }
+    let record: WorkflowRecord;
+    try {
+      record = parseRecord(JSON.parse(raw));
+    } catch (error) {
+      if (skipMalformed) return undefined;
+      throw error;
+    }
+    this.coordination!.insertWorkflowIfAbsent(id, recordJson(record));
+    const row = this.coordination!.loadWorkflow(id);
+    return row ? parseWorkflowRow(row) : undefined;
   }
 
   private async importLegacyFiles(): Promise<void> {
     if (this.importedLegacy) return;
-    this.importedLegacy = true;
+    if (this.legacyImport) return this.legacyImport;
+    const task = this.performLegacyImport();
+    this.legacyImport = task;
+    try {
+      await task;
+      this.importedLegacy = true;
+    } finally {
+      if (this.legacyImport === task) this.legacyImport = undefined;
+    }
+  }
+
+  private async performLegacyImport(): Promise<void> {
     let names: string[] = [];
     try {
       names = await readdir(this.directory);
-    } catch {
-      return;
+    } catch (error) {
+      if (isMissing(error)) return;
+      throw error;
     }
     for (const name of names.filter((entry) => entry.endsWith(".json"))) {
       const id = name.slice(0, -5);
       if (this.coordination!.loadWorkflow(id)) continue;
-      await this.importLegacyFile(id).catch(() => undefined);
+      await this.importLegacyFile(id, true);
     }
   }
+}
+
+function isMissing(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+}
+
+function isAlreadyExists(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === "EEXIST";
 }
 
 const PHASES = new Set<WorkflowPhase>([

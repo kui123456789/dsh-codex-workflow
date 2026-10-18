@@ -33,7 +33,6 @@ test("DSH plugin activation waits for all workflow tools and unload removes them
     await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
-
 test("DSH receives asynchronous plugin initialization failures", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-plugin-failure-"));
   const occupied = join(directory, "not-a-directory");

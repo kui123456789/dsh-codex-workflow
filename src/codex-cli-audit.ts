@@ -3,8 +3,6 @@ import type { ChildProcess } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { parseReviewResult } from "./bridge-protocol.js";
 import { parseAlignment } from "./review-authority.js";
-import { ALIGN_OUTPUT_SCHEMA } from "./review-authority.js";
-import { REVIEW_OUTPUT_SCHEMA } from "./schemas.js";
 import { isChineseText, reviewDisplayError, reviewRewritePrompt } from "./review-contract.js";
 import type { AlignmentOutcome, ReasoningEffort, ReviewResult } from "./types.js";
 import type { CodexCallbackRequest, CodexCallbackResult } from "./codex-callback.js";

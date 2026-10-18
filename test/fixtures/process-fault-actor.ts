@@ -105,10 +105,8 @@ async function main(): Promise<number> {
   if (subcommand === "stage-die") {
     const marker = arg(0);
     const metaFile = arg(1);
-    let stagedRequest: string | undefined;
     const blockingQueue = {
       enqueue: async (command: { requestId: string }): Promise<string> => {
-        stagedRequest = command.requestId;
         await writeFile(marker, command.requestId, "utf8");
         // Block forever: the process is killed here (crash between phase A
         // staging and phase B enqueue commit).

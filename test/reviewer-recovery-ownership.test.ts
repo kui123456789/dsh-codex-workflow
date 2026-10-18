@@ -7,7 +7,7 @@ import type { Agent } from "@deepseek-ai/dsh-agent";
 import { Session, SessionId, SESSION_FORMAT_VERSION } from "@deepseek-ai/dsh-session";
 import { snapshotSubagentDescriptor, type SubagentProvider } from "@deepseek-ai/dsh-subagent";
 import type { ToolRunContext } from "@deepseek-ai/dsh-tools";
-import type { RecoverableWorkflowRun, WorkflowRuntimeState } from "../src/application/workflow-runtime-state.js";
+import type { WorkflowRuntimeState } from "../src/application/workflow-runtime-state.js";
 import { CodexChildSessionFactory } from "../src/codex-child-session.js";
 import { WorkflowStore } from "../src/store.js";
 import { CodexTurnInterruptionError } from "../src/turn-interruption.js";

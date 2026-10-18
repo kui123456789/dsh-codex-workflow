@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { parseTarGzMembers } from "../scripts/release-check-lib.mjs";
+import { dshPeerRangeIncludesDevBaseline, parseTarGzMembers } from "../scripts/release-check-lib.mjs";
 
 const doctor = join(fileURLToPath(new URL("..", import.meta.url)), "scripts", "doctor.mjs");
 
@@ -134,4 +134,19 @@ test("tar.gz member listing parses pnpm pack output shape", async () => {
     ["package.json", "lib/index.js", "README.md"],
   );
   void gunzipSync;
+});
+
+test("release compatibility accepts extra DSH clauses but requires the pinned development baseline", () => {
+  assert.equal(
+    dshPeerRangeIncludesDevBaseline("^0.1.7-rc.2 || 0.2.0-rc.2 || 0.2.1-rc.2", "0.1.7-rc.2"),
+    true,
+  );
+  assert.equal(
+    dshPeerRangeIncludesDevBaseline("0.2.0-rc.2 || 0.2.1-rc.2", "0.1.7-rc.2"),
+    false,
+  );
+  assert.equal(
+    dshPeerRangeIncludesDevBaseline(">=0.1.7-rc.2 || 0.2.0-rc.2", "0.1.7-rc.2"),
+    false,
+  );
 });

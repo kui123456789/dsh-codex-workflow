@@ -40,7 +40,6 @@ input.on("line", (line) => {
   }
   if (method === "thread/read" || method === "thread/resume") return reply(id, { thread: threads.get(params.threadId) });
   if (method === "turn/start") {
-    const prompt = params.input?.map((item) => item.text ?? "").join("\n") ?? "";
     const stage = params.outputSchema ? "conversion" : mode.startsWith("rewrite") && accepted.length > 0 ? "rewrite" : "visible";
     const value = { id, index: accepted.length, threadId: params.threadId, turnId: "actual-diagnostic-turn-" + (accepted.length + 1),
       stage, active: true, replied: false, interruptConfirmed: false };
