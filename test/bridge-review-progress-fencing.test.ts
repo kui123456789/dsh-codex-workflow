@@ -53,7 +53,13 @@ test("a late revoked Bridge callback cannot change the replacement owner's compl
     async send(request) {
       sentA.push(request.submissionId);
       callbackAEntered.enter();
-      await callbackAResult.promise;
+      // Model the external request's handle while the unref'ed lease watcher runs.
+      let lifetime: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([callbackAResult.promise, new Promise<never>((_resolve, reject) => {
+          lifetime = setTimeout(() => reject(new Error("Fake Bridge callback exceeded its fixture lifetime")), 10_000);
+        })]);
+      } finally { clearTimeout(lifetime); }
       return { kind: "verdict", verdict: { verdict: "pass", findings: [], testGaps: [], summary: "A's superseded verdict" } };
     },
     cancel() {}, cancelSubmission() { callbackACancelled.enter(); }, async stop() { callbackAResult.release(); },

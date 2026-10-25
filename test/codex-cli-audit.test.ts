@@ -272,6 +272,9 @@ function stubbornSpawn(signals: Array<NodeJS.Signals | undefined>, starts: strin
     const stdin = new PassThrough();
     const stdout = new PassThrough();
     const stderr = new PassThrough();
+    // A real child owns native handles until close; in-memory streams do not.
+    const lifetime = setTimeout(() => emitter.emit("error", new Error("Fake CLI child exceeded its fixture lifetime")), 1_000);
+    emitter.once("close", () => clearTimeout(lifetime));
     Object.assign(emitter, {
       pid: 9876,
       exitCode: null,

@@ -6,6 +6,7 @@ let threadCounter = 0;
 let turnCounter = 0;
 let persistedTurnCounter = 0;
 const pendingQuestions = new Map();
+const heldStreamTurns = new Map();
 const heldStreamReviews = new Map();
 // Threads the plugin has subscribed to as its writer; mirrors the real server's
 // idempotent thread/unsubscribe semantics.
@@ -168,6 +169,16 @@ function handleClientRequest(message) {
     appendFileSync(process.env.FAKE_CODEX_THREAD_PARAMS_MARKER, `${JSON.stringify({ method, params })}\n`);
   }
   if (method === "initialized") return;
+  if (method === "fixture/heldStreams" && (process.env.FAKE_CODEX_HOLD_STREAM_TURN === "1" || process.env.FAKE_CODEX_HOLD_STREAM_REVIEW === "1")) {
+    return send({ id, result: { turns: [...heldStreamTurns.keys()], reviews: [...heldStreamReviews.keys()] } });
+  }
+  if (method === "fixture/releaseStreamTurn" && process.env.FAKE_CODEX_HOLD_STREAM_TURN === "1") {
+    const finish = heldStreamTurns.get(params.threadId);
+    if (!finish) return send({ id, error: { code: -32602, message: "No original stream turn is held" } });
+    heldStreamTurns.delete(params.threadId);
+    send({ id, result: {} });
+    return finish();
+  }
   if (method === "fixture/releaseStreamReview" && process.env.FAKE_CODEX_HOLD_STREAM_REVIEW === "1") {
     const finish = heldStreamReviews.get(params.threadId);
     if (!finish) return send({ id, error: { code: -32602, message: "No original stream review is held" } });
@@ -327,7 +338,12 @@ function handleClientRequest(message) {
     // turn error means the visible turn FAILED, so the transient-retry contract
     // can be asserted on it too.
     const visibleStatus = turnError() ? "failed" : "completed";
-    return setTimeout(() => complete(params.threadId, turnId, emission, reviewSchema ? finalStatus : visibleStatus), delay);
+    const finish = () => setTimeout(() => complete(params.threadId, turnId, emission, reviewSchema ? finalStatus : visibleStatus), delay);
+    if (process.env.FAKE_CODEX_HOLD_STREAM_TURN === "1" && !params.outputSchema) {
+      heldStreamTurns.set(params.threadId, finish);
+      return;
+    }
+    return finish();
   }
   if (method === "review/start") {
     const turnId = `turn-${++turnCounter}`;

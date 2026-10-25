@@ -9,6 +9,9 @@ jobs:
   test:
     name: node ${{ matrix.node }} / windows
     runs-on: windows-latest
+    env:
+      DSH_WORKFLOW_TEST_CONCURRENCY: "1"
+      DSH_WORKFLOW_TEST_REPORTER: tap
     strategy:
       fail-fast: false
       matrix:

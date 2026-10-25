@@ -586,6 +586,7 @@ test("a launcher exit during actual interruption tree capture retains a durable 
   let queryPid: number | undefined;
   let capturedDuringFailedAck = false;
   let failedAckObserved = false;
+  let failedInterrupt: Promise<SharedReviewerStats> | undefined;
   const launcherPath = join(f.directory, "capture-race-owned-launcher.mjs");
   const backendPath = join(f.directory, "capture-race-owned-backend.mjs");
   const launcherPidPath = join(f.directory, "capture-race-launcher.pid");
@@ -629,8 +630,16 @@ test("a launcher exit during actual interruption tree capture retains a durable 
     launcherPid = Number(await readFile(launcherPidPath, "utf8"));
     assert.notEqual(launcherPid, backendPid);
     f.client.interrupt = async (...args) => {
+      failedInterrupt ??= f.control("fixture/waitForInterrupt", { minimumCount: 1 });
+      void failedInterrupt.catch(() => undefined);
       try { return await originalInterrupt.apply(f.client, args); }
-      catch (error) { failedAckObserved = true; throw error; }
+      catch (error) {
+        // Arm the existing RPC budget at the actual interrupt, then observe
+        // its original reply before the capture hook can kill its transport.
+        await failedInterrupt;
+        failedAckObserved = true;
+        throw error;
+      }
     };
     // The observer calls the real execFile first; an actual query child is live when the launcher exits.
     childProcess.execFile = ((...args: Parameters<typeof originalExecFile>) => {
@@ -652,10 +661,9 @@ test("a launcher exit during actual interruption tree capture retains a durable 
     }) as typeof childProcess.execFile;
     syncBuiltinESMExports();
     options.requestTimeoutMs = 50;
-    const failedInterrupt = f.control("fixture/waitForInterrupt", { minimumCount: 1 });
-    void failedInterrupt.catch(() => undefined);
     const operation = owner.reviewOnly({ task: "Review read-only local configuration diagnostics", ...reviewInput }, f.exec);
     const operationOutcome: PromiseSettledResult<WorkflowRecord> = (await Promise.allSettled([operation]))[0]!;
+    assert.ok(failedInterrupt, "The real interrupt registers its own bounded fixture observer");
     const failedAckStats = await failedInterrupt;
     childProcess.execFile = originalExecFile;
     syncBuiltinESMExports();

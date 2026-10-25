@@ -21,10 +21,14 @@ test("DSH receives Planner output in its session before planning completes", asy
   const directory = await mkdtemp(join(tmpdir(), "dsh-live-planner-"));
   const events: Array<{ type: string; data: unknown }> = [];
   const children: Array<{ session: Session; frames: Array<{ type: string }> }> = [];
+  let plannerVisible!: () => void, reviewerVisible!: () => void;
+  const plannerProgress = new Promise<void>((resolve) => { plannerVisible = resolve; });
+  const reviewerProgress = new Promise<void>((resolve) => { reviewerVisible = resolve; });
   const plan = "# Goal\n实现安全的计划与验证流程。\n# Changes\n- src/index.ts：完成接口和错误处理。\n- test/index.test.ts：覆盖边界条件。\n# Verification\n- pnpm typecheck && pnpm test\n";
   const codex = new CodexAppServerClient({ command: process.execPath, args: [fixture],
     requestTimeoutMs: 5_000, idleProcessMs: 0,
     env: { ...process.env, FAKE_CODEX_STREAM_VISIBLE: "1", FAKE_CODEX_TURN_DELAY_MS: "700",
+      FAKE_CODEX_HOLD_STREAM_TURN: "1", FAKE_CODEX_HOLD_STREAM_REVIEW: "1",
       FAKE_CODEX_PLAIN_REVIEW_TURNS: JSON.stringify([plan]),
       FAKE_CODEX_NATIVE_REVIEW_TEXT: "VERDICT: pass\nFINDINGS: none\nTEST GAPS: none\nSUMMARY: 已检查实现和验证结果。" } });
   const store = new WorkflowStore(directory);
@@ -36,7 +40,14 @@ test("DSH receives Planner output in its session before planning completes", asy
     transientRetryJitterRatio: 0, turnTimeoutMs: 5_000, idleProcessMs: 0,
     terminalRelayTimeoutMs: 60_000, storageDir: directory } as WorkflowConfig;
   const agent = { id: "session-live", session: { header: { cwd: directory },
-    append: (type: string, data: unknown) => events.push({ type, data }) } } as unknown as Agent;
+    append: (type: string, data: unknown) => {
+      events.push({ type, data });
+      if (type !== "dsh-codex-workflow/live") return;
+      const live = data as { stage?: string; entries?: Array<{ text: string }> };
+      const text = live.entries?.map((entry) => entry.text).join("") ?? "";
+      if (live.stage === "planning" && text.includes("Implement safely")) plannerVisible();
+      if (live.stage === "reviewing" && text.includes("VERDICT: pass")) reviewerVisible();
+    } } } as unknown as Agent;
   const agents = { get: (id: string) => id === agent.id ? agent : undefined,
       create: async (options: { sessionId: ReturnType<typeof SessionId> }) => {
         const now = Date.now();
@@ -66,14 +77,19 @@ test("DSH receives Planner output in its session before planning completes", asy
   const childFactory = new CodexChildSessionFactory(agents as never, subagents as never);
   const manager = new WorkflowManager(store, codex, config, undefined, undefined, undefined, {}, agents, childFactory);
   const exec = { agent, signal: new AbortController().signal, deferContext: () => undefined } as unknown as ToolRunContext;
+  const control = (codex as unknown as { request(method: string, params: object): Promise<unknown> }).request.bind(codex);
+  let plannerThreadId: string | undefined, reviewerThreadId: string | undefined;
   let pending: Promise<unknown> | undefined;
   try {
     let settled = false;
     pending = manager.start({ task: "规划安全接口和验证步骤" }, exec).finally(() => { settled = true; });
-    const deadline = Date.now() + 4_000;
-    while (!events.some((event) => event.type === "dsh-codex-workflow/live") && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
+    // Observe real session output before releasing the original fixture turn.
+    // Missing output still fails through the existing business turn timeout.
+    await Promise.race([plannerProgress, pending.then(() => { throw new Error("Planner completed before its live session output"); })]);
+    const plannerStreams = await control("fixture/heldStreams", {}) as { turns: string[] };
+    assert.equal(plannerStreams.turns.length, 1);
+    plannerThreadId = plannerStreams.turns[0];
+    assert.ok(plannerThreadId);
     assert.ok(events.some((event) => event.type === "dsh-codex-workflow/plan-updated"
       && (event.data as { status?: string }).status === "planning"), "the tab can open at planning start");
     assert.equal(children.length, 1, "the Planner is a real child session");
@@ -83,17 +99,19 @@ test("DSH receives Planner output in its session before planning completes", asy
       && JSON.stringify(event.data).includes("Implement safely")), "the session receives live plan text");
     assert.equal(settled, false, "Codex planning is still running when the sidebar gets text");
     assert.ok(children[0]?.frames.some((frame) => frame.type === "chunk"), "native child chat receives live frames");
+    await control("fixture/releaseStreamTurn", { threadId: plannerThreadId });
+    plannerThreadId = undefined;
     const planned = await pending as WorkflowRecord;
     assert.equal(planned.phase, "executing");
     await writeFile(join(directory, "a.txt"), "review evidence", "utf8");
     settled = false;
     pending = manager.review(planned.id, { implementationSummary: "完成实现", changedFiles: ["a.txt"],
       testResults: "已验证" }, exec).finally(() => { settled = true; });
-    const reviewDeadline = Date.now() + 4_000;
-    while (!events.some((event) => event.type === "dsh-codex-workflow/live"
-      && (event.data as { stage?: string }).stage === "reviewing") && Date.now() < reviewDeadline) {
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
+    await Promise.race([reviewerProgress, pending.then(() => { throw new Error("Reviewer completed before its live session output"); })]);
+    const reviewerStreams = await control("fixture/heldStreams", {}) as { reviews: string[] };
+    assert.equal(reviewerStreams.reviews.length, 1);
+    reviewerThreadId = reviewerStreams.reviews[0];
+    assert.ok(reviewerThreadId);
     assert.ok(events.some((event) => event.type === "dsh-codex-workflow/review-start"));
     assert.equal(children.length, 2, "the Reviewer owns a separate child session");
     assert.ok((events.find((event) => event.type === "dsh-codex-workflow/review-start")?.data as { childSessionId?: string }).childSessionId);
@@ -102,8 +120,12 @@ test("DSH receives Planner output in its session before planning completes", asy
       && (event.data as { entries?: Array<{ text: string }> }).entries?.map((entry) => entry.text).join("").includes("VERDICT: pass")),
     "the session receives live review text");
     assert.equal(settled, false, "Codex review is still running when the sidebar gets text");
+    await control("fixture/releaseStreamReview", { threadId: reviewerThreadId });
+    reviewerThreadId = undefined;
     await pending;
   } finally {
+    if (plannerThreadId) await control("fixture/releaseStreamTurn", { threadId: plannerThreadId }).catch(() => undefined);
+    if (reviewerThreadId) await control("fixture/releaseStreamReview", { threadId: reviewerThreadId }).catch(() => undefined);
     await pending?.catch(() => undefined);
     await manager.stop();
     await codex.stop();
