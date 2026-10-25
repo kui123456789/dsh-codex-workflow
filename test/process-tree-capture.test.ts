@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import childProcess, { type ExecFileOptions } from "node:child_process";
+import fs, { type PathLike } from "node:fs";
+import { join } from "node:path";
 import { syncBuiltinESMExports } from "node:module";
 import test, { type TestContext } from "node:test";
 import { captureProcessTreeEvidence, originalProcessTreeExited } from "../src/infrastructure/process-transport.js";
@@ -10,6 +12,29 @@ const rootBirth = "win32:134357732495098540";
 const capturedParentBirth = "win32:134357732495653800";
 const staleBirth = "win32:134357729781063110";
 const windowsOnly = { skip: process.platform !== "win32" };
+
+for (const modernAvailable of [true, false]) {
+  test(`Windows census uses the installed modern host with legacy fallback: ${modernAvailable}`, windowsOnly, async (t) => {
+    const modern = join(process.env.ProgramW6432 ?? process.env.ProgramFiles ?? "C:\\Program Files", "PowerShell", "7", "pwsh.exe");
+    const legacy = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    const exists = t.mock.method(fs, "existsSync", (path: PathLike) => String(path) === modern && modernAvailable);
+    let invoked: string | undefined;
+    const execute = t.mock.method(childProcess, "execFile", ((command: string, args: string[], options: ExecFileOptions,
+      callback: (error: Error | null, stdout: string, stderr: string) => void) => {
+      invoked = command;
+      assert.equal(options.timeout, 4000);
+      assert.ok(args.some(value => value.includes("Get-CimInstance Win32_Process") && value.includes("ToFileTimeUtc")));
+      queueMicrotask(() => callback(null, JSON.stringify([{ ProcessId: root, ParentProcessId: 1, Birth: rootBirth }]), ""));
+      return new childProcess.ChildProcess();
+    }) as typeof childProcess.execFile);
+    syncBuiltinESMExports();
+    try {
+      const result = await captureProcessTreeEvidence(root);
+      assert.equal(invoked, modernAvailable ? modern : legacy);
+      assert.deepEqual(result?.processIdentities, [{ processId: root, birth: rootBirth }]);
+    } finally { execute.mock.restore(); exists.mock.restore(); syncBuiltinESMExports(); }
+  });
+}
 
 /** This is a controlled metadata replay through the real producer, not a
  * claim that these PIDs are presently owned SDK processes. The real stale

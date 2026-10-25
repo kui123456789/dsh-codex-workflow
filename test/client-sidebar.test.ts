@@ -309,3 +309,137 @@ test("settings tab binds ConfigForm subscription and reads models over Connectio
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepEqual(calls, [["/dsh-codex-workflow", "models"]]);
 });
+
+function rpcSidebar(legacy?: { getSnapshot(): unknown; subscribe(listener: () => void): () => void }) {
+  let plugin: { apply(ctx: unknown): () => void } | undefined;
+  let mounted: string | undefined = "parent-1";
+  let notifyMounted: (() => void) | undefined;
+  let injectBody: ((id: string) => { projectionFace: { getSnapshot(): unknown } }) | undefined;
+  let nextTimer = 0;
+  const timers = new Map<number, { delay: number; run: () => void }>();
+  const requests: Array<{ sessionId: string; signal: AbortSignal; resolve(value: unknown): void; reject(error: Error): void }> = [];
+  const opened: string[] = [];
+  runInNewContext(readFileSync(join(process.cwd(), "src/client.js"), "utf8"), {
+    AbortController,
+    setTimeout: (run: () => void, delay: number) => { const id = ++nextTimer; timers.set(id, { run, delay }); return id; },
+    clearTimeout: (id: number) => timers.delete(id),
+    window: { __ModuleLoader__: { load: (entry: { factory(require: (name: string) => unknown): typeof plugin }) => {
+      plugin = entry.factory(() => ({ createElement: () => null }));
+    } } },
+  });
+  const dispose = plugin!.apply({
+    connection: { rpc: { call: (channel: string, endpoint: string, payload: { args: { sessionId: string } }, signal: AbortSignal) => {
+      assert.equal(channel, "/dsh-codex-workflow");
+      assert.equal(endpoint, "workflow-state");
+      return new Promise((resolve, reject) => requests.push({ sessionId: payload.args.sessionId, signal, resolve, reject }));
+    } } },
+    sidebarRightTabs: { register: () => () => undefined },
+    slots: {
+      inject: (_name: string, register: () => void) => { register(); return () => undefined; },
+      register: (definition: { name?: string; inject?: typeof injectBody }) => {
+        if (definition.name === "sidebar.right.pane.tab") injectBody = definition.inject;
+        return () => undefined;
+      },
+    },
+    sidebarRight: {
+      mounted: { getSnapshot: () => mounted, subscribe: (listener: () => void) => { notifyMounted = listener; return () => undefined; } },
+      openResource: (address: string) => opened.push(address),
+      openTab: () => opened.push("fallback"),
+    },
+    sessions: { binding: () => legacy ? { session: { projections: { faceOf: () => legacy } } } : undefined },
+  });
+  return {
+    requests, opened, timers, dispose,
+    face: (id = "parent-1") => injectBody!(id).projectionFace,
+    mount: (id: string | undefined) => { mounted = id; notifyMounted?.(); },
+    poll: () => {
+      const timer = [...timers].find(([, value]) => value.delay === 1_000);
+      assert.ok(timer, "subscribed state schedules the next one-second read");
+      timers.delete(timer[0]);
+      timer[1].run();
+    },
+  };
+}
+
+const sidecarProjection = (childSessionId: string) => ({ currentWorkflowId: "wf", plan: {
+  workflowId: "wf", childSessionId, status: "planning", questions: [], assumptions: [],
+}, activeReview: null, reviews: [] });
+const drainRpc = async () => { for (let step = 0; step < 6; step += 1) await Promise.resolve(); };
+
+test("sidecar RPC restores the native sidebar without a live Session binding and retains state across read failures", async () => {
+  const sidebar = rpcSidebar();
+  try {
+    assert.equal(sidebar.requests.length, 1);
+    sidebar.requests[0]!.resolve({ ok: true, value: { externalState: true, projection: null } });
+    await drainRpc();
+    assert.equal(sidebar.opened.length, 0);
+    assert.deepEqual(JSON.parse(JSON.stringify(sidebar.face().getSnapshot())), {
+      currentWorkflowId: null, plan: null, activeReview: null, reviews: [],
+    });
+    sidebar.poll();
+    sidebar.requests[1]!.resolve({ ok: true, value: { externalState: true, projection: sidecarProjection("cold-child") } });
+    await drainRpc();
+    assert.equal(sidebar.opened.length, 1);
+    assert.match(sidebar.opened[0]!, /session\/cold-child\?parent=parent-1/);
+    const accepted = sidebar.face().getSnapshot();
+    sidebar.poll();
+    sidebar.requests[2]!.resolve({ ok: true, value: { externalState: true, projection: sidecarProjection("cold-child") } });
+    await drainRpc();
+    assert.equal(sidebar.face().getSnapshot(), accepted, "unchanged reads retain a stable React snapshot");
+    assert.equal(sidebar.opened.length, 1, "the same durable child is not reopened by polling");
+    sidebar.poll();
+    sidebar.requests[3]!.reject(new Error("connection reset"));
+    await drainRpc();
+    assert.equal(sidebar.face().getSnapshot(), accepted, "transport errors retain the accepted state");
+    sidebar.poll();
+    const pending = sidebar.requests[4]!;
+    sidebar.dispose();
+    assert.equal(pending.signal.aborted, true);
+    pending.resolve({ ok: true, value: { externalState: true, projection: sidecarProjection("too-late") } });
+    await drainRpc();
+    assert.equal(sidebar.opened.length, 1);
+    assert.equal(sidebar.timers.size, 0, "unmounted clients leave no polling or retry timers");
+  } finally { sidebar.dispose(); }
+});
+
+test("switching sessions cancels sidecar reads and prevents old responses from opening another session's child", async () => {
+  const sidebar = rpcSidebar();
+  try {
+    const original = sidebar.requests[0]!;
+    sidebar.mount("parent-2");
+    assert.equal(original.signal.aborted, true);
+    assert.equal(sidebar.requests[1]!.sessionId, "parent-2");
+    original.resolve({ ok: true, value: { externalState: true, projection: sidecarProjection("old-child") } });
+    sidebar.requests[1]!.resolve({ ok: true, value: { externalState: true, projection: sidecarProjection("current-child") } });
+    await drainRpc();
+    assert.equal(sidebar.opened.length, 1);
+    assert.match(sidebar.opened[0]!, /current-child\?parent=parent-2/);
+    sidebar.mount(undefined);
+    assert.equal([...sidebar.timers.values()].filter(timer => timer.delay === 1_000).length, 0);
+    sidebar.mount("parent-1");
+    assert.equal(sidebar.requests[2]!.sessionId, "parent-1", "returning to a released session starts a fresh read");
+    assert.equal(sidebar.opened.length, 1, "the cancelled old snapshot was not cached");
+  } finally { sidebar.dispose(); }
+});
+
+test("legacy hosts keep their projection subscription when workflow-state uses the legacy source", async () => {
+  let projection = sidecarProjection("legacy-child");
+  let notify: (() => void) | undefined;
+  let subscriptions = 0;
+  const sidebar = rpcSidebar({ getSnapshot: () => projection, subscribe: (listener) => {
+    subscriptions += 1;
+    notify = listener;
+    return () => { subscriptions -= 1; };
+  } });
+  try {
+    sidebar.requests[0]!.resolve({ ok: true, value: { externalState: false, projection: null } });
+    await drainRpc();
+    assert.equal(sidebar.face().getSnapshot(), projection);
+    assert.equal(subscriptions, 1);
+    projection = sidecarProjection("next-legacy-child");
+    notify?.();
+    assert.equal(sidebar.opened.length, 2);
+    assert.match(sidebar.opened[1]!, /next-legacy-child/);
+  } finally { sidebar.dispose(); }
+  assert.equal(subscriptions, 0);
+});

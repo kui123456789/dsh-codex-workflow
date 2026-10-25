@@ -1,0 +1,75 @@
+name: release-verification
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - package.json
+      - src/version.ts
+      - .github/workflows/release-verify.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-release:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      DSH_WORKFLOW_TEST_CONCURRENCY: "1"
+      DSH_WORKFLOW_TEST_REPORTER: tap
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.14.0"
+      - name: Install pinned development dependencies
+        run: |
+          corepack enable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          corepack prepare pnpm@10.33.2 --activate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm install --frozen-lockfile
+      - name: Install the supported DSH host into temporary storage
+        run: |
+          $hostRoot = Join-Path $env:RUNNER_TEMP 'dsh-host'
+          npm install --prefix $hostRoot --no-package-lock --ignore-scripts @deepseek-ai/dsh@0.2.1-rc.3
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "DSH_CODEX_HOST_PACKAGE_JSON=$hostRoot/node_modules/@deepseek-ai/dsh/package.json" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Run the complete isolated release gate
+        run: pnpm verify:isolated
+      - name: Collect native evidence and package only a completed gate
+        if: always()
+        run: |
+          $output = Join-Path $env:RUNNER_TEMP 'release-artifacts'
+          New-Item -ItemType Directory -Path $output -Force | Out-Null
+          $evidenceRoot = Join-Path (Split-Path $env:GITHUB_WORKSPACE) '.codex-workflow-verification'
+          $runs = @(Get-ChildItem -LiteralPath $evidenceRoot -Directory -Filter 'isolated-*')
+          if ($runs.Count -ne 1) { throw 'Expected one isolated verification receipt' }
+          $evidence = $runs[0].FullName
+          foreach ($name in @('summary.json', 'inputs.json', 'protected-build.json', 'artifacts.json')) {
+            $path = Join-Path $evidence $name
+            if (Test-Path -LiteralPath $path) { Copy-Item -LiteralPath $path -Destination $output }
+          }
+          Copy-Item -LiteralPath (Join-Path $evidence 'logs') -Destination $output -Recurse
+          $summary = Get-Content -LiteralPath (Join-Path $evidence 'summary.json') -Raw | ConvertFrom-Json
+          if ($summary.complete -ne $true) { throw 'Incomplete gate cannot produce a release package' }
+          pnpm --dir $summary.stageDirectory pack --pack-destination $output
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $packages = @(Get-ChildItem -LiteralPath $output -Filter '*.tgz')
+          if ($packages.Count -ne 1) { throw 'Expected one verified release package' }
+          $hash = Get-FileHash -LiteralPath $packages[0].FullName -Algorithm SHA256
+          "$($hash.Hash.ToLowerInvariant())  $($packages[0].Name)" | Set-Content -LiteralPath (Join-Path $output 'SHA256SUMS') -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-verification-${{ github.sha }}
+          path: ${{ runner.temp }}/release-artifacts/
+          if-no-files-found: error
+          retention-days: 14

@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { CoordinationStore, coordinationPath } from "./coordination.js";
 import type { ReviewFinding, ReviewStep, WorkflowMode, WorkflowPhase, WorkflowProcessState, WorkflowRecord } from "./types.js";
 import { deserializeWorkflowRecord, serializeWorkflowRecord } from "./state/workflow-schema.js";
+import { codexWorkflowProjectionDefinition, type CodexWorkflowProjection, type CodexWorkflowProjectionState,
+  type CodexWorkflowSessionEvent } from "./review-events.js";
 
 export interface UpdateOutcome<T> {
   /** The record as persisted after this update (or the untouched current
@@ -126,6 +128,30 @@ export class WorkflowStore {
   snapshot(id: string): WorkflowRecord | undefined {
     const row = this.ensure().loadWorkflow(id);
     return row ? parseWorkflowRow(row) : undefined;
+  }
+
+  /** Persist plugin-owned display state without adding host session events or
+   * changing the authoritative workflow record/revision. */
+  appendUiEvent(sessionId: string, event: CodexWorkflowSessionEvent): void {
+    if (!sessionId) throw new Error("workflow UI session id must not be empty");
+    if (!["dsh-codex-workflow/plan-updated", "dsh-codex-workflow/review-start",
+      "dsh-codex-workflow/review-progress", "dsh-codex-workflow/review-end", "dsh-codex-workflow/live"].includes(event.type)) {
+      throw new Error(`unsupported workflow UI event: ${event.type}`);
+    }
+    this.ensure().updateWorkflowUi(sessionId, (raw) => {
+      const state = raw === undefined ? codexWorkflowProjectionDefinition.init() : parseUiState(raw);
+      const next = codexWorkflowProjectionDefinition.apply(state,
+        { ...event, seq: 0, time: Date.now() } as Parameters<typeof codexWorkflowProjectionDefinition.apply>[1]);
+      if (next.failure !== null) throw new Error(next.failure);
+      const serialized = JSON.stringify(next);
+      parseUiState(serialized);
+      return serialized;
+    });
+  }
+
+  uiProjection(sessionId: string): CodexWorkflowProjection | undefined {
+    const raw = this.ensure().loadWorkflowUi(sessionId);
+    return raw === undefined ? undefined : codexWorkflowProjectionDefinition.wire.view(parseUiState(raw));
   }
 
   async list(): Promise<WorkflowRecord[]> {
@@ -415,6 +441,14 @@ function normalizeFinding(finding: ReviewFinding): ReviewFinding {
     ? finding.blocking
     : finding.severity === "critical" || finding.severity === "high";
   return { ...finding, blocking };
+}
+
+function parseUiState(raw: string): CodexWorkflowProjectionState {
+  const state: unknown = JSON.parse(raw);
+  // Validate without dropping optional tool details absent from the legacy
+  // projection schema (command/cwd/exitCode/status/files).
+  codexWorkflowProjectionDefinition.stateSchema.parse(state);
+  return state as CodexWorkflowProjectionState;
 }
 
 function recordJson(record: WorkflowRecord): string {

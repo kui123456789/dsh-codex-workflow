@@ -1,6 +1,6 @@
-# Release checklist — dsh-codex-workflow 1.1.14
+# Release checklist — dsh-codex-workflow 1.1.15
 
-This is the operator checklist for shipping the CURRENT release (1.1.14; keep this line in sync with `package.json` on every release). It assumes the automated gates
+This is the operator checklist for shipping the CURRENT release (1.1.15; keep this line in sync with `package.json` on every release). It assumes the automated gates
 succeeded; this page is about the things automation cannot cover, plus the
 rollback story. It never authorizes touching user credentials or configuration
 outside `$DSH_HOME/storages/dsh-codex-workflow/`.
@@ -297,7 +297,7 @@ For Chinese DSH prompts and identity checks, use the [same-session recovery guid
      then restore `complex`;
    - while one workflow is active, send another qualifying request and confirm
      no second WorkflowRecord or Planner task is created.
-3. **Current acceptance path (1.1.14).** The manual harnesses this step used to
+3. **Current acceptance path (1.1.15).** The manual harnesses this step used to
    name (`pnpm lifecycle:accept`, `pnpm review-only:accept`) were REMOVED: they
    drove the pre-1.1.0 CLI-visible wiring and could no longer be trusted as
    evidence. Run instead:

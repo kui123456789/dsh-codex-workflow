@@ -135,3 +135,75 @@ test("Codex clarification waits without settling and appends the answer to its o
     factory.unregisterProvider();
   }
 });
+
+test("activation-only hosts retain a real native one-shot child without starting a model activation", async () => {
+  const parentSession = Session.create(SessionId("parent-activation-host"), [], {
+    version: SESSION_FORMAT_VERSION, id: SessionId("parent-activation-host"), createdAt: Date.now(), isSeeded: false, cwd: process.cwd(),
+  });
+  const parent = { id: parentSession.id, session: parentSession } as Agent;
+  const children: Session[] = [];
+  let disposed = 0;
+  const factory = new CodexChildSessionFactory({ create: async (options: {
+    sessionId: ReturnType<typeof SessionId>; parentAgent: Agent; meta: Record<string, unknown>;
+  }) => {
+    assert.equal(options.parentAgent, parent);
+    const session = Session.create(options.sessionId, [], {
+      version: SESSION_FORMAT_VERSION, id: options.sessionId, createdAt: Date.now(), isSeeded: false, ...options.meta,
+    });
+    children.push(session);
+    return { agent: { id: session.id, session } as Agent, dispose: async () => { disposed += 1; } };
+  } } as never, {
+    registerProvider() { return () => {}; },
+    startActivation() { assert.fail("native Codex mirrors must not start an external activation or a parent-model loop"); },
+  });
+  const child = await factory.create(parent, process.cwd(), "Codex Planner", "Plan the change", new AbortController().signal);
+  try {
+    assert.equal(children.length, 1);
+    assert.equal(child.session.header.parentSession, parent.id);
+    assert.equal(child.session.header.origin, "subagent");
+    assert.equal(child.session.header.delegationDepth, 1);
+    assert.equal(child.session.header.agentPreset, "standard");
+    const catalog = parentSession.snapshotEvents().filter(event => event.type === "subagent/catalog");
+    assert.equal(catalog.length, 1);
+    assert.deepEqual(catalog[0]?.data, { version: 0, childId: child.id,
+      childCreatedAt: child.session.header.createdAt, mode: "one-shot", label: "Codex Planner" });
+    const descriptor = child.session.snapshotEvents().find(event => event.type === "subagent/descriptor");
+    assert.deepEqual(descriptor?.data, snapshotSubagentDescriptor({ mode: "one-shot", provider: "codex-workflow", label: "Codex Planner" }));
+    child.pauseForInput!("Which directory?");
+    child.beginContinuation("Use this directory.");
+    child.finish("The plan is ready.");
+    assert.deepEqual(child.session.snapshotEvents().filter(event => event.type === "turn/start").map(event => event.data.turn), [1, 2]);
+    assert.equal(parentSession.snapshotEvents().filter(event => event.type === "subagent/catalog").length, 1);
+    assert.equal(child.session.deriveMessages().at(-1)?.content[0]?.type, "text");
+  } finally {
+    await child.dispose();
+    await child.dispose();
+    assert.equal(disposed, 1);
+    factory.unregisterProvider();
+  }
+});
+
+test("activation-only host releases the real child if catalog publication fails", async () => {
+  const parentSession = Session.create(SessionId("parent-catalog-failure"));
+  const parent = { id: parentSession.id, session: parentSession } as Agent;
+  const failure = new Error("parent session publication failed");
+  parentSession.append = (() => { throw failure; }) as typeof parentSession.append;
+  let disposed = 0;
+  let childSession: Session | undefined;
+  const factory = new CodexChildSessionFactory({ create: async (options: { sessionId: ReturnType<typeof SessionId> }) => {
+    childSession = Session.create(options.sessionId);
+    return { agent: { id: options.sessionId, session: childSession } as Agent, dispose: async () => { disposed += 1; } };
+  } } as never, {
+    registerProvider() { return () => {}; },
+    startActivation() { assert.fail("native Codex mirrors must not use external activation admission"); },
+  });
+  try {
+    await assert.rejects(factory.create(parent, process.cwd(), "Codex Planner", "Plan the change", new AbortController().signal),
+      error => error === failure);
+    assert.equal(disposed, 1);
+    assert.equal(childSession?.snapshotEvents().at(-1)?.type, "turn/end");
+    assert.equal(parentSession.snapshotEvents().length, 0);
+  } finally {
+    factory.unregisterProvider();
+  }
+});

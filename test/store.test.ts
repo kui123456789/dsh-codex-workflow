@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { closeCoordinationStoresForDirectory, CoordinationStore } from "../src/coordination.js";
 import { WorkflowStore } from "../src/store.js";
+import type { CodexWorkflowSessionEvent } from "../src/review-events.js";
 import type { WorkflowRecord } from "../src/types.js";
 
 async function rmClosed(path: string): Promise<void> {
@@ -51,6 +52,87 @@ test("persists and lists workflow records atomically", async () => {
     assert.equal((await store.activeForSession("session-1"))?.id, record.id);
     assert.equal((await store.list())[0]?.revision, 1);
   } finally {
+    await rmClosed(directory);
+  }
+});
+
+test("workflow UI state merges independent writers and survives cold recovery without advancing workflow revision", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-ui-"));
+  const first = new WorkflowStore(directory);
+  const second = new WorkflowStore(directory);
+  let reopened: WorkflowStore | undefined;
+  try {
+    await first.save({
+      schemaVersion: 1, id: "wf-ui", dshSessionId: "session-ui", cwd: process.cwd(), task: "sidecar",
+      phase: "executing", createdAt: "2026-10-25T00:00:00.000Z", updatedAt: "2026-10-25T00:00:00.000Z",
+      assumptions: [], questions: [], reviewCycles: 0,
+    });
+    await second.init();
+    const original = await first.load("wf-ui");
+    assert.equal(first.uiProjection("session-ui"), undefined);
+    first.appendUiEvent("session-ui", { type: "dsh-codex-workflow/plan-updated", data: {
+      workflowId: "wf-ui", status: "ready", planMarkdown: "Retained plan", questions: [], assumptions: [],
+    } });
+    second.appendUiEvent("session-ui", { type: "dsh-codex-workflow/review-start", data: {
+      workflowId: "wf-ui", reviewId: "review-ui", attempt: 1, startedAt: "2026-10-25T00:00:01.000Z", mode: "planned",
+    } });
+    first.appendUiEvent("session-ui", { type: "dsh-codex-workflow/live", data: {
+      workflowId: "wf-ui", stage: "reviewing", reviewId: "review-ui", at: "2026-10-25T00:00:02.000Z",
+      entries: [{ kind: "tool", itemId: "tool-ui", text: "Checking ", command: "pnpm typecheck", cwd: directory, files: ["src/store.ts"] }],
+    } });
+    second.appendUiEvent("session-ui", { type: "dsh-codex-workflow/live", data: {
+      workflowId: "wf-ui", stage: "reviewing", reviewId: "review-ui", at: "2026-10-25T00:00:03.000Z",
+      entries: [{ kind: "tool", itemId: "tool-ui", text: "complete", exitCode: 0, status: "completed" }],
+    } });
+    first.close();
+    second.close();
+    reopened = new WorkflowStore(directory);
+    await reopened.init();
+    const view = reopened.uiProjection("session-ui");
+    assert.equal(view?.plan?.planMarkdown, "Retained plan");
+    assert.equal(view?.activeReview?.reviewId, "review-ui");
+    assert.equal(view?.reviews.length, 1);
+    assert.deepEqual(view?.reviews[0]?.live, [{ kind: "tool", itemId: "tool-ui", text: "Checking complete",
+      command: "pnpm typecheck", cwd: directory, files: ["src/store.ts"], exitCode: 0, status: "completed" }]);
+    assert.deepEqual(await reopened.load("wf-ui"), original);
+    assert.equal(reopened.uiProjection("other-session"), undefined);
+    assert.deepEqual(reopened.coordinationHandle.integrityCheck(), ["ok"]);
+  } finally {
+    first.close();
+    second.close();
+    reopened?.close();
+    await rmClosed(directory);
+  }
+});
+
+test("workflow UI state rejects invalid folds and rolls back failed persistence", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-ui-rollback-"));
+  const store = new WorkflowStore(directory);
+  try {
+    await store.init();
+    const event: CodexWorkflowSessionEvent = { type: "dsh-codex-workflow/plan-updated", data: {
+      workflowId: "wf-ui", status: "planning", questions: [], assumptions: [],
+    } };
+    store.appendUiEvent("session-ui", event);
+    const original = store.uiProjection("session-ui");
+    assert.throws(() => store.appendUiEvent("session-ui", {
+      ...event, data: { ...event.data, status: "invalid" },
+    } as unknown as CodexWorkflowSessionEvent));
+    assert.deepEqual(store.uiProjection("session-ui"), original);
+    store.coordinationHandle.db.exec(`CREATE TRIGGER reject_ui_write BEFORE UPDATE ON workflow_ui
+      BEGIN SELECT RAISE(ABORT, 'scripted UI persistence failure'); END`);
+    assert.throws(() => store.appendUiEvent("session-ui", {
+      ...event, data: { ...event.data, status: "ready", planMarkdown: "Committed after recovery" },
+    }), /scripted UI persistence failure/);
+    assert.deepEqual(store.uiProjection("session-ui"), original);
+    store.coordinationHandle.db.exec("DROP TRIGGER reject_ui_write");
+    store.appendUiEvent("session-ui", {
+      ...event, data: { ...event.data, status: "ready", planMarkdown: "Committed after recovery" },
+    });
+    assert.equal(store.uiProjection("session-ui")?.plan?.planMarkdown, "Committed after recovery");
+    assert.deepEqual(store.coordinationHandle.integrityCheck(), ["ok"]);
+  } finally {
+    store.close();
     await rmClosed(directory);
   }
 });

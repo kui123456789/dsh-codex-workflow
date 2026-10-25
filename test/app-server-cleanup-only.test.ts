@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import type { ChildProcess } from "node:child_process";
+import childProcess, { type ChildProcess } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
@@ -168,8 +169,26 @@ test("ordinary Planner native clarification keeps its request and never interrup
   } finally { await f.close(); }
 });
 
-test("a durable conversion fork waiter timeout retains its original continuation classification and subscription after failed ACK", async () => {
+test("a durable conversion fork waiter timeout retains its original continuation classification and subscription after failed ACK", async (t) => {
   const f = await fixture("failed", false);
+  const originalExecFile = childProcess.execFile;
+  let activeCensuses = 0, peakCensuses = 0;
+  const nativeQuery = t.mock.method(childProcess, "execFile", ((...args: unknown[]) => {
+    const values = args[1];
+    if (!Array.isArray(values) || !values.some(value => String(value).includes("Get-CimInstance Win32_Process"))) {
+      return Reflect.apply(originalExecFile, childProcess, args);
+    }
+    activeCensuses += 1;
+    peakCensuses = Math.max(peakCensuses, activeCensuses);
+    const callback = args.at(-1) as (...values: unknown[]) => void;
+    try {
+      return Reflect.apply(originalExecFile, childProcess, [...args.slice(0, -1), (...values: unknown[]) => {
+        activeCensuses -= 1;
+        callback(...values);
+      }]);
+    } catch (error) { activeCensuses -= 1; throw error; }
+  }) as typeof childProcess.execFile);
+  syncBuiltinESMExports();
   try {
     await f.configure({ status: [{ kind: "hold" }] });
     (f.client as unknown as { options: { requestTimeoutMs: number } }).options.requestTimeoutMs = 80;
@@ -184,7 +203,12 @@ test("a durable conversion fork waiter timeout retains its original continuation
     assert.deepEqual(observed.unsubscribes, []);
     assert.deepEqual(observed.active, [{ threadId: failure.threadId, turnId: failure.turnId }]);
     await f.finishCleanup(failure);
-  } finally { await f.close(); }
+  } finally {
+    try { await f.close(); }
+    finally { nativeQuery.mock.restore(); syncBuiltinESMExports(); }
+  }
+  if (process.platform === "win32") assert.equal(peakCensuses, 1,
+    "one original backend must not compete with its own fork, receipt and interruption census queries");
 });
 
 test("a native conversion request cannot unsubscribe while its interruption ACK is still pending", async () => {
