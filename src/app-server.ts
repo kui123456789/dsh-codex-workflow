@@ -91,6 +91,7 @@ interface PendingForkCreation {
   error?: Error;
   cleanupFlight?: Promise<void>;
   evidence?: Promise<ProcessTreeEvidence>;
+  evidenceReleased?: boolean;
 }
 
 interface PendingForkRelease {
@@ -356,6 +357,7 @@ export class CodexAppServerClient {
   private idleRetirement?: IdleProcessRetirement;
   /** Only teardown shares a census; model-stage snapshots can omit later children. */
   private readonly processRetirements = new WeakMap<ChildProcess, IdleProcessRetirement>();
+  private readonly processCensuses = new WeakMap<ChildProcess, Promise<void>>();
   private readonly retirementDiagnostics = new WeakMap<ProcessTreeEvidence, readonly ProcessTreeObservation[]>();
   private readonly startupDiagnostics = new WeakMap<ChildProcess, readonly ProcessTreeCaptureObservation[]>();
   private readonly initializedProcessTrees = new WeakMap<ChildProcess, Promise<ProcessTreeEvidence>>();
@@ -603,7 +605,8 @@ export class CodexAppServerClient {
         return evidence;
       };
       if (this.child !== creation.process || creation.process.exitCode !== null || creation.process.signalCode !== null) return finish();
-      const captured = await captureProcessTreeEvidence(processId, value => observations.push(value));
+      const captured = await this.captureOwnedProcessTree(creation.process, value => observations.push(value),
+        () => !creation.evidenceReleased);
       if (this.child !== creation.process || creation.process.exitCode !== null || creation.process.signalCode !== null) return finish();
       return finish(captured);
     })();
@@ -1258,6 +1261,7 @@ export class CodexAppServerClient {
       if (this.captureThreadOwner(release.fork.threadId)) throw new Error("Original conversion subscription release is unconfirmed");
       for (const key of [...this.turns.keys()]) if (key.startsWith(`${release.fork.threadId}:`)) this.turns.delete(key);
       release.released = true;
+      release.creation.evidenceReleased = true;
       this.forkReleases.delete(release);
       this.scheduleIdle();
     })();
@@ -1626,7 +1630,7 @@ export class CodexAppServerClient {
         const processId = child.pid;
         const started = performance.now();
         const observations: ProcessTreeCaptureObservation[] = [];
-        const captured = await captureProcessTreeEvidence(processId, value => observations.push(value));
+        const captured = await this.captureOwnedProcessTree(child, value => observations.push(value));
         const retired = this.child !== child || child.exitCode !== null || child.signalCode !== null;
         if (retired) observations.push(Object.freeze({ processId, code: "owner_retired",
           elapsedMs: Math.max(0, Math.round(performance.now() - started)), limitMs: 4000 }));
@@ -1831,7 +1835,7 @@ export class CodexAppServerClient {
     const processId = receipt.process.pid;
     const task = (async (): Promise<ProcessTreeEvidence> => {
       if (this.child !== receipt.process || receipt.process.exitCode !== null) return Object.freeze({ processId });
-      const captured = await captureProcessTreeEvidence(processId);
+      const captured = await this.captureOwnedProcessTree(receipt.process, undefined, () => !receipt.lifecycle.released);
       if (this.child !== receipt.process || receipt.process.exitCode !== null || receipt.process.signalCode !== null) {
         return Object.freeze({ processId });
       }
@@ -2092,7 +2096,7 @@ export class CodexAppServerClient {
     owner: ChildProcess | undefined, cleanupOnly = false, threadOwner = this.captureThreadOwner(threadId)): Promise<T | CodexTurnInterruptionError> {
     const confirmed = await this.abandonTurn(threadId, turnId, owner, threadOwner);
     if (!confirmed && owner && this.child === owner && owner.exitCode === null && !this.stopped) {
-      const captured = await captureProcessTreeEvidence(owner.pid);
+      const captured = await this.captureOwnedProcessTree(owner);
       // A wrapper that exits while observed may have left a native descendant.
       // Keep the typed pending guard without a tree instead of assuming exit.
       const evidence = this.child === owner && !this.stopped && owner.exitCode === null && owner.signalCode === null ? captured : undefined;
@@ -2459,6 +2463,29 @@ export class CodexAppServerClient {
     if (this.idleRetirement === retirement) this.idleRetirement = undefined;
   }
 
+  /** Serialize fresh Windows queries for one exact backend. Fork/start receipts
+   * and interruption cleanup can otherwise launch three competing CIM scans.
+   * Each query retains its own native timeout and snapshot; no result is cached
+   * or lent to a later request, and retired owners cannot start a queued scan. */
+  private captureOwnedProcessTree(child: ChildProcess,
+    observe?: (value: ProcessTreeCaptureObservation) => void, needed: () => boolean = () => true): ReturnType<typeof captureProcessTreeEvidence> {
+    if (process.platform !== "win32") return captureProcessTreeEvidence(child.pid, observe);
+    const previous = this.processCensuses.get(child);
+    let release!: () => void;
+    const completion = new Promise<void>(resolve => { release = resolve; });
+    this.processCensuses.set(child, completion);
+    return (async () => {
+      try {
+        await previous;
+        if (!needed() || this.child !== child || child.exitCode !== null || child.signalCode !== null) return undefined;
+        return await captureProcessTreeEvidence(child.pid, observe);
+      } finally {
+        release();
+        if (this.processCensuses.get(child) === completion) this.processCensuses.delete(child);
+      }
+    })();
+  }
+
   private processRetirement(child: ChildProcess): IdleProcessRetirement {
     const original = this.processRetirements.get(child);
     if (original) return original;
@@ -2479,10 +2506,10 @@ export class CodexAppServerClient {
           return finish();
         };
         if (!stillOwned()) return retired();
-        let captured = await captureProcessTreeEvidence(processId, value => observations.push(value));
+        let captured = await this.captureOwnedProcessTree(child, value => observations.push(value));
         // One unavailable observation may be retried only before retirement,
         // while this same native child still belongs to the original SDK.
-        if (!captured && stillOwned()) captured = await captureProcessTreeEvidence(processId, value => observations.push(value));
+        if (!captured && stillOwned()) captured = await this.captureOwnedProcessTree(child, value => observations.push(value));
         if (!stillOwned()) return retired();
         return finish(captured);
       })(),

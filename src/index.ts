@@ -30,7 +30,10 @@ export const Config = ConfigSchema;
 export type Config = RawConfig;
 
 export async function apply(ctx: Context, raw: Config): Promise<void> {
-  registerCodexWorkflowSessionEventTypes();
+  const subagents = ctx.subagents as unknown as { start?: unknown; startActivation?: unknown };
+  if (typeof subagents.startActivation !== "function" || typeof subagents.start === "function") {
+    registerCodexWorkflowSessionEventTypes();
+  }
   const config = resolveConfig(raw);
   workflowToolTimeouts(config);
   const projections = ctx.get("sessionProjections") as { register(definition: typeof codexWorkflowProjectionDefinition): () => void } | undefined;
@@ -56,7 +59,7 @@ export async function apply(ctx: Context, raw: Config): Promise<void> {
       rpcTimeoutMs: config.rpcTimeoutMs,
       idleProcessMs: config.idleProcessMs,
     });
-    const disposeModelCatalogRoute = registerModelCatalogRoute(ctx, codex);
+    const disposeModelCatalogRoute = registerModelCatalogRoute(ctx, codex, store, childFactory.usesExternalUiState);
     const audit = new CodexCliAuditDispatcher({
       command: config.codexCommand,
       reviewSchemaFile: schemaFile,
@@ -217,17 +220,38 @@ function resolveConfig(raw: Config): WorkflowConfig {
 /** Authenticated browser route used by the settings page to display the
  * current App Server model catalog. The route is read-only and carries no
  * credentials or prompt content. */
-function registerModelCatalogRoute(ctx: Context, codex: CodexAppServerClient): (() => void) | undefined {
-  const connection = ctx.get("connection") as { rpc?: { handle(channel: "/dsh-codex-workflow", handler: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>): () => void | Promise<void> } };
-  return connection.rpc?.handle("/dsh-codex-workflow", async (endpoint, _payload, signal) => {
-    if (endpoint !== "models") return { ok: false, error: { code: "dsh-codex-workflow/not-found", message: "unknown workflow endpoint", details: {} } };
-    try {
-      const models = await codex.listModels(signal);
-      return { ok: true, value: { models } };
-    } catch (error) {
-      return { ok: false, error: { code: "dsh-codex-workflow/models", message: error instanceof Error ? error.message : String(error), details: {} } };
-    }
-  });
+function registerModelCatalogRoute(ctx: Context, codex: CodexAppServerClient, store: WorkflowStore, externalUiState: boolean): (() => void | Promise<void>) | undefined {
+  const register = (owner: Context) => {
+    const connection = (Reflect.get(owner, "connection") ?? owner.get("connection")) as { rpc?: { handle(channel: "/dsh-codex-workflow", handler: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>): () => void | Promise<void> } };
+    return connection.rpc?.handle("/dsh-codex-workflow", async (endpoint, payload, signal) => {
+      if (endpoint === "workflow-state") {
+        const sessionId = (payload as { args?: { sessionId?: unknown } } | null)?.args?.sessionId;
+        if (typeof sessionId !== "string" || !sessionId || sessionId.length > 512) {
+          return { ok: false, error: { code: "dsh-codex-workflow/invalid-session", message: "sessionId is required", details: {} } };
+        }
+        signal.throwIfAborted();
+        const projection = externalUiState ? store.uiProjection(sessionId) : undefined;
+        return { ok: true, value: { projection: projection ?? null, externalState: externalUiState } };
+      }
+      if (endpoint !== "models") return { ok: false, error: { code: "dsh-codex-workflow/not-found", message: "unknown workflow endpoint", details: {} } };
+      try {
+        const models = await codex.listModels(signal);
+        return { ok: true, value: { models } };
+      } catch (error) {
+        return { ok: false, error: { code: "dsh-codex-workflow/models", message: error instanceof Error ? error.message : String(error), details: {} } };
+      }
+    });
+  };
+  // HTTP-backed Connection RPC requires the registration owner's webServer service.
+  if (typeof ctx.inject === "function" && ctx.get("webServer")) {
+    const route = ctx.inject(["connection", "webServer"], (owner) => {
+      // Connection delegates through a service shadow on newer Cordis hosts.
+      // Carry the injected HTTP service into that registration context.
+      return register(owner.extend({ webServer: owner.get("webServer") }));
+    });
+    return () => route.dispose();
+  }
+  return register(ctx);
 }
 
 type LiveConfigValue<T> = T | { get(): T | undefined };

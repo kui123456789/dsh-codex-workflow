@@ -21,22 +21,42 @@ async function main() {
     log("actor-complete",{created:false,originalCause:true});return;
   }
   if (mode === "native-timeout") {
-    let f: Awaited<ReturnType<typeof sharedReviewerFixture>> | undefined;
+    const f=await sharedReviewerFixture(options);
     let callbackCleaned = false, aborted = false;
-    await test("controlled native timeout with a held lease notice", {timeout:4000}, async t => {
-      const nativeOptions={mode:"active" as const,signal:t.signal};
-      f=await sharedReviewerFixture(nativeOptions);
-      t.after(async()=>{
-        aborted=t.signal.aborted;await f!.close();callbackCleaned=true;
-        log("native-after-cleaned",{aborted,phase:f!.phase,nativeCalls:f!.nativeOptions.length});
+    let operation:Promise<unknown>|undefined;
+    let enterNotice!:()=>void;
+    const notice=new Promise<void>(resolve=>{enterNotice=resolve;});
+    const originalEnter=f.lossSeen.enter;
+    try {
+      f.lossSeen.enter=()=>{log("held-native-notice");enterNotice();};
+      operation=unavailableSharedReviewer(f);
+      const preparationDeadline=setTimeout(()=>controller.abort(new Error("Fixture did not reach the held native-timeout phase")),10_000);
+      try {
+        await Promise.race([notice,operation.then(()=>{
+          throw new Error("Original fixture settled before the held lease notice");
+        })]);
+        controller.signal.throwIfAborted();
+      } finally {clearTimeout(preparationDeadline);}
+      // The native timeout measures cancellation at the actual held phase,
+      // after imports, backend startup and the real SQL lease loss completed.
+      await test("controlled native timeout with a held lease notice", {timeout:4000}, async t => {
+        t.after(async()=>{
+          aborted=t.signal.aborted;await f.close();callbackCleaned=true;
+          log("native-after-cleaned",{aborted,phase:f.phase,nativeCalls:f.nativeOptions.length});
+        });
+        const forwardAbort=()=>controller.abort(t.signal.reason);
+        t.signal.addEventListener("abort",forwardAbort,{once:true});
+        if(t.signal.aborted)forwardAbort();
+        try {await operation;}
+        finally {t.signal.removeEventListener("abort",forwardAbort);await f.close();}
       });
-      f.lossSeen.enter=()=>{log("held-native-notice");};
-      try {await unavailableSharedReviewer(f);}
-      finally {await f.close();}
-    });
-    assert.ok(f);assert.equal(aborted,true);assert.equal(callbackCleaned,true);assert.equal(existsSync(f.directory),false);
-    assert.equal(f.runtime.backgroundTasks.size,0);assert.equal(f.nativeOptions.length,1);
-    log("actor-complete",{nativeTimeout:true,callbackCleaned,aborted});return;
+      assert.ok(f);assert.equal(aborted,true);assert.equal(callbackCleaned,true);assert.equal(existsSync(f.directory),false);
+      assert.equal(f.runtime.backgroundTasks.size,0);assert.equal(f.nativeOptions.length,1);
+      log("actor-complete",{nativeTimeout:true,callbackCleaned,aborted});return;
+    } finally {
+      controller.abort(cause);f.lossSeen.enter=originalEnter;originalEnter();
+      await f.close();await operation?.catch(()=>undefined);
+    }
   }
   const f=await sharedReviewerFixture(options);
   let operation:Promise<unknown>|undefined,manualHold:Promise<void>|undefined;

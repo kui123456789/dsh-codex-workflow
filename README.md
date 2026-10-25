@@ -13,7 +13,7 @@ No browser is opened or controlled anywhere in the product path; no network list
 
 Planner and Reviewer turns run through the NPM Codex CLI's `codex app-server --stdio`, but plugin-created threads use `thread/start { ephemeral: true }`. They remain available for the current App Server process, do not receive Desktop names, and do not appear in `thread/list`. Failure recovery and clarification answers require the original process and handle. A lost original thread reports an error; neither path reconstructs a replacement Planner. Structured conversion and authority alignment continue to use `codex exec --ephemeral` or an equivalent private App Server turn.
 
-Planner and Reviewer runs are published through DSH's `subagents.start()` using the `codex-workflow` provider. Each gets a native child Session (`origin: "subagent"`) while the NPM Codex App Server executes the task in an ephemeral thread. The child Session receives native assistant stream frames and a final message. The browser opens DSH's built-in `subagentchat` right-sidebar resource for that child, so Codex appears as a child agent conversation. The `codexWorkflow` projection retains workflow status and final review metadata; it no longer serves as the primary live renderer. Private reasoning text and raw tool output are not forwarded. The plugin never opens or focuses Codex Desktop.
+Planner and Reviewer runs use DSH's `subagents.start()` on legacy hosts; on activation-only hosts such as 0.2.1-rc.3, this plugin owns the native one-shot mirror lifecycle. Each gets a native child Session (`origin: "subagent"`) while the NPM Codex App Server executes the task in an ephemeral thread. The child Session receives native assistant stream frames and a final message. The browser opens DSH's built-in `subagentchat` right-sidebar resource for that child, so Codex appears as a child agent conversation. Workflow status and final review metadata use the `codexWorkflow` projection on legacy hosts or plugin-owned SQLite state on activation-only hosts. Private reasoning text and raw tool output are not forwarded. The plugin never opens or focuses Codex Desktop.
 
 Concurrent SDK callers share one App Server initialization, with independent cancellation of each caller's wait. Cancelling one observer preserves the original process for observers still waiting; only the last withdrawal abandons initialization and cleans its original process. A later independent request waits for that cleanup before initializing again. Permanent plugin stop prevents another bootstrap. These initialization rules do not restore a lost ephemeral Planner or authorize a replacement workflow.
 
@@ -99,15 +99,21 @@ If a scoped protocol error arrives before the original `turn/start` or `review/s
 
 Unconfirmed cleanup captures original process identities once: Windows uses CIM creation time in canonical FILETIME units, and Linux uses boot ID plus `/proc` start ticks. Windows capture excludes a stale parent-PID link when the child's valid creation time predates the current parent instance; an unrelated older process cannot enter the original tree through a reused parent PID. Missing or incomparable birth metadata keeps the conservative capture rule. Later exit checks distinguish a new instance at a reused PID from the captured original. Missing identities or unavailable metadata keep cleanup unconfirmed; legacy PID lists can still confirm when every captured PID is absent. These checks release original resources and do not restore lost ephemeral threads. Other platforms retain the conservative legacy behavior.
 
+Windows process-tree captures for one original backend run in sequence. A queued request checks that its evidence is still needed and the same native child is still owned before taking its own fresh snapshot; results are never reused across captures. The native query budget remains four seconds, while waiting behind another capture can add to caller latency. Different backends retain independent capture queues.
+
+Windows CIM queries prefer PowerShell 7 when it is already installed at the standard Program Files location, and otherwise use the built-in Windows PowerShell. Both read the same `Win32_Process.CreationDate` identity source. The plugin does not install a shell or change `PATH`.
+
 ## Requirements
 
-- DeepSeek Harness `0.1.7-rc.2` (the development and type-check baseline; the declared peer range also accepts `0.2.0-rc.2` and `0.2.1-rc.2`)
+- DeepSeek Harness `0.1.7-rc.2` (the development and type-check baseline; the declared peer range also accepts `0.2.0-rc.2`, `0.2.1-rc.2`, and `0.2.1-rc.3`)
 - Node.js `^22.19.0` or `>=24`
 - Codex CLI with a valid ChatGPT login and App Server support (verified by `pnpm doctor`)
 
 ### Upgrading after a DSH update
 
-The plugin is developed and type-checked against DSH `0.1.7-rc.2` with cordis `4.0.4`; its declared peer range accepts DSH `0.1.7-rc.2`, `0.2.0-rc.2`, and `0.2.1-rc.2`. Run `pnpm host:check` against the **operator's installed** core packages (isolated temp storage, no live profile/session/model) before treating a host as verified; the check also asks the host's own `evaluatePluginCompatibility` to judge the declared range.
+The plugin is developed and type-checked against DSH `0.1.7-rc.2` with cordis `4.0.4`; its declared peer range also accepts DSH `0.2.0-rc.2`, `0.2.1-rc.2`, and `0.2.1-rc.3`. Run `pnpm host:check` against the **operator's installed** core packages (isolated temp storage, no live profile/session/model) before treating a host as verified; the check also asks the host's own `evaluatePluginCompatibility` to judge the declared range. Set `DSH_CODEX_HOST_PACKAGE_JSON` to the desktop application's bundled `@deepseek-ai/dsh/package.json` when the desktop and CLI installations differ. Use an isolated build when a live profile links to this checkout.
+
+On activation-only hosts such as DSH `0.2.1-rc.3`, sidebar state lives in the plugin's `coord.sqlite` and is read through the authenticated `workflow-state` RPC; no custom workflow events are appended to the host's Session log. Hosts with the legacy subagent API keep their existing projection path. Codex one-shot child conversations remain native Sessions, with this plugin owning their lifecycle on activation-only hosts; they do not start the parent model loop. Existing historical chat logs are never rewritten: legacy logs containing unsupported required event types need separate migration before the new host can reopen them.
 
 Two things matter when the host moves:
 

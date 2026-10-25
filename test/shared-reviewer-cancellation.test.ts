@@ -18,7 +18,7 @@ for(const mode of ["notice","forwarded","background","healthy","pre-aborted","do
     const rows=(await readFile(join(directory,"states.jsonl"),"utf8")).trim().split("\n").map(line=>JSON.parse(line));
     assert.equal(code,mode === "native-timeout" ? 1 : 0,`Original fixture actor failed; evidence retained ${directory}`);
     assert.equal(rows.filter(row=>row.kind === "uncaught-monitor").length,0);
-    assert.equal(rows.at(-1).kind,"actor-complete",`Fixture did not finish its own cleanup; evidence retained ${directory}`);
+    assert.equal(rows.at(-1).kind,"actor-complete",`Fixture did not finish its own cleanup; evidence retained ${directory}; final events ${JSON.stringify(rows.slice(-3))}`);
     if(mode === "native-timeout") {
       assert.ok(rows.some(row=>row.kind === "held-native-notice"),"Native timeout occurred at the intended held lease phase");
       const cleaned=rows.find(row=>row.kind === "native-after-cleaned");

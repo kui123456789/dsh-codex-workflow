@@ -1736,7 +1736,13 @@ export class WorkflowManager {
           : event.data.status === "failed" && record.processState === "waiting" ? "waiting"
             : ({ planning: "running", waiting_input: "waiting", ready: "completed", failed: "failed" } as const)[event.data.status]) }
         : event.data;
-      append.call(agent.session, event.type, data, { ignorable: true });
+      if (this.codexChildFactory?.usesExternalUiState) {
+        // V4 accepts only the host's released event vocabulary. Keep plugin UI
+        // state in our own database so a cold host can always reopen its log.
+        this.store.appendUiEvent(record.dshSessionId, { ...event, data } as CodexWorkflowSessionEvent);
+      } else {
+        append.call(agent.session, event.type, data, { ignorable: true });
+      }
     } catch {
       // A session can be disposing while a background callback settles. The
       // coordination record remains authoritative and will be shown on reload.

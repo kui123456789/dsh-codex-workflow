@@ -1,5 +1,6 @@
 import { createInterface, type Interface } from "node:readline";
 import { execFile, type ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import crossSpawn from "cross-spawn";
@@ -118,7 +119,12 @@ async function boundedOutput(command: string, args: string[], onFailure?: (failu
 }
 
 async function windowsProcesses(processIds?: readonly number[], onFailure?: (failure: CaptureFailure) => void): Promise<Array<{ pid: number; parent: number; birth?: string }> | undefined> {
-  const command = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  // The optional modern host avoids part of Windows PowerShell's cold-start
+  // cost while reading the same CIM CreationDate source. No PATH lookup or
+  // installation is performed; hosts without it retain the system executable.
+  const modern = join(process.env.ProgramW6432 ?? process.env.ProgramFiles ?? "C:\\Program Files", "PowerShell", "7", "pwsh.exe");
+  const command = existsSync(modern) ? modern
+    : join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   const filter = processIds ? ` -Filter '${processIds.map((pid) => `ProcessId = ${pid}`).join(" OR ")}'` : "";
   // Both capture and lookup use CIM CreationDate: FILETIME units do not add
   // precision to that source. ToFileTimeUtc handles its Local/UTC DateTime Kind.

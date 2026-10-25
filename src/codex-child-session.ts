@@ -2,11 +2,14 @@ import { randomUUID } from "node:crypto";
 import type { Agent, AgentHandle, AgentRegistry } from "@deepseek-ai/dsh-agent";
 import { createAssistantMessage, createToolResultMessage, createUserMessage, ToolCallId, type AssistantStreamRecord, type ContentBlock, type StreamChunk } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
-import { childSessionMeta, type ResolvedSubagentStartRequest, type SubagentProvider, type SubagentResult, type SubagentRun, type SubagentRuntime } from "@deepseek-ai/dsh-subagent";
+import { childSessionMeta, snapshotSubagentDescriptor, type ResolvedSubagentStartRequest, type SubagentProvider, type SubagentResult, type SubagentRun, type SubagentRuntime } from "@deepseek-ai/dsh-subagent";
 import type { AppServerLiveEvent } from "./app-server.js";
 
 const PROVIDER_NAME = "codex-workflow";
 type TextPart = { kind: AppServerLiveEvent["kind"]; itemId: string; text: string };
+type CompatibleSubagentRuntime = Pick<SubagentRuntime, "registerProvider"> & Partial<Pick<SubagentRuntime, "start">> & {
+  startActivation?: unknown;
+};
 
 export interface CodexChildSessionHandle {
   readonly id: string;
@@ -23,28 +26,48 @@ export interface CodexChildSessionHandle {
   dispose(): Promise<void>;
 }
 
-/** DSH owns catalog and lifecycle through SubagentRuntime. This adapter owns
- * only the child Agent and bridges Codex output into its native conversation. */
+/** Bridge Codex output into a native child conversation. Older hosts own the
+ * run through SubagentRuntime; activation-only hosts retain the native
+ * one-shot format while this adapter owns its Agent handle and catalog entry. */
 export class CodexChildSessionFactory {
   private readonly provider: CodexWorkflowProvider;
   private readonly unregister: () => void;
 
-  constructor(agents: Pick<AgentRegistry, "create">, private readonly subagents: Pick<SubagentRuntime, "start" | "registerProvider">) {
+  constructor(agents: Pick<AgentRegistry, "create">, private readonly subagents: CompatibleSubagentRuntime) {
     this.provider = new CodexWorkflowProvider(agents);
     this.unregister = subagents.registerProvider(this.provider);
   }
 
+  get usesExternalUiState(): boolean {
+    return typeof this.subagents.start !== "function" && typeof this.subagents.startActivation === "function";
+  }
+
   async create(parent: Agent, cwd: string, label: string, prompt: string, signal: AbortSignal): Promise<CodexChildSessionHandle> {
     if (parent.session.header.cwd && parent.session.header.cwd !== cwd) throw new Error("Codex subagent workspace differs from parent");
-    const run = await this.subagents.start(PROVIDER_NAME, { parent, label,
-      prompt: [{ type: "text", text: prompt }], signal });
-    const child = this.provider.get(run.id);
-    if (!child) {
-      await run.dispose();
-      throw new Error("Codex subagent provider did not publish its child");
+    if (typeof this.subagents.start !== "function" && typeof this.subagents.startActivation !== "function") {
+      throw new Error("Unsupported DSH subagent runtime");
     }
-    return { id: child.id, session: child.session, beginContinuation: (prompt) => child.beginContinuation(prompt), failAttempt: (message) => child.failAttempt(message), pauseForInput: (message) => child.pauseForInput(message), progress: (entry) => child.progress(entry),
-      finish: (text, reason) => child.finish(text, reason), dispose: () => run.dispose() };
+    const request = { parent, label, prompt: [{ type: "text" as const, text: prompt }], signal };
+    const legacy = typeof this.subagents.start === "function";
+    // rc.3 external activations cannot own a local Agent. Do not route this
+    // native mirror through startActivation or start the parent's model loop.
+    const run = legacy ? await this.subagents.start!(PROVIDER_NAME, request)
+      : await this.provider.start({ ...request,
+        descriptor: snapshotSubagentDescriptor({ mode: "one-shot", provider: PROVIDER_NAME, label }) });
+    try {
+      const child = this.provider.get(run.id);
+      if (!child) throw new Error("Codex subagent provider did not publish its child");
+      if (!legacy) {
+        signal.throwIfAborted();
+        parent.session.append("subagent/catalog", { version: 0, childId: child.session.id,
+          childCreatedAt: child.session.header.createdAt, mode: "one-shot", label });
+      }
+      return { id: child.id, session: child.session, beginContinuation: (prompt) => child.beginContinuation(prompt), failAttempt: (message) => child.failAttempt(message), pauseForInput: (message) => child.pauseForInput(message), progress: (entry) => child.progress(entry),
+        finish: (text, reason) => child.finish(text, reason), dispose: () => run.dispose() };
+    } catch (error) {
+      await run.dispose();
+      throw error;
+    }
   }
 
   unregisterProvider(): void { this.unregister(); }

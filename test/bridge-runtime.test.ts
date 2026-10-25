@@ -1425,7 +1425,8 @@ test("a delivered receipt retry re-arms the terminal relay watchdog once", async
 });
 
 test("a persistent retry write failure leaves the claim reclaimable", async () => {
-  const h = await harness(5, 60_000, 2, 100);
+  // Expire the lease explicitly below, after observing the retained claim.
+  const h = await harness(5, 60_000, 2);
   try {
     const workspace = await makeWorkspace(h.directory);
     const target = makeAgent("session-persistent-retry-write", "C:\\work");

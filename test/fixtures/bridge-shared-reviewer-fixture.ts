@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import type { ChildProcess } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -117,7 +118,12 @@ export async function sharedReviewerFixture(options: { mode?: "active" | "retain
   const client = new CodexAppServerClient({ command: process.execPath,
     args: [protocol, "--interrupt-mode", "confirmed", "--turn-mode", "active", "--active-visible-turns", mode === "retained" ? "3" : "1"],
     requestTimeoutMs: 30_000, rpcTimeoutMs: 4000, idleProcessMs: 0 });
-  const request = (client as unknown as { request<T>(method: string, params: object): Promise<T> }).request.bind(client);
+  const processPort = client as unknown as {
+    child?: ChildProcess;
+    request<T>(method: string, params: object): Promise<T>;
+    requestRaw<T>(method: string, params: object, signal: AbortSignal | undefined, expectedProcess: ChildProcess): Promise<T>;
+  };
+  const request = processPort.request.bind(client);
   const control = (method: string, params: object = {}) => request<SharedReviewerStats>(method, params);
   const nativeOptions: Array<{ threadId: string; options: Parameters<CodexAppServerClient["startTurn"]>[1]; signal?: AbortSignal }> = [];
   const originalTurn = client.startTurn.bind(client);
@@ -207,8 +213,13 @@ export async function sharedReviewerFixture(options: { mode?: "active" | "retain
   const close = () => {
     closePromise ??= Promise.resolve().then(async () => {
       lossRelease.release(); retryReturn.release();
-      await control("fixture/setInterruptMode", { mode: "confirmed" }).catch(() => undefined);
-      await control("fixture/completeActive").catch(() => undefined);
+      // Cleanup addresses only the original backend; request() would start a
+      // fresh process when this fixture never ran a model or already retired it.
+      const originalProcess = processPort.child;
+      if (originalProcess) {
+        await processPort.requestRaw("fixture/setInterruptMode", { mode: "confirmed" }, undefined, originalProcess).catch(() => undefined);
+        await processPort.requestRaw("fixture/completeActive", {}, undefined, originalProcess).catch(() => undefined);
+      }
       // Stop owns callback cancellation and joins its background work. Waiting
       // for that work first can strand the very process stop must interrupt.
       await manager.stop(); factory.unregisterProvider(); await client.stop(); await ctx.fiber.dispose();

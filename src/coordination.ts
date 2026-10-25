@@ -32,6 +32,7 @@ import { WorkflowRepositorySql } from "./infrastructure/workflow-repository.js";
  *       claim_epoch, claim_owner, claim_until, last_error, next_attempt_at,
  *       receipt_json, dead_letter_at, created_at)
  *   workflows(id PK, revision, record_json, updated_at)
+ *   workflow_ui(session_id PK, state_json) — plugin-owned display state
  */
 
 export interface CoordinationOptions {
@@ -108,6 +109,10 @@ CREATE TABLE IF NOT EXISTS workflows (
   revision    INTEGER NOT NULL,
   record_json TEXT NOT NULL,
   updated_at  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS workflow_ui (
+  session_id TEXT PRIMARY KEY,
+  state_json TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS live_sessions (
   session_id    TEXT PRIMARY KEY,
@@ -499,6 +504,29 @@ export class CoordinationStore {
   }
 
   // -------------------------------------------------------------- workflows
+
+  loadWorkflowUi(sessionId: string): string | undefined {
+    this.assertOpen();
+    const row = this.db.prepare("SELECT state_json FROM workflow_ui WHERE session_id = ?").get(sessionId) as
+      { state_json: string } | undefined;
+    return row?.state_json;
+  }
+
+  /** Fold against the latest display state while holding the SQLite writer
+   * lock. This state does not participate in workflow revision/CAS updates. */
+  updateWorkflowUi(sessionId: string, mutate: (stateJson: string | undefined) => string): void {
+    this.assertOpen();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const stateJson = mutate(this.loadWorkflowUi(sessionId));
+      this.db.prepare(`INSERT INTO workflow_ui (session_id, state_json) VALUES (?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET state_json = excluded.state_json`).run(sessionId, stateJson);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
 
   loadWorkflow(id: string): WorkflowRow | undefined {
     this.assertOpen();

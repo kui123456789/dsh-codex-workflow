@@ -3156,14 +3156,23 @@ test("1.1.4: a round cancelled AFTER claiming the Reviewer still releases it, wi
 
 test("1.1.4: a hung release cannot wedge the round — the cleanup has its own deadline", async () => {
   const directory = await mkdtemp(join(tmpdir(), "dsh-codex-workflow-release-hang-"));
+  const releaseLifetimes = new Set<NodeJS.Timeout>();
   try {
     await reviewFiles(directory, "changed.txt");
     const gateway = new FakeGateway();
     gateway.reviewResults = [{ verdict: "pass", findings: [], testGaps: [], summary: "ok" }];
-    // A `thread/unsubscribe` that never settles. The release carries no business
+    // A `thread/unsubscribe` that stays pending beyond its cleanup deadline.
+    // The release carries no business
     // signal by design, so this deadline is the only thing that keeps the round
-    // (and therefore cancel/teardown) from waiting on it forever.
-    gateway.unsubscribeThread = () => new Promise<string>(() => undefined);
+    // (and therefore cancel/teardown) from waiting on the pending transport.
+    gateway.unsubscribeThread = () => new Promise<string>((_resolve, reject) => {
+      // A pending transport request owns a handle beyond the production deadline.
+      const lifetime = setTimeout(() => {
+        releaseLifetimes.delete(lifetime);
+        reject(new Error("Fake unsubscribe exceeded its fixture lifetime"));
+      }, 1_000);
+      releaseLifetimes.add(lifetime);
+    });
     const instance = manager(directory, gateway, { reviewerReleaseTimeoutMs: 250 });
     const exec = fakeExec("session-release-hang", directory, []);
     await changedFile(directory);
@@ -3176,6 +3185,7 @@ test("1.1.4: a hung release cannot wedge the round — the cleanup has its own d
     assert.match(persisted.lastProgressMessage ?? "", /reviewer release timed out/,
       "the timeout is reported on the round's terminal message");
   } finally {
+    for (const lifetime of releaseLifetimes) clearTimeout(lifetime);
     await rmClosed(directory);
   }
 });

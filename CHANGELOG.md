@@ -2,6 +2,16 @@
 
 All notable changes to `dsh-codex-workflow`.
 
+## [1.1.15] - 2026-10-25
+
+- Support DSH 0.2.1-rc.3 while retaining the existing development baseline and older host ranges.
+- Register the authenticated model-catalog and workflow-state routes through the HTTP service context required by newer Cordis hosts.
+- Preserve native Codex one-shot child conversations on activation-only hosts without invoking the parent model loop; retain the legacy subagent API on older hosts.
+- Persist sidebar state in the plugin's SQLite database on newer hosts instead of appending unsupported custom events to their session journals. Restore the sidebar through a read-only RPC with cancellation and stale-response protection; older hosts continue using their native projection even when sidecar state exists.
+- Verify the selected desktop runtime consistently, including distributions without declaration files, real RPC registration/unload, updated persistence services, and cold parent/child journal recovery. Existing historical chat logs are not rewritten or migrated.
+- Serialize Windows process-tree queries for the same original backend so fork, start-receipt and interruption bookkeeping do not launch competing CIM scans. Each executed query still takes a fresh snapshot within its existing native query budget; retired owners and released receipts cannot start unnecessary queued queries.
+- Prefer an existing standard PowerShell 7 installation for lower-overhead Windows CIM queries, with Windows PowerShell fallback. Keep the same CreationDate-to-FILETIME identity source and four-second query timeout.
+
 ## [1.1.14] - 2026-10-18
 
 - Harden bridge verdict delivery: retry evidence validation and post-relay bookkeeping failures, preserve reclaimable claims when retry persistence fails, and restore the terminal relay watchdog after receipt recovery without repeating the relay.

@@ -31,7 +31,10 @@ const [cordis, prompts, tools, agents, sessions, projections, subagents, llm, pe
   loadHost("@deepseek-ai/dsh-session-persistence-jsonl"),
 ]);
 const hostVersion = JSON.parse(await readFile(hostPackage, "utf8")).version;
-registerCodexWorkflowSessionEventTypes(sessions.KNOWN_SESSION_EVENT_TYPES);
+const persistencePlugin = persistence.default ?? persistence;
+const externalUiState = typeof subagents.SubagentRuntime.prototype.start !== "function";
+// V4 must reopen with the host's unmodified released event vocabulary.
+if (!externalUiState) registerCodexWorkflowSessionEventTypes(sessions.KNOWN_SESSION_EVENT_TYPES);
 const PLAN = [
   "# Goal", "Add a local health check that reports configuration and storage status.",
   "# Changes", "- Inspect configuration through a read-only adapter and report readable failures.",
@@ -233,8 +236,15 @@ async function scenario(stage, action, clarificationMode) {
     await ctx.plugin(agents.AgentRegistry, {});
     await ctx.plugin(sessions.SessionStore, {});
     await ctx.plugin(projections.SessionProjectionRegistry, {});
+    if (subagents.SubagentRuntime.inject?.includes("workingDirectory")) {
+      const [filesystem, workingDirectory] = await Promise.all([
+        loadHost("@deepseek-ai/dsh-fs-local"), loadHost("@deepseek-ai/dsh-working-directory"),
+      ]);
+      await ctx.plugin(filesystem.default, {});
+      await ctx.plugin(workingDirectory.default, { defaultDirectory: directory });
+    }
     await ctx.plugin(subagents.SubagentRuntime, {});
-    await ctx.plugin(persistence.default, { root: join(directory, "journals") });
+    await ctx.plugin(persistencePlugin, { root: join(directory, "journals") });
     ctx.sessionProjections.register(codexWorkflowProjectionDefinition);
     ctx.on("agent/assistant-stream", ({ agent, frame }) => { frames.push({ id: agent.id, frame }); });
     // No agent loop or model provider is installed. Own the real persistence
@@ -342,7 +352,9 @@ async function scenario(stage, action, clarificationMode) {
     if (clarificationMode) assert.equal(status.phase, "waiting_input");
     else assert.deepEqual(status.continuation, modelInterruption
       ? { available: false, reason: "interruption_unconfirmed" } : { available: true });
-    const projection = ctx.sessionProjections.snapshot(parent.session).values.codexWorkflow;
+    const workflowProjection = () => externalUiState ? store.uiProjection(parent.id)
+      : ctx.sessionProjections.snapshot(parent.session).values.codexWorkflow;
+    const projection = workflowProjection();
     if (stage === "planning") {
       assert.equal(projection.plan.processState, "waiting", "Planner wait is published to the real host projection");
       assert.equal(projection.plan.status, clarificationMode ? "waiting_input" : "planning");
@@ -532,9 +544,19 @@ async function scenario(stage, action, clarificationMode) {
     // A fresh backend must read the original journal after the child is released;
     // replaying an in-memory snapshot cannot prove that the session was persisted.
     await ctx.sessionPersistence.flush();
+    if (externalUiState) {
+      assert.equal(parent.session.snapshotEvents().some(event => event.type.startsWith("dsh-codex-workflow/")), false,
+        "V4 never persists private plugin event types into the host log");
+      const coldStore = new WorkflowStore(store.directory);
+      try {
+        await coldStore.init();
+        assert.deepEqual(coldStore.uiProjection(parent.id), workflowProjection(),
+          "a separate SQLite handle restores the complete sidebar state");
+      } finally { coldStore.close(); }
+    }
     const cold = new cordis.Context();
     try {
-      await cold.plugin(persistence.default, { root: join(directory, "journals") });
+      await cold.plugin(persistencePlugin, { root: join(directory, "journals") });
       for (const original of [child, parent.session]) {
         const reader = await cold.sessionPersistence.open(original.id, "read");
         try {
@@ -556,14 +578,16 @@ async function scenario(stage, action, clarificationMode) {
     }
     const finalView = ctx.sessionProjections.snapshot(child).values;
     if (stage === "planning" && ["resume", "answer", "model_interruption", "submitted_abort"].includes(action)) {
-      const plan = ctx.sessionProjections.snapshot(parent.session).values.codexWorkflow.plan;
+      const plan = workflowProjection().plan;
       assert.equal(plan.status, "ready");
       assert.equal(plan.processState, "completed", "a ready plan clears the prior pause state");
-      const states = parent.session.snapshotEvents().filter(event => event.type === "dsh-codex-workflow/plan-updated")
-        .map(event => ({ status: event.data.status, processState: event.data.processState }));
-      assert.equal(states[0].processState, "running");
-      assert.ok(states.some((state, index) => state.processState === "waiting"
-        && states.slice(index + 1).some(next => next.processState === "running")), "the same Planner publishes wait then running");
+      if (!externalUiState) {
+        const states = parent.session.snapshotEvents().filter(event => event.type === "dsh-codex-workflow/plan-updated")
+          .map(event => ({ status: event.data.status, processState: event.data.processState }));
+        assert.equal(states[0].processState, "running");
+        assert.ok(states.some((state, index) => state.processState === "waiting"
+          && states.slice(index + 1).some(next => next.processState === "running")), "the same Planner publishes wait then running");
+      }
     }
     assert.equal(finalView.subagent.mode, "one-shot");
     assert.equal(finalView.subagentTiming.active, undefined);
@@ -623,4 +647,4 @@ for (const mode of ["native", "converted"]) {
 results.push(await scenario("planning", "submitted_abort", "native"));
 for (const stage of ["planning", "reviewing"]) results.push(await scenario(stage, "model_interruption"));
 console.log(JSON.stringify({ ok: true, hostVersion, services: ["ToolRuntime", "AgentRegistry", "SessionStore", "SessionProjectionRegistry", "SubagentRuntime", "SessionPersistence"],
-  modelGateway: "scripted-local", storage: "isolated-temp", browserUIVerified: false, scenarios: results }, null, 2));
+  modelGateway: "scripted-local", storage: "isolated-temp", externalUiState, browserUIVerified: false, scenarios: results }, null, 2));

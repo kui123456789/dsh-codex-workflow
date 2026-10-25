@@ -31,6 +31,7 @@ window.__ModuleLoader__.load({
       `dsh-resource://subagentchat/session/${encodeURIComponent(childSessionId)}?parent=${encodeURIComponent(parentSessionId)}&mode=one-shot`;
 
     const LOADING_PROJECTION = Object.freeze({ currentWorkflowId: null, plan: null, activeReview: null, reviews: Object.freeze([]) });
+    const EMPTY_PROJECTION = Object.freeze({ currentWorkflowId: null, plan: null, activeReview: null, reviews: Object.freeze([]) });
     const subscribeToNothing = () => () => {};
 
     function useProjection(face) {
@@ -240,9 +241,95 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         const disposers = [];
         let disposed = false;
+        const workflowFaces = new Map();
         const projectionOf = (sessionId) => {
           const binding = sessionId ? ctx.sessions.binding(sessionId) : undefined;
-          return binding?.session.projections.faceOf("codexWorkflow");
+          const legacy = binding?.session.projections.faceOf("codexWorkflow");
+          if (!sessionId || typeof ctx.connection?.rpc?.call !== "function") return legacy;
+          let face = workflowFaces.get(sessionId);
+          if (!face) {
+            const listeners = new Set();
+            let legacyFace;
+            let legacyDisposer;
+            let externalState = false;
+            let externalProjection;
+            let projectionJson;
+            let timer;
+            let request;
+            let generation = 0;
+            let closed = false;
+            const publish = () => { for (const listener of [...listeners]) listener(); };
+            const stop = () => {
+              generation += 1;
+              if (timer !== undefined) clearTimeout(timer);
+              timer = undefined;
+              request?.abort();
+              request = undefined;
+              legacyDisposer?.();
+              legacyDisposer = undefined;
+              if (workflowFaces.get(sessionId) === face) workflowFaces.delete(sessionId);
+            };
+            const poll = async () => {
+              if (closed || disposed || listeners.size === 0 || request) return;
+              const epoch = generation;
+              const controller = new AbortController();
+              request = controller;
+              try {
+                const result = await ctx.connection.rpc.call("/dsh-codex-workflow", "workflow-state", { args: { sessionId } }, controller.signal);
+                if (epoch !== generation || closed || disposed || controller.signal.aborted) return;
+                const value = result?.ok ? result.value : undefined;
+                if (typeof value?.externalState !== "boolean") return;
+                if (value.externalState && value.projection !== null && (!value.projection || !Array.isArray(value.projection.reviews))) return;
+                const previous = face.getSnapshot();
+                externalState = value.externalState;
+                if (externalState) {
+                  const serialized = JSON.stringify(value.projection);
+                  if (serialized !== projectionJson) {
+                    projectionJson = serialized;
+                    externalProjection = value.projection ?? EMPTY_PROJECTION;
+                  }
+                }
+                if (face.getSnapshot() !== previous) publish();
+              } catch {
+                // A reconnect must not erase the last durable sidebar value.
+              } finally {
+                if (epoch === generation && request === controller) {
+                  request = undefined;
+                  if (!closed && !disposed && listeners.size > 0) timer = setTimeout(poll, 1_000);
+                }
+              }
+            };
+            face = {
+              getSnapshot: () => externalState ? externalProjection : legacyFace?.getSnapshot?.(),
+              setLegacy: (next) => {
+                if (legacyFace === next) return;
+                legacyDisposer?.();
+                legacyDisposer = undefined;
+                legacyFace = next;
+                if (listeners.size > 0) legacyDisposer = legacyFace?.subscribe(publish);
+              },
+              subscribe: (listener) => {
+                if (closed || disposed) return subscribeToNothing();
+                listeners.add(listener);
+                if (listeners.size === 1) {
+                  workflowFaces.set(sessionId, face);
+                  legacyDisposer = legacyFace?.subscribe(publish);
+                  void poll();
+                }
+                let subscribed = true;
+                return () => {
+                  if (!subscribed) return;
+                  subscribed = false;
+                  listeners.delete(listener);
+                  if (listeners.size === 0) stop();
+                };
+              },
+              dispose: () => { closed = true; listeners.clear(); stop(); },
+            };
+            workflowFaces.set(sessionId, face);
+          }
+          face.setLegacy(legacy);
+          return face;
         };
         const tabDefinition = {
           id: TAB_ID,
@@ -469,6 +556,8 @@ window.__ModuleLoader__.load({
           exhaustedOpenRetries.clear();
           opening.clear();
           releaseProjection();
+          for (const face of [...workflowFaces.values()]) face.dispose();
+          workflowFaces.clear();
           for (const dispose of disposers.reverse()) dispose?.();
         };
       },
