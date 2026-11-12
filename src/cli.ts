@@ -103,11 +103,15 @@ async function continuation(record: WorkflowRecord): Promise<{ available: boolea
 }
 async function envelope(home: string, record: WorkflowRecord, refreshes = 2): Promise<Record<string, unknown>> {
   let capability = await continuation(record);
-  if (refreshes > 0) {
+  {
     const snapshot = new StateStore(home, true);
     try {
       const latest = snapshot.get(record.id);
-      if (latest && latest.revision !== record.revision) return envelope(home, latest, refreshes - 1);
+      if (latest && latest.revision !== record.revision) {
+        if (refreshes > 0) return envelope(home, latest, refreshes - 1);
+        record = latest;
+        capability = { available: false, reason: record.processState === "running" ? "running" : "state_changed" };
+      }
     } finally { snapshot.close(); }
   }
   let phase = record.phase, state = record.processState, invalidated = false;

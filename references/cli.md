@@ -19,3 +19,5 @@ Use `--input FILE` to read a JSON file, or `--stdin` to read JSON from standard 
 The default limits are three review cycles, one unchanged blocking review round, a ten-minute turn timeout, and a twenty-minute transient retry budget measured by a monotonic clock. Model and effort defaults follow the local Codex configuration; explicitly selected values are persisted for resume.
 
 A subsequent `status` rechecks workspace evidence and may report `blocked` with `reviewValid: false` after a prior pass if the workspace changed.
+
+Status refreshes are bounded. If concurrent updates exhaust that budget, the response uses the latest stored phase and temporarily disables continuation with `reason: "state_changed"` (or `"running"` for a running operation). Query `status` again before resuming; a stale snapshot never authorizes another model call.

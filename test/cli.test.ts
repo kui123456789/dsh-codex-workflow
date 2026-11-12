@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 
 const cli = resolve("scripts/workflow.mjs");
@@ -75,6 +76,54 @@ test("offline doctor returns the stable JSON envelope without a model call", asy
       assert.ok(Object.hasOwn(value, key), key);
     }
     assert.equal(typeof value.continuation.available, "boolean");
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("status returns the latest phase when identity queries consume the refresh budget", async () => {
+  const home = await mkdtemp(resolve(tmpdir(), "codex-workflow-status-"));
+  try {
+    const { StateStore, newRecord } = await import("../src/state.js");
+    const store = new StateStore(home);
+    const record = newRecord(home, { task: "Observe bounded status refresh" }, process.execPath, []);
+    record.operation = { id: "status-operation", stage: "planning", input: {}, startedAt: Date.now(), finished: false,
+      spawnRequested: false, cleanupConfirmed: true, threadId: "01234567-1234-1234-1234-0123456789ab",
+      worker: { pid: 2147483001, birth: "01234567-1234-1234-1234-0123456789ab:100" } };
+    try { store.insert(record); } finally { store.close(); }
+    const preload = join(home, "identity-boundary.mjs");
+    await writeFile(preload, `
+import { createRequire, syncBuiltinESMExports } from "node:module";
+import { DatabaseSync } from "node:sqlite";
+import { join } from "node:path";
+const fs = createRequire(import.meta.url)("node:fs/promises");
+const original = fs.readFile;
+const boot = "01234567-1234-1234-1234-0123456789ab";
+Object.defineProperty(process, "platform", { value: "linux" });
+let queries = 0;
+fs.readFile = async (path, ...args) => {
+  if (path === "/proc/sys/kernel/random/boot_id") return boot;
+  if (path !== "/proc/2147483001/stat") return original(path, ...args);
+  queries++;
+  const db = new DatabaseSync(join(process.env.STATUS_RACE_HOME, "coord.sqlite"));
+  try {
+    const row = db.prepare("SELECT record_json FROM workflows").get();
+    const value = JSON.parse(row.record_json);
+    value.revision++;
+    value.error = "identity-query-" + queries;
+    if (queries === 3) { value.phase = "waiting_input"; value.processState = "waiting"; value.operation.finished = true; }
+    db.prepare("UPDATE workflows SET revision=?,record_json=? WHERE id=?").run(value.revision, JSON.stringify(value), value.id);
+  } finally { db.close(); }
+  if (queries === 3) throw Object.assign(new Error("original worker exited"), { code: "ENOENT" });
+  const fields = Array(20).fill("0"); fields[0] = "S"; fields[1] = "1"; fields[19] = "100";
+  return "2147483001 (worker) " + fields.join(" ");
+};
+syncBuiltinESMExports();
+`);
+    const response = await json(["status", "--workflow", record.id], home, undefined,
+      { STATUS_RACE_HOME: home, NODE_OPTIONS: "--import=" + pathToFileURL(preload).href });
+    assert.equal(response.phase, "waiting_input", JSON.stringify(response));
+    assert.equal(response.processState, "waiting");
+    assert.equal(response.continuation.available, false);
+    assert.equal(response.error, "identity-query-3", "status must remain bounded to the original query budget");
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 
