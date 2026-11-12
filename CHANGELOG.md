@@ -4,6 +4,8 @@ All notable changes to `codex-workflow`, formerly the `dsh-codex-workflow` plugi
 
 ## [Unreleased]
 
+- Reorganize the documentation around standalone Skill installation, host-agent workflow and stop conditions, JSON CLI usage, recovery, and release evidence. Add a current document index and mark retained DSH records as historical without rewriting their bodies.
+
 ## [2.0.0] - 2026-11-12
 
 - Replace the DSH plugin with the portable `codex-workflow` skill. Compatible hosts must read `SKILL.md` and run local Node commands. The packaged skill has no npm runtime dependencies; it requires Node.js `^22.19.0 || >=24.0.0`, a configured Codex CLI, and Git for Git workspace evidence.

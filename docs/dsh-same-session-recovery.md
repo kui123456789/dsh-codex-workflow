@@ -1,5 +1,7 @@
 # 在 DSH 验证原会话继续
 
+> 历史记录：本文描述 `dsh-codex-workflow` 1.x 插件，命令、源码路径和验收结论属于当时版本。2.x 独立 Skill 请见[文档导航](README.md)。
+
 使用独立的验收父会话，保持同一 DSH、插件和 App Server 进程。中途重启会丢失 ephemeral 线程；本测试不能修复历史 `corrupt` 子会话。以下提示词用于 **DSH-led 工具流程**，Bridge 审查通过原 submission 的后台重试恢复。
 
 ## 测试 Planner

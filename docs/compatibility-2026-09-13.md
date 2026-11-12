@@ -1,5 +1,7 @@
 # DSH 0.1.5 compatibility — 2026-09-13
 
+> Historical record for the `dsh-codex-workflow` 1.x plugin. Commands, source paths, and verification results refer to that version. See the [documentation index](README.md) for the standalone 2.x skill.
+
 Follow-up: the user subsequently started the formal profile. See
 [the live validation report](live-validation-2026-09-13.md): loading, planning
 and DSH execution passed, but the system Codex CLI rejected the configured

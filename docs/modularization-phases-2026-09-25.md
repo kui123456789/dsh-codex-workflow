@@ -1,5 +1,7 @@
 # 模块化与状态模型重构 — 阶段记录（2026-09-25 起）
 
+> 历史记录：本文描述 `dsh-codex-workflow` 1.x 插件，命令、源码路径和验收结论属于当时版本。2.x 独立 Skill 请见[文档导航](README.md)。
+
 来源：Codex 侧发起并批准的桥接计划（工作流 `00a043f3-d1fe-459d-a598-1bbcbd8f2823`）。
 节奏（用户确认）：**分阶段提交 + 每阶段门禁**（`pnpm typecheck` / 相关测试 / `pnpm test`，最终 `pnpm verify` + `pnpm release:check` + `pnpm host:check`）。
 
