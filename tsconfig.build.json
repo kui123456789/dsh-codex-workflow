@@ -4,8 +4,14 @@
     "declaration": true,
     "sourceMap": true,
     "outDir": "lib",
-    "rootDir": "src"
+    "rootDir": "src",
+    "incremental": true,
+    "tsBuildInfoFile": "./node_modules/.cache/codex-workflow/build.tsbuildinfo"
   },
-  "include": ["src/**/*.ts"],
-  "exclude": ["test"]
+  "include": [
+    "src/**/*.ts"
+  ],
+  "exclude": [
+    "test"
+  ]
 }

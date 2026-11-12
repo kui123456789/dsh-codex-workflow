@@ -1,122 +1,51 @@
 {
-  "name": "dsh-codex-workflow",
-  "version": "1.1.15",
-  "description": "DeepSeek Harness plugin that uses Codex to plan and review while DSH executes.",
-  "keywords": [
-    "deepseek-harness",
-    "dsh",
-    "dsh-plugin",
-    "codex",
-    "workflow",
-    "code-review"
-  ],
+  "name": "codex-workflow",
+  "version": "2.0.0",
+  "description": "Portable Agent Skill: Codex plans and reviews while the host agent implements.",
+  "type": "module",
+  "private": true,
+  "packageManager": "pnpm@10.33.2",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/kui123456789/dsh-codex-workflow.git"
   },
-  "homepage": "https://github.com/kui123456789/dsh-codex-workflow#readme",
-  "bugs": {
-    "url": "https://github.com/kui123456789/dsh-codex-workflow/issues"
-  },
-  "publishConfig": {
-    "access": "public"
-  },
-  "packageManager": "pnpm@10.33.2",
-  "type": "module",
-  "main": "./lib/index.js",
-  "types": "./lib/index.d.ts",
   "bin": {
-    "dsh-codex-workflow": "lib/bridge-cli.js"
-  },
-  "exports": {
-    ".": {
-      "types": "./lib/index.d.ts",
-      "default": "./lib/index.js"
-    },
-    "./package.json": "./package.json",
-    "./client": "./lib/client.js"
+    "codex-workflow": "scripts/workflow.mjs"
   },
   "files": [
-    "lib",
-    "scripts",
-    "cordis.patch.yml",
-    "README.md",
-    "CHANGELOG.md",
+    "SKILL.md",
+    "agents",
+    "references",
+    "scripts/workflow.mjs",
     "LICENSE"
   ],
   "scripts": {
-    "demo": "node demo/server.mjs",
-    "build": "tsc -p tsconfig.build.json && node scripts/copy-client.mjs",
+    "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
     "pretest": "pnpm build",
     "test": "node scripts/run-tests.mjs",
     "verify": "pnpm typecheck && pnpm test",
-    "doctor": "pnpm build && node scripts/doctor.mjs",
-    "doctor:offline": "pnpm build && node scripts/doctor.mjs --offline",
-    "host:check": "pnpm build && node scripts/host-compat-check.mjs",
-    "host:recovery:check": "pnpm build && node scripts/host-recovery-check.mjs",
+    "doctor": "node scripts/workflow.mjs doctor",
+    "doctor:offline": "node scripts/workflow.mjs doctor --offline",
+    "pack:skill": "pnpm build && node scripts/package-skill.mjs",
     "release:check": "node scripts/release-check.mjs",
     "verify:isolated": "node scripts/verify-isolated.mjs"
   },
-  "dsh": {
-    "client": {
-      "platform": "web",
-      "inject": [
-        "@deepseek-ai/dsh-client-ui-sidebar-right",
-        "@deepseek-ai/dsh-api-session-controller",
-        "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-slots"
-      ]
-    },
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    }
-  },
-  "dependencies": {
-    "@deepseek-ai/schemastery": "^3.18.4",
-    "cross-spawn": "^7.0.6",
-    "zod": "^4.6.5"
-  },
-  "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.4",
-    "@deepseek-ai/dsh-agent": "^0.1.7-rc.2 || 0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3",
-    "@deepseek-ai/dsh-llm": "^0.1.7-rc.2 || 0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3",
-    "@deepseek-ai/dsh-session": "^0.1.7-rc.2 || 0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3",
-    "@deepseek-ai/dsh-session-projection": "^0.1.7-rc.2 || 0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3",
-    "@deepseek-ai/dsh-subagent": "^0.1.7-rc.2 || 0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3",
-    "@deepseek-ai/dsh-system-prompt": "^0.1.7-rc.2 || 0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3",
-    "@deepseek-ai/dsh-tools": "^0.1.7-rc.2 || 0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3",
-    "@deepseek-ai/dsh-util-values": "^0.1.7-rc.2 || 0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3"
-  },
   "devDependencies": {
-    "@deepseek-ai/cordis": "4.0.4",
-    "@deepseek-ai/dsh-agent": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-api-session-controller": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-invariants": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-llm": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-scope": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-session": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-session-persistence-jsonl": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-session-projection": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-subagent": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-system-prompt": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-tool-call-timeout-policy": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-tools": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-user-approval": "0.1.7-rc.2",
-    "@deepseek-ai/dsh-util-values": "0.1.7-rc.2",
     "@types/cross-spawn": "^6.0.6",
     "@types/node": "^24.0.0",
+    "cross-spawn": "^7.0.6",
+    "esbuild": "~0.28.0",
     "tsx": "^4.20.6",
     "typescript": "^5.9.2"
   },
   "engines": {
-    "node": "^22.19.0 || >=24.0.0",
-    "dsh": "^0.1.7-rc.2 || 0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3"
+    "node": "^22.19.0 || >=24.0.0"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
       "esbuild"
     ]
-  },
-  "license": "MIT"
+  }
 }

@@ -1,29 +1,13 @@
 # Repository Guidelines
 
-## Project Structure & Module Organization
+## Scope and structure
 
-`src/` contains the DSH plugin, Codex App Server integration, bridge runtime, and browser client (`src/client.js`). Workflow orchestration lives in `src/application/`; persistence and schema code lives in `src/infrastructure/` and `src/state/`. `test/` holds Node test suites and a fake App Server fixture. `scripts/` contains build, compatibility, and release checks. `docs/` holds operational guidance. Generated JavaScript and declarations go to `lib/`; edit `src/`, then rebuild.
+This repository builds the portable `codex-workflow` skill. `SKILL.md` is its entry point; `references/` contains the CLI and recovery guidance. TypeScript source lives in `src/`, tests and fake Codex fixtures in `test/`, and build and verification tools in `scripts/`. The generated skill is packaged at `dist/codex-workflow` and `dist/codex-workflow.zip`; do not hand-edit generated output.
 
-## Build, Test, and Development Commands
+Codex planner and reviewer roles are read-only. The host agent implements and tests within the user's authorization. Review-only intent does not authorize fixes. Preserve exact persistent thread IDs, operation ownership, cancellation fencing, and review evidence; never duplicate an operation when its receipt or cleanup is uncertain. Existing DSH databases and configuration are outside this skill's scope. Historical DSH documents remain historical.
 
-- `pnpm install` installs pinned development dependencies.
-- `pnpm build` compiles TypeScript and copies the browser client to `lib/`.
-- `pnpm typecheck` checks types without emitting files.
-- `pnpm test` builds and runs `test/*.test.ts` with Node's test runner through `tsx`.
-- `pnpm verify` runs type checking and the full test suite.
-- `pnpm verify:isolated` runs complete verification in a snapshot outside the checkout, retains evidence, and protects a linked DSH client's build files from verification writes.
-- `pnpm host:check` loads the built plugin against the installed DSH host in isolated temporary storage.
-- `pnpm host:recovery:check` verifies original-thread continuation through installed DSH services with local fault injection.
-- `pnpm release:check` runs verification, an offline doctor check, and a package audit.
+## Development and verification
 
-## Coding Style & Naming Conventions
+Use Node `^22.19.0 || >=24.0.0` and the pinned pnpm version. Follow existing TypeScript conventions: two-space indentation, semicolons, and double quotes. Run `pnpm build`, `pnpm typecheck`, affected tests, and `pnpm verify`; use `pnpm verify:isolated` when isolated verification is needed. `pnpm doctor:offline` checks local readiness, `pnpm pack:skill` creates the distribution, and `pnpm release:check` runs release checks. Consult `docs/release-checklist.md` before release work. Do not claim platform or live Codex validation without evidence.
 
-Use TypeScript with two-space indentation, semicolons, and double quotes, matching nearby code. Keep browser code in `src/client.js` compatible with the host's module loader. Name modules by responsibility (`planner-execution.ts`, `workflow-schema.ts`) and tests after the module or behavior they cover (`workflow.test.ts`). Run `pnpm typecheck` before proposing changes. Do not edit generated `lib/` files by hand.
-
-## Testing Guidelines
-
-Use `node:test` and `node:assert/strict`. Add regression tests at the boundary where a failure occurs; the fake App Server in `test/fixtures/` supports protocol and lifecycle cases. The full suite defaults to four independent test processes; set `DSH_WORKFLOW_TEST_CONCURRENCY=2` when memory is limited (allowed: 1–4). Concurrency inside each scenario is unchanged. Run one suite with `pnpm exec tsx --test test/workflow.test.ts`; place test flags before filenames. Run `pnpm verify` before delivery. No numeric coverage threshold is enforced.
-
-## Commit & Pull Request Guidelines
-
-Recent commits use prefixes such as `feat:`, `fix:`, `refactor:`, `docs:`, and `release:` with an imperative summary. Keep commits focused. Pull requests should describe the behavior changed, link the relevant issue or workflow, and include test results. For settings or sidebar changes, include a screenshot or short recording. Document any DSH host compatibility impact.
+Preserve existing changelog history and record user-facing behavior changes in Unreleased. Do not commit, push, tag, or publish unless requested.

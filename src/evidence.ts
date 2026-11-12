@@ -40,6 +40,7 @@ export async function isGitRepository(cwd: string): Promise<boolean> {
 }
 
 async function collectGitEvidence(options: EvidenceOptions): Promise<ReviewEvidence> {
+  const gitRoot = (await runGitCapture(options.cwd, ["rev-parse", "--show-toplevel"])).stdout.trim();
   const baseRevision = await readGitBaseRevision(options.cwd);
   const { stdout } = await runGitCapture(options.cwd, [
     "-c", "core.quotepath=false",
@@ -61,14 +62,15 @@ async function collectGitEvidence(options: EvidenceOptions): Promise<ReviewEvide
         ["diff", "--no-ext-diff", "--no-color"],
       ];
   const diff = await streamGitDiff(options.cwd, commands, options.maxDiffBytes);
+  const indexDiff = await streamGitDiff(options.cwd, [["diff", "--cached", "--no-ext-diff", "--no-color"]], 0);
   const captured = diff.captured.subarray(0, options.maxDiffBytes);
   // Untracked files never appear in any diff, but their content is still a
   // verifiable workspace change: hash it so no-change detection sees edits.
   const untrackedDigest = createHash("sha256");
   for (const entry of entries) {
     if (entry.xy !== "??") continue;
-    const resolved = resolve(options.cwd, entry.path);
-    if (!isWithin(options.cwd, resolved)) continue;
+    const resolved = resolve(gitRoot, entry.path);
+    if (!isWithin(gitRoot, resolved)) continue;
     try {
       const info = await stat(resolved);
       if (info.isFile()) untrackedDigest.update(await hashFile(resolved));
@@ -84,20 +86,23 @@ async function collectGitEvidence(options: EvidenceOptions): Promise<ReviewEvide
   fingerprintHash.update(status);
   fingerprintHash.update("\n");
   fingerprintHash.update(diff.digest);
+  fingerprintHash.update(`\nINDEX:${indexDiff.digest}\n`);
   fingerprintHash.update("\n");
   fingerprintHash.update(untrackedDigest.digest());
+  const explicit = options.changedFiles?.length ? await collectFileEvidence(options) : undefined;
+  if (explicit) fingerprintHash.update(`\nEXPLICIT:${explicit.fingerprint}\n${JSON.stringify(explicit.missingFiles)}\n${JSON.stringify(explicit.rejectedPaths)}`);
   return {
     kind: "git",
     baseRevision,
-    changedFiles,
+    changedFiles: [...new Set([...changedFiles.map((path) => relative(options.cwd, resolve(gitRoot, path)).replaceAll("\\", "/")), ...(explicit?.changedFiles ?? [])])],
     status,
     diff: decodeUtf8Safely(captured),
     diffTruncated: diff.totalBytes > options.maxDiffBytes,
     diffBytes: diff.totalBytes,
     fingerprint: fingerprintHash.digest("hex"),
-    fileHashes: [],
-    missingFiles: [],
-    rejectedPaths: [],
+    fileHashes: explicit?.fileHashes ?? [],
+    missingFiles: explicit?.missingFiles ?? [],
+    rejectedPaths: explicit?.rejectedPaths ?? [],
     insufficient: false,
   };
 }

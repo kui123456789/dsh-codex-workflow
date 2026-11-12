@@ -1,153 +1,79 @@
-#!/usr/bin/env node
-// Release check for dsh-codex-workflow.
-//
-// A repeatable, OFFLINE gate (no Codex login, no real DSH_HOME):
-//   1. verify      : typecheck + full test suite + build
-//   2. offline doctor: `doctor --offline --json` must pass; skipped codex-heavy
-//      checks are reported (never falsely "pass").
-//   3. pack audit  : `pnpm pack` into a temp dir, list the tarball contents
-//      (gzip + ustar parse, no extra deps) and assert the `files` whitelist:
-//      ONLY lib/, scripts/, package.json, README.md, CHANGELOG.md, LICENSE,
-//      cordis.patch.yml — no tests/fixtures, coord.sqlite, DSH_HOME paths,
-//      credentials, temp/review leftovers. The temp tarball is ALWAYS removed.
-import crossSpawn from "cross-spawn";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { cp, lstat, mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
-import {
-  dshPeerRangeIncludesDevBaseline,
-  parseTarGzMembers,
-  RELEASE_ALLOWED_FILES,
-  RELEASE_ALLOWED_PREFIXES,
-  RELEASE_FORBIDDEN,
-} from "./release-check-lib.mjs";
+import { join, resolve } from "node:path";
+import { readCompleteTestReceipt } from "./test-receipt.mjs";
 
-const root = fileURLToPath(new URL("..", import.meta.url));
-const failures = [];
-
-function report(label, ok, detail = "") {
-  if (!ok) failures.push(`${label}${detail ? `: ${detail}` : ""}`);
-  return ok;
+const root = process.cwd();
+const evidenceRoot = resolve(root, "..", ".codex-workflow-verification");
+await mkdir(evidenceRoot, { recursive: true });
+const evidence = await mkdtemp(join(evidenceRoot, "release-"));
+const runId = randomUUID();
+const receiptPath = join(evidence, "tests.jsonl");
+const summary = { complete: false, repositoryRoot: root, evidenceDirectory: evidence, nodeVersion: process.version, steps: [] };
+const pnpm = process.env.npm_execpath;
+async function run(name, command, args, env = {}, cwd = root) {
+  const child = spawn(command, args, { cwd, env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true, detached: process.platform !== "win32" });
+  let log = "", stdout = "";
+  child.stdout.on("data", chunk => { log += chunk; stdout += chunk; process.stdout.write(chunk); });
+  child.stderr.on("data", chunk => { log += chunk; process.stderr.write(chunk); });
+  const timer = setTimeout(() => {
+    if (process.platform === "win32") spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" }).unref();
+    else { try { process.kill(-child.pid, "SIGKILL"); } catch {} }
+  }, 15 * 60_000);
+  let code;
+  try { code = await new Promise((accept, reject) => { child.once("error", reject); child.once("close", code => accept(code ?? 1)); }); }
+  finally { clearTimeout(timer); await writeFile(join(evidence, name + ".log"), log); }
+  summary.steps.push({ name, exitCode: code });
+  if (code !== 0) throw new Error(name + " failed with exit " + code);
+  return stdout;
 }
-
-function runPnpm(args) {
-  const result = crossSpawn.sync("pnpm", args, { cwd: root, stdio: ["ignore", "inherit", "inherit"], windowsHide: true });
-  if (result.error) throw result.error;
-  return result.status;
-}
-
-function runNode(args) {
-  const result = crossSpawn.sync(process.execPath, args, { cwd: root, encoding: "utf8", windowsHide: true });
-  if (result.error) throw result.error;
-  return { status: result.status, stdout: String(result.stdout || ""), stderr: String(result.stderr || "") };
-}
-
-const packageJson = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
-const versionSource = await readFile(join(root, "src", "version.ts"), "utf8");
-const sourceVersion = versionSource.match(/PLUGIN_VERSION\s*=\s*"([^"]+)"/)?.[1];
-report("runtime/package version match", sourceVersion === packageJson.version,
-  `src/version.ts=${sourceVersion ?? "missing"}, package.json=${packageJson.version ?? "missing"}`);
-
-// Docs keep pace with the release: the CHANGELOG must document this exact
-// version and the README must not advertise itself as an older release.
-const changelog = await readFile(join(root, "CHANGELOG.md"), "utf8");
-report("CHANGELOG documents the release version", changelog.includes(`## [${packageJson.version}]`),
-  `CHANGELOG.md has no ${packageJson.version} entry`);
-const readme = await readFile(join(root, "README.md"), "utf8");
-const patch = await readFile(join(root, "cordis.patch.yml"), "utf8");
-report("README documents autonomous trigger modes", /autoTriggerMode[\s\S]*off[\s\S]*complex[\s\S]*always/.test(readme),
-  "README.md does not document off | complex | always");
-report("bundle defaults autonomous trigger to complex", /^\s*autoTriggerMode:\s*complex\s*$/m.test(patch),
-  "cordis.patch.yml does not set autoTriggerMode: complex");
-report("system-prompt peer dependency is declared", typeof packageJson.peerDependencies?.["@deepseek-ai/dsh-system-prompt"] === "string",
-  "package.json has no @deepseek-ai/dsh-system-prompt peer dependency");
-// 1.1.3: every DSH peer range must describe the version the plugin is actually
-// developed and type-checked against (its pinned devDependency), otherwise the
-// declared contract silently drifts from the verified baseline. The HOST judges
-// the range itself at profile startup; this keeps our two declarations in step
-// (the runtime verdict is checked by `pnpm host:check` and `pnpm doctor`).
-const dshPeerDrift = Object.entries(packageJson.peerDependencies ?? {})
-  .filter(([name]) => name.startsWith("@deepseek-ai/dsh"))
-  .filter(([name, range]) => !dshPeerRangeIncludesDevBaseline(range, packageJson.devDependencies?.[name]));
-report("every dsh peer range includes its pinned dev dependency baseline", dshPeerDrift.length === 0,
-  dshPeerDrift.map(([name, range]) => `${name} peer ${range} does not include ^${packageJson.devDependencies?.[name]}`).join(", "));
-
-// 1.1.12 VISIBILITY CONTRACT. Plugin-created Planner/Reviewer threads are
-// App Server ephemeral threads: they are not named, are omitted from
-// `thread/list`, and the readable result is projected into DSH's sidebar.
-// Keep two static guards so a future change cannot silently restore Desktop
-// tasks or remove the sidebar contract:
-//   a) `workflow.ts` must never create a durable Reviewer through the CLI
-//      dispatcher, and
-//   b) the README must document the ephemeral + sidebar behavior.
-const workflowSource = await readFile(join(root, "src", "workflow.ts"), "utf8");
-report("workflow.ts never creates a durable CLI Reviewer",
-  !/audit[?!]?\.(createReview|review)\s*\(/.test(workflowSource),
-  "src/workflow.ts calls the CLI dispatcher's durable review path");
-report("README documents the ephemeral sidebar visibility contract",
-  /thread\/start\s*\{\s*ephemeral:\s*true\s*\}/.test(readme)
-    && /thread\/list/.test(readme)
-    && /subagentchat/.test(readme)
-    && /never opens or focuses Codex Desktop/.test(readme),
-  "README.md does not document ephemeral threads, DSH subagentchat sidebar, and Desktop suppression");
-
-// 1) verify
-report("typecheck", runPnpm(["typecheck"]) === 0, "pnpm typecheck failed");
-report("tests", runPnpm(["test"]) === 0, "pnpm test failed");
-report("build", runPnpm(["build"]) === 0, "pnpm build failed");
-
-// 2) offline doctor
-const doctor = runNode([join(root, "scripts", "doctor.mjs"), "--offline", "--json"]);
-report("offline doctor exits successfully", doctor.status === 0, doctor.stderr.slice(0, 400));
-let doctorReport = null;
 try {
-  doctorReport = JSON.parse(doctor.stdout);
-} catch {
-  report("offline doctor parseable JSON", false, doctor.stdout.slice(0, 400));
-}
-if (doctorReport) {
-  report("offline doctor passes", doctorReport.ok === true, JSON.stringify(doctorReport.checks.filter((c) => !c.ok).map((c) => c.label)));
-  report("offline doctor reports skipped codex checks", doctorReport.skippedCount >= 4, `skippedCount=${doctorReport.skippedCount}`);
-}
-
-// 3) pack audit (temp dir always cleaned)
-const tempDir = await mkdtemp(join(tmpdir(), "dsh-release-check-"));
-let tgz = null;
-try {
-  const pack = runPnpm(["pack", "--pack-destination", tempDir]);
-  report("pack succeeds", pack === 0, "pnpm pack failed");
-  const files = await readdir(tempDir);
-  tgz = files.find((name) => name.endsWith(".tgz"));
-  report("pack produced a tarball", Boolean(tgz), "no .tgz emitted");
-  if (tgz) {
-    const bytes = await readFile(join(tempDir, tgz));
-    const rawNames = parseTarGzMembers(bytes);
-    const members = rawNames.map((name) => name.replace(/^package\//, "")).filter((name) => name.length > 0 && !name.endsWith("/"));
-    report("tarball lists cleanly", members.length > 0, "no members parsed");
-
-    const forbidden = RELEASE_FORBIDDEN;
-    const outOfWhitelist = [];
-    const forbiddenMatches = [];
-    for (const member of members) {
-      if (forbidden.some((pattern) => pattern.test(member))) forbiddenMatches.push(member);
-      if (RELEASE_ALLOWED_FILES.has(member)) continue;
-      if (RELEASE_ALLOWED_PREFIXES.some((prefix) => member.startsWith(prefix))) continue;
-      outOfWhitelist.push(member);
+  if (!pnpm) throw new Error("Run the release gate through pnpm release:check");
+  await run("verify", process.execPath, [pnpm, "verify"], {
+    CODEX_WORKFLOW_TEST_RECEIPT: receiptPath, CODEX_WORKFLOW_TEST_RECEIPT_ID: runId, CODEX_WORKFLOW_TEST_REPORTER: "tap",
+  });
+  summary.receipt = await readCompleteTestReceipt({ receiptPath, runId, repositoryRoot: root, exitCode: 0 });
+  const offline = JSON.parse((await run("doctor", process.execPath, ["scripts/workflow.mjs", "doctor", "--offline", "--home", join(evidence, "doctor-home")])).trim());
+  if (typeof offline.continuation?.available !== "boolean") throw new Error("Offline doctor did not return the public JSON envelope");
+  await run("package", process.execPath, ["scripts/package-skill.mjs"]);
+  const packageRoot = resolve("dist/codex-workflow");
+  const files = [];
+  async function inspect(directory, prefix = "") {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name), relative = prefix + entry.name;
+      if ((await lstat(path)).isSymbolicLink()) throw new Error("Package contains a symbolic link: " + relative);
+      if (entry.isDirectory()) {
+        if (["node_modules", "src", ".git", "test"].includes(entry.name)) throw new Error("Package contains development files: " + relative);
+        await inspect(path, relative + "/");
+      } else files.push({ path: relative, sha256: createHash("sha256").update(await readFile(path)).digest("hex") });
     }
-    report("every tarball member is on the files whitelist", outOfWhitelist.length === 0, `out-of-whitelist: ${outOfWhitelist.join(", ")}`);
-    report("no forbidden/temp/credential/fixture content shipped", forbiddenMatches.length === 0, `forbidden: ${forbiddenMatches.join(", ")}`);
-    report("package.json shipped", members.includes("package.json"), "package.json missing");
-    report("at least one lib/ artifact shipped", members.some((name) => name.startsWith("lib/")), "lib/ missing");
-    report("no tests/fixtures shipped", !members.some((name) => name.startsWith("test/") || name.includes("fixtures")), "test/ or fixtures shipped");
   }
+  await inspect(packageRoot);
+  for (const required of ["SKILL.md", "scripts/workflow.mjs"]) {
+    if (!files.some(file => file.path === required)) throw new Error("Package missing " + required);
+  }
+  const standalone = join(evidence, "standalone-package");
+  await cp(packageRoot, standalone, { recursive: true });
+  const packageDoctor = JSON.parse((await run("package-doctor", process.execPath, [join(standalone, "scripts/workflow.mjs"), "doctor", "--offline", "--home", join(evidence, "package-home")], {}, tmpdir())).trim());
+  if (typeof packageDoctor.continuation?.available !== "boolean") throw new Error("Packaged CLI is not independently runnable");
+  await writeFile(join(evidence, "artifacts.json"), JSON.stringify({ packageRoot, files }, null, 2) + "\n");
+  async function assertNoStrays(directory) {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      if (["node_modules", ".git", ".migration-evidence", ".codegraph", ".mnemon", ".verification"].includes(entry.name)) continue;
+      const path = join(directory, entry.name);
+      if (entry.name.endsWith(".tgz") || entry.name === ".codex-pack-review") throw new Error("Packaging left a stray artifact: " + path);
+      if (entry.isDirectory()) await assertNoStrays(path);
+    }
+  }
+  await assertNoStrays(root);
+  summary.complete = true;
+} catch (error) {
+  summary.error = error instanceof Error ? error.message : String(error);
+  process.exitCode = 1;
 } finally {
-  // Always remove the temp pack directory; a stray tgz must never survive.
-  await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+  await writeFile(join(evidence, "summary.json"), JSON.stringify(summary, null, 2) + "\n");
+  console.log(JSON.stringify({ complete: summary.complete, evidenceDirectory: evidence, error: summary.error }));
 }
-
-const ok = failures.length === 0;
-process.stdout.write(ok
-  ? `RELEASE_CHECK_OK\nverified: typecheck/test/build\noffline doctor: ok (${doctorReport?.skippedCount ?? 0} skipped)\npack audit: ok\ntemp tarball: cleaned\n`
-  : `RELEASE_CHECK_FAIL\n${failures.map((item) => `- ${item}`).join("\n")}\n`);
-if (!ok) process.exitCode = 1;

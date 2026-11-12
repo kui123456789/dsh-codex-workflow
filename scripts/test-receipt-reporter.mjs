@@ -3,9 +3,9 @@ import { open } from "node:fs/promises";
 
 /** Companion reporter. Native reporters retain responsibility for human output. */
 export default async function* report(source) {
-  const runId = process.env.DSH_WORKFLOW_TEST_RECEIPT_ID;
-  const root = process.env.DSH_WORKFLOW_TEST_RECEIPT_ROOT;
-  const path = process.env.DSH_WORKFLOW_TEST_RECEIPT;
+  const runId = process.env.CODEX_WORKFLOW_TEST_RECEIPT_ID;
+  const root = process.env.CODEX_WORKFLOW_TEST_RECEIPT_ROOT;
+  const path = process.env.CODEX_WORKFLOW_TEST_RECEIPT;
   if (!runId || !root || !path) throw new Error("Test receipt has no original run identity");
   const output = await open(path, "wx");
   const line = value => JSON.stringify(value) + "\n";

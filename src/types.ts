@@ -1,156 +1,8 @@
-import type { SubmissionNoticeCommand, SubmitVerdictCommand } from "./bridge-protocol.js";
+import type { ProcessIdentity, ProcessTree } from "./process.js";
 
-export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
-export type ConversionTransport = "app-server" | "cli";
-export type ConversionFallback = "cli" | "fail";
-
-export type WorkflowMode = "planned" | "review_only";
-
-/** How the workflow was started: by this DSH session (legacy tools) or by the
- * Codex-led bridge. Old records default to "dsh". */
-export type WorkflowOrigin = "dsh" | "codex_bridge";
-
-/** Durable state of the callback that validates/resumes the workflow's Codex review task. */
-export type CallbackState = "idle" | "queued" | "sending" | "waiting_verdict" | "retrying" | "failed";
-
-/** Per-submission lifecycle inside a bridge workflow. */
-export type SubmissionState =
-  | "queued"         // submit persisted, callback not yet spawned
-  | "sending"        // callback child is running
-  | "waiting_verdict" // callback finished, verdict not yet received (legacy)
-  | "retrying"       // callback hit a retryable condition, backing off
-  | "verdict_ready"  // verdict obtained and staged in the record; enqueue pending
-  | "received"       // structured verdict received and queued for application
-  | "applied"        // verdict applied to the workflow (outcome persisted)
-  | "delivered"      // outcome relayed to the original DSH session
-  | "failed";        // terminal callback/verdict failure; workflow stays intact
-
-export interface ReviewInput {
-  implementationSummary: string;
-  changedFiles?: string[];
-  testResults?: string;
-}
-
-/** Independent-round intent is control data, never review material. */
-export interface ReviewRequestInput extends ReviewInput {
-  newReviewRound?: boolean;
-}
-
-/** Submission intent is control data, never part of the review material. */
-export interface SubmitInput extends ReviewInput {
-  newReviewRound?: boolean;
-}
-
-export type WorkflowPhase =
-  | "planning"
-  | "waiting_input"
-  | "executing"
-  | "reviewing"
-  | "fixing"
-  | "waiting_review_decision"
-  | "passed"
-  | "blocked"
-  | "failed"
-  | "cancelled";
-
-export type ReviewStep =
-  | "reviewing"
-  | "review_native_turn"
-  | "review_readback"
-  | "review_display_rewrite"
-  | "review_conversion"
-  | "review_alignment"
-  | "review_reconciliation"
-  | "review_finalizing";
-
-export type WorkflowProcessState = "running" | "waiting" | "completed" | "failed" | "cancelled" | "stale";
-
-/** Captured process-instance evidence; numeric PIDs alone can be reused. */
-export interface ProcessInstanceIdentity {
-  readonly processId: number;
-  readonly birth: string;
-}
-
-/** An exact durable cleanup claim, without ephemeral thread or turn ids. */
-export interface WorkflowTerminalCleanupMarker {
-  token: string;
-  epoch: number;
-  sessionId: string;
-}
-
-/** A model/transport failure that can continue on the same in-process thread. */
-export interface WorkflowRetryState {
-  stage: "planning" | "reviewing";
-  reason: string;
-  attempts: number;
-  awaitingContinuation: boolean;
-  /** The submitted original start has no adopted authoritative receipt yet. */
-  awaitingStartReceipt?: boolean;
-  /** A rejected turn can only be cleaned up, never continued as model work. */
-  awaitingCleanup?: boolean;
-  terminalFailure?: string;
-  /** Historical receipts cannot authorize cleanup of a later original writer. */
-  terminalCleanup?: WorkflowTerminalCleanupMarker;
-  /** Safe original backend-process evidence, never an ephemeral thread id.
-   * An empty marker means interruption is pending but its process is unknown. */
-  interruption?: { processId?: number; processIds?: number[]; processIdentities?: readonly ProcessInstanceIdentity[];
-    target?: "planner" | "reviewer" | "auxiliary" };
-  /** Only the stage is durable; completed model artifacts stay process-local. */
-  reviewCheckpoint?: { nextStep: "conversion" | "alignment" | "reconciliation" | "finalizing" };
-  /** The original Planner owns completed artifacts; only its next step is stored. */
-  plannerCheckpoint?: { nextStep: "visible" | "conversion" | "completion" | "corrected_conversion" | "finalizing" };
-}
-
-export interface ReviewPhaseTiming {
-  startedAt: string;
-  endedAt?: string;
-  elapsedMs?: number;
-}
-
-export interface PlannerQuestion {
-  id: string;
-  header: string;
-  question: string;
-  options?: Array<{ label: string; description?: string }>;
-  allowOther: boolean;
-  secret: boolean;
-}
-
-export interface PlannerResult {
-  status: "ready" | "needs_input" | "failed";
-  planMarkdown?: string;
-  questions: PlannerQuestion[];
-  assumptions: string[];
-  message?: string;
-}
-
-export interface ReviewFinding {
-  severity: "critical" | "high" | "medium" | "low";
-  blocking: boolean;
-  title: string;
-  body: string;
-  file?: string;
-  line?: number;
-}
-
-export interface ReviewResult {
-  verdict: "pass" | "changes_requested";
-  findings: ReviewFinding[];
-  testGaps: string[];
-  summary: string;
-}
-
-/**
- * Auditable evidence of what the workspace looked like when a review ran.
- * `kind: "git"` evidence comes from `git status --porcelain=v1` plus the full
- * `git diff HEAD` stream; `kind: "files"` evidence hashes the files listed in
- * `changedFiles` without a git repository. `fingerprint` is a stable SHA-256
- * covering the Git HEAD commit, status and full (untruncated) diff/content so
- * that staged, unstaged, deleted, renamed and untracked changes all move it.
- */
+export type WorkflowPhase = "planning" | "waiting_input" | "executing" | "reviewing" | "fixing" | "waiting_review_decision" | "passed" | "blocked" | "failed" | "cancelled";
 export interface ReviewEvidence {
   kind: "git" | "files";
-  /** Actual Git HEAD commit, or "unborn" for a verified branch without commits. */
   baseRevision?: string;
   changedFiles: string[];
   status: string;
@@ -161,322 +13,72 @@ export interface ReviewEvidence {
   fileHashes: Array<{ path: string; sha256: string }>;
   missingFiles: string[];
   rejectedPaths: string[];
-  /** True when there was no reliable way to observe workspace changes (e.g. no
-   * git repository and no changedFiles); no-change detection is disabled then. */
   insufficient: boolean;
 }
-
-export interface ReviewDecision {
-  decision: "accept" | "fix";
-  note?: string;
-  decidedAt: string;
+export interface PlannerResult {
+  status: "ready" | "needs_input" | "failed";
+  planMarkdown: string;
+  questions: Array<{ id: string; header: string; question: string; options: Array<{ label: string; description: string }>; allowOther: boolean; secret: boolean }>;
+  assumptions: string[];
+  message: string;
 }
-
-/** One review entry (finding or test gap) judged to conflict with the review
- * authority hierarchy (1.0.10). */
-export interface ReviewConflict {
-  /** Kind of the conflicting entry inside the normalized ReviewResult. */
-  kind: "finding" | "testGap";
-  /** 0-based index of the entry inside the normalized ReviewResult. */
-  index: number;
-  reason: string;
-  /** The original-task constraint or approved-plan entry the entry violates
-   * ("generic quality suggestion" when none applies). */
-  violated: string;
-  /** True when the entry is excused by a REPRODUCIBLE critical/high
-   * correctness, security or data-corruption defect with concrete code
-   * evidence (level-1 exception). */
-  highSeverityException: boolean;
+export interface ReviewResult {
+  verdict: "pass" | "changes_requested";
+  findings: Array<{ severity: "critical" | "high" | "medium" | "low"; blocking: boolean; title: string; body: string; file: string | null; line: number | null }>;
+  testGaps: string[];
+  summary: string;
 }
-
-/** Durable audit of the most recent review-authority alignment conflict. */
-export interface ReviewConflictInfo {
-  conflicts: ReviewConflict[];
-  /** True when ONE visible reconciliation turn ran on the same Codex task. */
-  reconciled: boolean;
-  /** True when the reconciliation re-alignment ended aligned (the corrected
-   * verdict was applied). An unresolved conflict never touches `latestReview`. */
-  resolved: boolean;
-  at: string;
+export interface Settings {
+  plannerModel?: string;
+  reviewerModel?: string;
+  plannerEffort?: string;
+  reviewerEffort?: string;
+  turnTimeoutMs: number;
+  transientRetryBudgetMs: number;
+  maxReviewCycles: number;
+  maxNoChangeReviewRounds: number;
 }
-
-/** Internal result of the alignment fork (never persisted, never the public
- * ReviewResult). */
-export interface AlignmentOutcome {
-  aligned: boolean;
-  conflicts: ReviewConflict[];
+export interface ReviewInput { implementationSummary: string; changedFiles?: string[]; testResults?: string }
+export interface Operation {
+  id: string;
+  stage: "planning" | "reviewing";
+  input: Record<string, unknown>;
+  threadId?: string;
+  worker?: ProcessIdentity;
+  tree?: ProcessTree;
+  startedAt: number;
+  finished: boolean;
+  spawnRequested: boolean;
+  evidence?: ReviewEvidence;
+  failureReason?: string;
+  recoverable?: boolean;
+  cleanupConfirmed?: boolean;
 }
-
 export interface WorkflowRecord {
   schemaVersion: 1;
   id: string;
-  /** Monotonic write counter used by the SQLite revision-CAS; every persisted
-   * write bumps it. Optional for records written by older versions. */
-  revision?: number;
-  dshSessionId: string;
+  revision: number;
   cwd: string;
   task: string;
-  /** Optional for records written by older versions; defaults to "planned". */
-  mode?: WorkflowMode;
+  requestKey: string;
+  mode: "planned" | "review_only";
   phase: WorkflowPhase;
+  processState: "running" | "waiting" | "completed" | "failed" | "cancelled";
   createdAt: string;
   updatedAt: string;
-  plannerThreadId?: string;
-  plannerTurnId?: string;
-  /** Model requested explicitly or resolved by the App Server client for the
-   * visible Planner turn. Retained for later turns and private conversion;
-   * this is not provider-side routing or billing telemetry. Older records
-   * may omit the choice. */
-  plannerModel?: string;
-  /** Requested visible-turn effort retained across the planning flow.
-   * Private structured conversions keep their separate low-effort policy. */
-  plannerEffort?: ReasoningEffort;
-  /** Legacy source thread id retained for diagnostics only. */
-  sourceThreadId?: string;
-  reviewerThreadId?: string;
-  /** Origin marker for legacy ids and new process-local ephemeral rounds.
-   * New records never persist the ephemeral id itself. */
-  reviewerThreadOrigin?: "app-server" | "app-server-ephemeral" | "cli";
-  reviewerTurnId?: string;
-  /** Effective reviewer model/effort, persisted so review-only overrides
-   * survive into later repair rounds. Optional for old records. */
-  reviewerModel?: string;
-  reviewerEffort?: ReasoningEffort;
-  planMarkdown?: string;
-  assumptions: string[];
-  questions: PlannerQuestion[];
-  pendingInput?: {
-    turnId: string;
-    itemId: string;
-  };
-  reviewCycles: number;
-  /** Safe, durable observability for the current/most recent review attempt. */
-  reviewStep?: ReviewStep;
-  reviewStartedAt?: string;
-  lastProgressAt?: string;
-  activeTurnId?: string;
-  reviewAttempt?: number;
-  reviewElapsedMs?: number;
-  reviewPhaseTimings?: Partial<Record<ReviewStep, ReviewPhaseTiming>>;
-  lastProgressMessage?: string;
-  processState?: WorkflowProcessState;
-  /** Recoverable model-run state. Ephemeral thread ids remain process-local in
-   * WorkflowRuntimeState and are intentionally never written here. */
-  retryState?: WorkflowRetryState;
-  /** A registered foreground Reviewer ended without an accepted verdict.
-   * Unchanged material requires an explicit independent business round. */
-  reviewFailureReason?: "original_reviewer_unavailable" | "review_contract_conflict";
-  /** Durable server-reported original-thread snapshots, not a complete bill. */
-  observedUsage?: import("./workflow-usage.js").WorkflowObservedUsage;
-  /** Optional for records written by older versions; defaults to 0. */
-  noChangeReviewRounds?: number;
-  /** Consecutive review CALLS (DSH-led review rounds or bridge submissions)
-   * that ended in an UNRESOLVED reviewer-contract conflict (review authority
-   * alignment). An aligned review resets this to 0; two consecutive
-   * unresolved conflicts block the workflow WITHOUT consuming review cycles.
-   * Optional for records written by older versions; defaults to 0. */
-  reviewContractFailures?: number;
-  /** The most recent review-authority alignment conflict: which findings/test
-   * gaps conflicted with the authority hierarchy, whether ONE visible
-   * reconciliation turn ran on the same Codex task, and whether the corrected
-   * verdict ended aligned (resolved). `latestReview` only ever holds APPLIED
-   * verdicts, so an unresolved conflict never overwrites it. Optional for
-   * records written by older versions. */
-  latestReviewConflict?: ReviewConflictInfo;
-  latestReview?: ReviewResult;
-  latestReviewEvidence?: ReviewEvidence;
-  previousReviewFingerprint?: string;
-  reviewDecision?: ReviewDecision;
-  error?: string;
-  /** Bridge-originated workflows: the external Codex task this workflow is
-   * bound to and the queue request that started it. Optional for old records. */
-  origin?: WorkflowOrigin;
-  codexThreadId?: string;
-  bridgeRequestId?: string;
-  /** Delivery progress of a bridge dispatch: `prepared` after the workflow
-   * exists, `delivered` after the followup was sent. Used as an idempotency
-   * checkpoint so crash replays never duplicate a workflow. */
-  bridgeDeliveryState?: "prepared" | "delivered";
-  callbackState?: CallbackState;
-  callbackAttempts?: number;
-  callbackError?: string;
-  /** The last DSH submission awaiting the Codex verdict callback. */
-  pendingReviewRequest?: ReviewInput;
-  /** Identity and durable state of the current submission. One unfinished
-   * submission per workflow; every callback/verdict update is conditional on
-   * this id so stale cycles and late verdicts can never apply. */
-  submissionId?: string;
-  submissionState?: SubmissionState;
-  submissionAttempts?: number;
-  /** An upstream result exists only in the owning process; never restart it silently. */
-  submissionReviewPending?: boolean;
-  submissionError?: string;
-  /** Machine-readable reason for the last non-verdict callback outcome
-   * (interrupted turn, turn timeout, rate limit, active writer, teardown/cancel
-   * abort, lease loss, original_reviewer_unavailable,
-   * original_review_result_unavailable, ...). Persisted so a stuck submission is diagnosable
-   * and the persistent recovery loop can classify it instead of guessing. */
-  submissionCallbackReason?: string;
-  /** Earliest wall-clock time at which the persistent callback recovery loop
-   * may start another bounded retry round after the Codex task was busy. */
-  submissionRetryAt?: number;
-  /** Idempotency checkpoint for verdict application/replay. */
-  appliedVerdictRequestId?: string;
-  appliedVerdictSubmissionId?: string;
-  /** The workspace fingerprint the applied verdict was verified against. Kept
-   * until delivery so a workspace change after apply (e.g. while the DSH
-   * session is offline) invalidates the verdict before it is reported. */
-  appliedVerdictEvidenceFingerprint?: string;
-  /** Durable two-phase verdict pipeline: the FULL verdict command (identity +
-   * payload, including requestId and createdAt) is staged here BEFORE it is
-   * enqueued, so a crash between staging and enqueueing is recovered by
-   * re-enqueueing the exact same command — identical requestId, createdAt and
-   * commandHash — never by minting a new one. The staged identity is kept
-   * until the verdict is APPLIED, so a manual verdict answering the same
-   * submission with a different request id is refused while the expected
-   * verdict is pending. */
-  stagedVerdict?: {
-    command: SubmitVerdictCommand;
-    createdAt: string;
-  };
-  /** Durable terminal callback notification. The exact command identity is
-   * persisted before enqueueing and retained through delivery so restart
-   * recovery can safely replay it without minting a second message. */
-  submissionNotice?: {
-    command: SubmissionNoticeCommand;
-    state: "prepared" | "enqueued" | "delivered";
-  };
-  /** Fenced submission callback lease: the random owner token/epoch and
-   * expiry of the process currently running (or last running) the Reviewer
-   * callback. Recovery and re-claims verify these, so an old owner
-   * can never interfere with a new owner's claim and a live callback is never
-   * double-spawned. */
-  submissionLeaseToken?: string;
-  submissionLeaseEpoch?: number;
-  submissionLeaseUntil?: number;
-  /** Durable state for opening the completed review in Codex Desktop. */
-  desktopOpenState?: "pending" | "opened" | "disabled";
-  desktopOpenSubmissionId?: string;
-  desktopOpenAttempts?: number;
-  desktopOpenNextAt?: number;
-  desktopOpenError?: string;
-}
-
-/** Read-only, process-local capability attached to status responses only. */
-export interface WorkflowContinuationStatus {
-  available: boolean;
-  reason?: "running" | "thread_unavailable" | "handle_unavailable" | "cancelled" | "not_waiting" | "stopped" | "workspace_changed" | "evidence_unavailable" | "identity_changed" | "interruption_unconfirmed" | "review_contract_conflict" | "start_receipt_pending" | "start_receipt_invalid";
-}
-
-export interface WorkflowStatus extends WorkflowRecord {
-  reviewerActive: boolean;
-  continuation: WorkflowContinuationStatus;
-  /** Safe process-local diagnostic when observed usage could not be saved. */
-  usagePersistenceError?: string;
-  /** Current original thread snapshot, excluding other threads and workflow-wide totals. */
-  tokenUsage?: Pick<import("./usage-accounting.js").TokenUsageSnapshot, "total" | "last" | "modelContextWindow"> & {
-    source: "app_server";
-    scope: "current_original_thread";
-    stage: "planning" | "reviewing";
-  };
-}
-
-export interface WorkflowConfig {
+  settings: Settings;
   codexCommand: string;
-  autoTriggerMode: import("./auto-trigger.js").AutoTriggerMode;
-  plannerModel: string;
-  reviewerModel: string;
-  plannerEffort: ReasoningEffort;
-  reviewerEffort: ReasoningEffort;
-  conversionTransport?: ConversionTransport;
-  conversionFallback?: ConversionFallback;
-  maxReviewCycles: number;
-  maxNoChangeReviewRounds: number;
-  reviewDiffMaxBytes: number;
-  bridgePollMs: number;
-  bridgeMaxPayloadBytes: number;
-  callbackTimeoutMs: number;
-  callbackMaxAttempts: number;
-  callbackRetryBaseMs: number;
-  /** 1.1.1 shared retry policy for TRANSIENT upstream failures
-   * (server_overloaded / at capacity / 429 / 5xx / dropped streams / a thread
-   * writer held elsewhere). Exponential backoff with jitter, bounded by a total
-   * wall-clock budget per operation. */
-  transientRetryBaseMs: number;
-  transientRetryMaxMs: number;
-  transientRetryBudgetMs: number;
-  transientRetryJitterRatio: number;
-  /** Independent Review progress heartbeat and stale threshold. Optional for
-   * host/test configs written before observability was added. */
-  reviewHeartbeatMs?: number;
-  reviewStaleMs?: number;
-  /** 1.1.4: deadline for the round's Reviewer-subscription release. The cleanup
-   * carries no business signal (a cancelled round must still release), so this
-   * bound is what keeps a hung `thread/unsubscribe` from wedging the round's
-   * finally — and with it cancel/teardown. Default 10000. */
-  reviewerReleaseTimeoutMs?: number;
-  /** Lease lifetime for submission callback claims (ms); heartbeats renew at
-   * ttl/3 while a callback runs. Default 60000. */
-  leaseTtlMs?: number;
-  turnTimeoutMs: number;
-  /** Per-control-RPC timeout (thread/start, turn/start, thread/fork,
-   * collaborationMode/list, unsubscribe, ...): derived from turnTimeoutMs
-   * (default min(turnTimeoutMs, 60s)). The tool timeout budgets count every
-   * serial control RPC against THIS bound, so the host can never pre-empt a
-   * legitimate operation even when several control RPCs are slow. */
-  rpcTimeoutMs?: number;
-  idleProcessMs: number;
-  terminalRelayTimeoutMs: number;
-  openCodexDesktopOnReview?: boolean;
-  desktopOpenRetryBaseMs?: number;
-  desktopOpenRetryMaxMs?: number;
-  storageDir: string;
-}
-
-export interface TurnQuestionRequest {
-  requestId: string | number;
-  threadId: string;
-  turnId: string;
-  itemId: string;
-  questions: PlannerQuestion[];
-}
-
-export interface TurnCompleteResult {
-  kind: "completed";
-  threadId: string;
-  turnId: string;
-  status: "completed" | "interrupted" | "failed";
-  text: string;
-  /** The FINAL visible output item's type of a genuinely completed turn:
-   * `plan` for Plan-mode Planner output (persisted as an item of that type and
-   * rendered by Codex Desktop as a readable plan), `agentMessage` for normal
-   * turns, `exitedReviewMode` for review turns. Absent for interrupted/failed
-   * turns or when no candidate item exists. */
-  itemType?: string;
+  codexArgs: string[];
+  plannerThreadId?: string;
+  reviewerThreadId?: string;
+  plan?: PlannerResult;
+  review?: ReviewResult;
+  evidence?: ReviewEvidence;
+  reviewInput?: ReviewInput;
+  reviewCycles: number;
+  noChangeReviewRounds: number;
+  previousFingerprint?: string;
+  operation?: Operation;
   error?: string;
-  /** Why the turn ended the way it did, when it did not complete normally:
-   * `interrupted` (some actor interrupted it), `failed`, or `timed_out` (our
-   * own waitForTurn timeout, never a verdict). `completed` turns never set it. */
-  reason?: string;
-}
-
-export interface TurnNeedsInputResult {
-  kind: "needs_input";
-  threadId: string;
-  turnId: string;
-  request: TurnQuestionRequest;
-}
-
-export type TurnWaitResult = TurnCompleteResult | TurnNeedsInputResult;
-
-/** The identity baseline of the turns already PERSISTED on a durable thread,
- * captured (`thread/read` with `includeTurns: true`) BEFORE a visible
- * review/rewrite turn starts. The newly-persisted turn is detected against
- * these ids, because the RPC turn id returned by `review/start`/`turn/start`
- * is NOT guaranteed to equal the persisted `thread.turns[].id` — real App
- * Server evidence shows native review RPC turn ids that never appear in the
- * persisted rollout history. */
-export interface PersistedTurnBaseline {
-  /** id of every turn already persisted at baseline time. */
-  ids: string[];
+  decision?: "accept" | "fix";
 }

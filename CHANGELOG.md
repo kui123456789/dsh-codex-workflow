@@ -1,6 +1,19 @@
 # Changelog
 
-All notable changes to `dsh-codex-workflow`.
+All notable changes to `codex-workflow`, formerly the `dsh-codex-workflow` plugin.
+
+## [Unreleased]
+
+## [2.0.0] - 2026-11-12
+
+- Replace the DSH plugin with the portable `codex-workflow` skill. Compatible hosts must read `SKILL.md` and run local Node commands. The packaged skill has no npm runtime dependencies; it requires Node.js `^22.19.0 || >=24.0.0`, a configured Codex CLI, and Git for Git workspace evidence.
+- Preserve the planning, clarification, host implementation, review, repair, decision, cancellation, and exact-thread recovery workflow. Codex planner and reviewer roles stay read-only; review-only requests do not authorize automatic fixes.
+- Add a JSON command protocol, bounded status waits, background workers, SQLite workflow ownership and checkpoints, and persistent Codex thread bindings. Uncertain startup receipts or process cleanup block duplicate operations.
+- Validate structured model results and complete workspace fingerprints, including staged, unstaged, untracked, and explicitly scoped file content. Workspace changes invalidate review acceptance.
+- Default to three review rounds, stop after one blocking round without verifiable changes, and use monotonic timeout and transient retry budgets. Model defaults follow local Codex configuration, with optional role overrides.
+- Distribute a self-contained skill folder and ZIP. Remove DSH host integrations, UI, installation entry points, and runtime dependencies. Existing DSH data and configuration are not migrated or modified; earlier DSH release records remain historical.
+- Replace host-specific tests with standalone subprocess, state, evidence, recovery, cancellation, and packaging checks. Configure Windows, Linux, and macOS CI on Node 22.19 and 24. Actual platform and live-provider results are reported separately in the GitHub release.
+- Correct current guidance for per-operation schema artifacts, user decisions on nonblocking suggestions, offline doctor scope, and monotonic retry timing. Retire sidebar/tool-display and settings-navigation claims that no longer apply to the skill.
 
 ## [1.1.15] - 2026-10-25
 

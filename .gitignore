@@ -1,5 +1,9 @@
 node_modules/
 lib/
+dist/
+.migration-evidence/
+.verification/
+/scripts/workflow.mjs
 coverage/
 *.tgz
 *.log

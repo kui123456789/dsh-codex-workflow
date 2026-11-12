@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Workflow"
+  short_description: "Coordinate read-only Codex planning and review"
+  default_prompt: "Use $codex-workflow to coordinate planning, implementation, and review."

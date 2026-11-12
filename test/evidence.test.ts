@@ -264,6 +264,46 @@ test("git evidence records deletions and renames", async () => {
   }
 });
 
+test("index-only content changes move the fingerprint even with identical worktree and porcelain status", async () => {
+  const directory = await makeGitRepo();
+  try {
+    await writeFile(join(directory, "base.txt"), "first staged content");
+    await git(directory, "add", "base.txt");
+    await writeFile(join(directory, "base.txt"), "same final worktree");
+    const first = await collectEvidence({ cwd: directory, maxDiffBytes: 65536 });
+    await writeFile(join(directory, "base.txt"), "different staged content");
+    await git(directory, "add", "base.txt");
+    await writeFile(join(directory, "base.txt"), "same final worktree");
+    const second = await collectEvidence({ cwd: directory, maxDiffBytes: 65536 });
+    assert.equal(first.status, second.status);
+    assert.notEqual(first.fingerprint, second.fingerprint);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("nested Git workspaces hash their root-relative untracked paths correctly", async () => {
+  const directory = await makeGitRepo();
+  try {
+    const nested = join(directory, "nested");
+    await mkdir(nested);
+    await writeFile(join(nested, "new.txt"), "first");
+    const first = await collectEvidence({ cwd: nested, maxDiffBytes: 65536 });
+    await writeFile(join(nested, "new.txt"), "second");
+    const second = await collectEvidence({ cwd: nested, maxDiffBytes: 65536 });
+    assert.notEqual(first.fingerprint, second.fingerprint);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("explicit Git review files remain guarded when the index hides their worktree changes", async () => {
+  const directory = await makeGitRepo();
+  try {
+    await git(directory, "update-index", "--skip-worktree", "base.txt");
+    const first = await collectEvidence({ cwd: directory, maxDiffBytes: 65536, changedFiles: ["base.txt"] });
+    await writeFile(join(directory, "base.txt"), "hidden change");
+    const second = await collectEvidence({ cwd: directory, maxDiffBytes: 65536, changedFiles: ["base.txt"] });
+    assert.notEqual(first.fingerprint, second.fingerprint);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
 test("git evidence truncates large diffs safely and still hashes the full output", async () => {
   const directory = await makeGitRepo();
   try {

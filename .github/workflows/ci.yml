@@ -2,55 +2,45 @@ name: ci
 
 on:
   push:
-    branches: [main, master, 'feature/**']
+    branches: [main, master, 'feature/**', 'codex/**']
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   test:
-    name: node ${{ matrix.node }} / windows
-    runs-on: windows-latest
+    name: node ${{ matrix.node }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     env:
-      DSH_WORKFLOW_TEST_CONCURRENCY: "1"
-      DSH_WORKFLOW_TEST_REPORTER: tap
+      CODEX_WORKFLOW_TEST_CONCURRENCY: '2'
+      CODEX_WORKFLOW_TEST_REPORTER: tap
     strategy:
       fail-fast: false
       matrix:
-        node:
-          - "22.19.x"
-          - "24.x"
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: ['22.19.x', '24.x']
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Node with Corepack-pinned pnpm
-        uses: actions/setup-node@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-
-      - name: Enable Corepack + locked pnpm
+      - name: Enable pinned pnpm
         run: |
           corepack enable
           corepack prepare pnpm@10.33.2 --activate
-
-      - name: Install (frozen lockfile)
+      - name: Install locked development dependencies
         run: pnpm install --frozen-lockfile
-
-      - name: Typecheck
-        run: pnpm typecheck
-
-      - name: Tests (full suite incl. process-level fault/recovery)
-        run: pnpm test
-
-      - name: Build
-        run: pnpm build
-
-      - name: Offline doctor (no Codex login, no real DSH_HOME)
-        run: pnpm doctor:offline -- --json
-
-      - name: Release check (verify + offline doctor + pack audit, tgz cleaned)
+      - name: Verify standalone Skill and native test receipts
         run: pnpm release:check
-
-      - name: No packaging leftovers
-        shell: pwsh
-        run: |
-          if (Get-ChildItem -Recurse -Filter *.tgz -ErrorAction SilentlyContinue) { throw "stray .tgz after release:check" }
-          if (Get-ChildItem -Recurse -Directory -Filter .codex-pack-review -ErrorAction SilentlyContinue) { throw "stray review dir after release:check" }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verification-${{ matrix.os }}-${{ matrix.node }}
+          path: ${{ github.workspace }}/../.codex-workflow-verification/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
