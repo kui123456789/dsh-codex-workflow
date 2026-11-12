@@ -20,7 +20,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     env:
-      CODEX_WORKFLOW_TEST_CONCURRENCY: '2'
+      CODEX_WORKFLOW_TEST_CONCURRENCY: '1'
       CODEX_WORKFLOW_TEST_REPORTER: tap
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +34,8 @@ jobs:
           corepack enable
           corepack prepare pnpm@10.33.2 --activate
           pnpm install --frozen-lockfile
+      - name: Resolve verification evidence path
+        run: node -e "require('node:fs').appendFileSync(process.env.GITHUB_ENV, 'CODEX_WORKFLOW_EVIDENCE=' + require('node:path').resolve('..', '.codex-workflow-verification') + '\n')"
       - name: Run complete isolated release gate twice
         run: pnpm verify:isolated
       - name: Publish verified Skill artifacts
@@ -52,8 +54,8 @@ jobs:
         with:
           name: release-verification-${{ github.sha }}
           path: |
-            ${{ github.workspace }}/../.codex-workflow-verification/
-            !${{ github.workspace }}/../.codex-workflow-verification/**/snapshot/**
+            ${{ env.CODEX_WORKFLOW_EVIDENCE }}
+            !${{ env.CODEX_WORKFLOW_EVIDENCE }}/**/snapshot/**
             ${{ runner.temp }}/codex-workflow/
           include-hidden-files: true
           if-no-files-found: error

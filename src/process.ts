@@ -1,5 +1,7 @@
 import { execFile, type ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
+import { join } from "node:path";
 import crossSpawn from "cross-spawn";
 
 export interface ProcessIdentity {
@@ -49,7 +51,8 @@ async function helper(command: string, args: string[], timeout = helperTimeout):
 
 async function powershell(script: string, timeout?: number): Promise<string | undefined> {
   const encoded = Buffer.from(`$ErrorActionPreference='Stop'; ${script}`, "utf16le").toString("base64");
-  return helper("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], timeout);
+  const modern = process.env.ProgramFiles && join(process.env.ProgramFiles, "PowerShell", "7", "pwsh.exe");
+  return helper(modern && existsSync(modern) ? modern : "powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], timeout);
 }
 
 async function linuxRow(pid: number, boot: string): Promise<ProcessRow | "dead" | "unknown"> {
@@ -61,7 +64,8 @@ async function linuxRow(pid: number, boot: string): Promise<ProcessRow | "dead" 
     if (!Number.isSafeInteger(parent) || !start || !/^\d+$/.test(start)) return "unknown";
     return { identity: { pid, birth: `${boot}:${start}` }, parent, dead: fields[0] === "Z" || fields[0] === "X" };
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "dead" : "unknown";
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === "ENOENT" || code === "ESRCH" ? "dead" : "unknown";
   }
 }
 

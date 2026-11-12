@@ -73,6 +73,22 @@ async function gitInit(directory: string): Promise<void> {
   await execFileAsync("git", ["config", "core.autocrlf", "false"], { cwd: directory, windowsHide: true });
 }
 
+test("git evidence keeps workspace-relative paths through a directory alias", async () => {
+  const directory = await makeGitRepo();
+  const alias = directory + "-alias";
+  try {
+    await symlink(directory, alias, process.platform === "win32" ? "junction" : "dir");
+    await writeFile(join(directory, "new.txt"), "untracked through an alias", "utf8");
+    const direct = await collectEvidence({ cwd: directory, maxDiffBytes: 65536 });
+    const linked = await collectEvidence({ cwd: alias, maxDiffBytes: 65536 });
+    assert.ok(linked.changedFiles.includes("new.txt"), JSON.stringify(linked.changedFiles));
+    assert.equal(linked.fingerprint, direct.fingerprint);
+  } finally {
+    await rm(alias, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 async function git(directory: string, ...args: string[]): Promise<string> {
   const { stdout } = await execFileAsync("git", args, { cwd: directory, windowsHide: true });
   return stdout;
@@ -344,24 +360,26 @@ test("non-git evidence hashes files inside the cwd and rejects traversal", async
     await writeFile(join(directory, "sub", "b.txt"), "beta", "utf8");
     const escaped = await mkdtemp(join(tmpdir(), "dsh-codex-evidence-outside-"));
     await writeFile(join(escaped, "outside.txt"), "secret", "utf8");
+    const nested = join("sub", "b.txt");
+    const rejected = ["../outside.txt", ...(process.platform === "win32" ? ["..\\outside.txt"] : []), join(escaped, "outside.txt")];
     try {
       const evidence = await collectEvidence({
         cwd: directory,
         maxDiffBytes: 65536,
-        changedFiles: ["a.txt", "sub\\b.txt", "missing.txt", "../outside.txt", "..\\outside.txt", join(escaped, "outside.txt")],
+        changedFiles: ["a.txt", nested, "missing.txt", ...rejected],
       });
       assert.equal(evidence.kind, "files");
       assert.equal(evidence.fileHashes.length, 2);
-      assert.deepEqual(evidence.fileHashes.map((file) => file.path), ["a.txt", "sub\\b.txt"]);
+      assert.deepEqual(evidence.fileHashes.map((file) => file.path), ["a.txt", nested]);
       assert.ok(evidence.fileHashes[0]?.sha256);
       assert.ok(evidence.fileHashes[1]?.sha256);
       assert.deepEqual(evidence.missingFiles, ["missing.txt"]);
-      assert.deepEqual(evidence.rejectedPaths, ["../outside.txt", "..\\outside.txt", join(escaped, "outside.txt")]);
+      assert.deepEqual(evidence.rejectedPaths, rejected);
       assert.equal(evidence.insufficient, false);
       const once = await collectEvidence({
         cwd: directory,
         maxDiffBytes: 65536,
-        changedFiles: ["a.txt", "sub\\b.txt", "missing.txt", "../outside.txt", "..\\outside.txt", join(escaped, "outside.txt")],
+        changedFiles: ["a.txt", nested, "missing.txt", ...rejected],
       });
       assert.equal(evidence.fingerprint, once.fingerprint);
     } finally {

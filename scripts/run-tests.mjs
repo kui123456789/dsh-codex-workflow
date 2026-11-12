@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { readCompleteTestReceipt, testReceiptArguments } from "./test-receipt.mjs";
 
 const root = process.cwd();
-const concurrency = process.env.CODEX_WORKFLOW_TEST_CONCURRENCY ?? "4";
+const concurrency = process.env.CODEX_WORKFLOW_TEST_CONCURRENCY ?? "1";
 if (!/^[1-4]$/.test(concurrency)) throw new Error("CODEX_WORKFLOW_TEST_CONCURRENCY must be 1–4");
 const runId = process.env.CODEX_WORKFLOW_TEST_RECEIPT_ID ?? randomUUID();
 const receiptPath = process.env.CODEX_WORKFLOW_TEST_RECEIPT

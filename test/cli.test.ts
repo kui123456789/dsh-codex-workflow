@@ -262,7 +262,7 @@ test("simultaneous starts admit exactly one workflow and one planner request", {
 test("a turn timeout confirms cleanup and refuses a fabricated replacement request", { timeout: 30_000 }, async () => {
   await sandbox(async (home, cwd) => {
     const started = await json(["start", "--cwd", cwd, "--stdin", "--codex-command", process.execPath], home,
-      { task: "Timeout a slow model request", turnTimeoutMs: 100, transientRetryBudgetMs: 0 }, { FAKE_CODEX_DELAY_MS: "10000" });
+      { task: "Timeout a slow model request", turnTimeoutMs: 100, transientRetryBudgetMs: 0 }, { FAKE_CODEX_SCENARIO: "missing_thread", FAKE_CODEX_DELAY_MS: "10000" });
     const result = await settled(home, started.workflowId);
     assert.equal(result.phase, "failed", JSON.stringify(result));
     assert.equal(result.continuation.available, false);

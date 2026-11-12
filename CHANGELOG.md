@@ -13,6 +13,7 @@ All notable changes to `codex-workflow`, formerly the `dsh-codex-workflow` plugi
 - Default to three review rounds, stop after one blocking round without verifiable changes, and use monotonic timeout and transient retry budgets. Model defaults follow local Codex configuration, with optional role overrides.
 - Distribute a self-contained skill folder and ZIP. Remove DSH host integrations, UI, installation entry points, and runtime dependencies. Existing DSH data and configuration are not migrated or modified; earlier DSH release records remain historical.
 - Replace host-specific tests with standalone subprocess, state, evidence, recovery, cancellation, and packaging checks. Configure Windows, Linux, and macOS CI on Node 22.19 and 24. Actual platform and live-provider results are reported separately in the GitHub release.
+- Keep review paths relative to the canonical workspace, including macOS temporary-directory aliases and Windows junctions. Handle vanished Linux process entries without relaxing unreadable-process cleanup barriers; prefer a standard PowerShell 7 installation when available while retaining native query deadlines.
 - Correct current guidance for per-operation schema artifacts, user decisions on nonblocking suggestions, offline doctor scope, and monotonic retry timing. Retire sidebar/tool-display and settings-navigation claims that no longer apply to the skill.
 
 ## [1.1.15] - 2026-10-25

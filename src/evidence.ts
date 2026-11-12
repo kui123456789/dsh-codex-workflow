@@ -20,6 +20,7 @@ export interface EvidenceOptions {
  * `missingFiles` / `rejectedPaths` instead of failing the review.
  */
 export async function collectEvidence(options: EvidenceOptions): Promise<ReviewEvidence> {
+  options = { ...options, cwd: await realpath(options.cwd).catch(() => resolve(options.cwd)) };
   if (await isGitRepository(options.cwd)) {
     try {
       return await collectGitEvidence(options);
